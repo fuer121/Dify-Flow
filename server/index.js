@@ -18,6 +18,7 @@ import {
 } from "./db.js";
 import { getTask, publicTask, cancelTask, subscribeTask } from "./tasks.js";
 import { sanitizeError } from "./sanitize.js";
+import { testDifyConnection } from "./dify.js";
 import {
   publicAnalysisRunWithResult,
   startAnalysisTask,
@@ -37,6 +38,14 @@ app.get("/api/config", (_request, response) => {
 app.get("/api/openai/test", async (_request, response, next) => {
   try {
     response.json({ ok: true, openai: await testOpenAIConnection() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dify/test", async (_request, response, next) => {
+  try {
+    response.json({ ok: true, dify: await testDifyConnection() });
   } catch (error) {
     next(error);
   }

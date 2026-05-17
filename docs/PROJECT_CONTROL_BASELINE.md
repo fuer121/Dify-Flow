@@ -132,6 +132,7 @@ When adding diagnostics:
 Backend:
 
 - `GET /api/config`
+- `GET /api/dify/test`
 - `GET /api/openai/test`
 - `GET /api/books`
 - `POST /api/books/imports`
@@ -169,6 +170,7 @@ Frontend routes:
 - Prompt/schema snapshots are stored per analysis task.
 - OpenAI-compatible calls use Responses API shape with `store: false` and no `background`.
 - The service runs an OpenAI-compatible connectivity check before analysis starts, preventing per-chapter network/key failures.
+- Dify diagnostics are available at `/api/dify/test`; this checks Dify App API access without pulling chapter text.
 - Final results render as a table when `finalResult.items` can be tabular; otherwise JSON preview is shown.
 
 ## Verification Commands
@@ -180,6 +182,7 @@ npm run lint
 npm test
 npm run build
 curl -s http://127.0.0.1:5184/api/config | jq .
+curl -s http://127.0.0.1:5184/api/dify/test | jq .
 curl -s http://127.0.0.1:5184/api/openai/test | jq .
 ```
 
@@ -216,4 +219,3 @@ git remote set-url origin https://github.com/fuer121/Dify-Flow.git
 - Add explicit retry controls for failed import batches and failed analysis chapters.
 - Add encrypted export/import for backups if needed.
 - Add a small admin page for runtime diagnostics that never displays secrets or chapter text.
-

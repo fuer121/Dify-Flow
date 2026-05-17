@@ -97,6 +97,7 @@ async function runImportTask(task, { bookId, bookName, startChapter, endChapter,
 
     const existing = force ? new Set() : getExistingChapterIndexes(bookId, startChapter, endChapter);
     const batches = buildChapterBatches(startChapter, endChapter);
+    let lastBatchError = "";
 
     for (const batch of batches) {
       assertNotCancelled(task);
@@ -151,6 +152,7 @@ async function runImportTask(task, { bookId, bookName, startChapter, endChapter,
           });
         }
       } catch (error) {
+        lastBatchError = sanitizeText(error.message);
         task.progress.failed += missing.length;
         updateTask(task, {
           progress: { ...task.progress, current: `批次 ${batch.startChapter}-${batch.endChapter} 失败` },
@@ -162,7 +164,8 @@ async function runImportTask(task, { bookId, bookName, startChapter, endChapter,
     const savedCount = task.progress.completed - task.progress.skipped;
     if (task.progress.failed > 0 && savedCount <= 0) {
       updateBookImportStatus(bookId, "failed");
-      throw new Error("所有待导入批次都失败了，请检查 Dify API Base、Workflow API Key 和 Dify 工作流输入字段。");
+      const suffix = lastBatchError ? `最后一次 Dify 错误：${lastBatchError}` : "请检查 Dify API Base、Workflow API Key 和 Dify 工作流输入字段。";
+      throw new Error(`所有待导入批次都失败了。${suffix}`);
     }
 
     const finalStatus = task.progress.failed > 0 ? "completed_with_errors" : "completed";

@@ -38,17 +38,49 @@ export async function fetchChapterBatch({ bookId, startChapter, endChapter }) {
     throw wrapped;
   }
 
-  const data = await response.json().catch(() => null);
+  const { data, text } = await readDifyResponse(response);
   if (!response.ok) {
-    const error = new Error(sanitizeText(data?.message || data?.error || `Dify 调用失败：HTTP ${response.status}`));
+    const error = new Error(sanitizeText(data?.message || data?.error || text || `Dify 调用失败：HTTP ${response.status}`));
     error.status = response.status;
-    error.details = sanitizeDetails(data);
+    error.details = sanitizeDetails(data || { status: response.status, message: text });
     throw error;
   }
 
   const outputs = data?.data?.outputs || {};
   const raw = outputs.result ?? outputs.text ?? outputs.chapters ?? outputs.output;
   return normalizeDifyChapterOutput(raw, { bookId, startChapter, endChapter });
+}
+
+export async function testDifyConnection() {
+  requireDifyConfig();
+  let response;
+  try {
+    response = await fetch(`${config.dify.base}/parameters`, {
+      headers: {
+        Authorization: `Bearer ${config.dify.apiKey}`
+      }
+    });
+  } catch (error) {
+    const wrapped = new Error(`无法连接 Dify API：${config.dify.base}（${error.message}）`);
+    wrapped.status = 502;
+    throw wrapped;
+  }
+
+  const { data, text } = await readDifyResponse(response);
+  if (!response.ok) {
+    const error = new Error(sanitizeText(data?.message || data?.error || text || `Dify 连通性测试失败：HTTP ${response.status}`));
+    error.status = response.status;
+    error.details = sanitizeDetails(data || { status: response.status, message: text });
+    throw error;
+  }
+
+  const forms = data?.user_input_form || data?.parameters?.user_input_form || [];
+  const variables = forms.flatMap((entry) => Object.values(entry || {}).map((item) => item?.variable).filter(Boolean));
+  return {
+    ok: true,
+    status: response.status,
+    variables
+  };
 }
 
 export function normalizeDifyChapterOutput(raw, context = {}) {
@@ -82,6 +114,27 @@ function parseJsonMaybe(raw) {
     const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
     if (fenced) return JSON.parse(fenced[1].trim());
     return trimmed;
+  }
+}
+
+async function readDifyResponse(response) {
+  if (typeof response.text === "function") {
+    const text = await response.text();
+    return { data: parseJsonText(text), text };
+  }
+  const data = await response.json().catch(() => null);
+  return {
+    data,
+    text: data ? JSON.stringify(data) : ""
+  };
+}
+
+function parseJsonText(text) {
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
   }
 }
 

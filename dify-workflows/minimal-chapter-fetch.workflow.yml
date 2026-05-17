@@ -1,0 +1,640 @@
+---
+app:
+  description: 输入小说 ID 和章节范围，只返回章节原文 JSON，不接入 LLM。
+  icon: "\U0001F4DA"
+  icon_background: "#EAF7F2"
+  mode: workflow
+  name: 小说章节原文最小获取
+  use_icon_as_answer_icon: false
+kind: app
+version: 0.5.0
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      allowed_file_extensions:
+      - ".JPG"
+      - ".JPEG"
+      - ".PNG"
+      - ".GIF"
+      - ".WEBP"
+      - ".SVG"
+      allowed_file_types:
+      - image
+      allowed_file_upload_methods:
+      - local_file
+      - remote_url
+      enabled: false
+      fileUploadConfig:
+        audio_file_size_limit: 600
+        batch_count_limit: 5
+        file_size_limit: 600
+        image_file_batch_limit: 10
+        image_file_size_limit: 600
+        single_chunk_attachment_limit: 10
+        video_file_size_limit: 600
+        workflow_file_upload_limit: 10
+      image:
+        enabled: false
+        number_limits: 3
+        transfer_methods:
+        - local_file
+        - remote_url
+      number_limits: 3
+    opening_statement: ''
+    retriever_resource:
+      enabled: true
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+      language: ''
+      voice: ''
+  graph:
+    edges:
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: start
+        targetType: code
+      id: 2000000000001-source-2000000000002-target
+      source: '2000000000001'
+      sourceHandle: source
+      target: '2000000000002'
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: code
+        targetType: iteration
+      id: 2000000000002-source-2000000000003-target
+      source: '2000000000002'
+      sourceHandle: source
+      target: '2000000000003'
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: true
+        isInLoop: false
+        iteration_id: '2000000000003'
+        sourceType: iteration-start
+        targetType: tool
+      id: 2000000000003start-source-2000000000004-target
+      source: 2000000000003start
+      sourceHandle: source
+      target: '2000000000004'
+      targetHandle: target
+      type: custom
+      zIndex: 1002
+    - data:
+        isInIteration: true
+        isInLoop: false
+        iteration_id: '2000000000003'
+        sourceType: tool
+        targetType: code
+      id: 2000000000004-source-2000000000006-target
+      source: '2000000000004'
+      sourceHandle: source
+      target: '2000000000006'
+      targetHandle: target
+      type: custom
+      zIndex: 1002
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: iteration
+        targetType: code
+      id: 2000000000003-source-2000000000008-target
+      source: '2000000000003'
+      sourceHandle: source
+      target: '2000000000008'
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: code
+        targetType: end
+      id: 2000000000008-source-2000000000009-target
+      source: '2000000000008'
+      sourceHandle: source
+      target: '2000000000009'
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    nodes:
+    - data:
+        selected: false
+        title: 用户输入
+        type: start
+        variables:
+        - default: ''
+          hint: ''
+          label: 书籍id
+          max_length: 48
+          options: []
+          placeholder: ''
+          required: true
+          type: number
+          variable: book_id
+        - default: ''
+          hint: ''
+          label: 开始章节
+          max_length: 48
+          options: []
+          placeholder: ''
+          required: true
+          type: number
+          variable: start_chapter
+        - default: ''
+          hint: ''
+          label: 结束章节
+          max_length: 48
+          options: []
+          placeholder: ''
+          required: true
+          type: number
+          variable: end_chapter
+      height: 161
+      id: '2000000000001'
+      position:
+        x: 80
+        y: 300
+      positionAbsolute:
+        x: 80
+        y: 300
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        code: |
+          def main(book_id: int, start_chapter: int, end_chapter: int):
+              try:
+                  book_id = int(book_id)
+                  start = int(start_chapter)
+                  end = int(end_chapter)
+              except Exception:
+                  return {
+                      "chapter_numbers": [],
+                      "range_status": "error: book_id、start_chapter、end_chapter 必须是数字",
+                  }
+
+              if book_id <= 0:
+                  return {
+                      "chapter_numbers": [],
+                      "range_status": "error: book_id 必须大于 0",
+                  }
+
+              if start <= 0 or end <= 0:
+                  return {
+                      "chapter_numbers": [],
+                      "range_status": "error: 章节号必须大于 0",
+                  }
+
+              if end < start:
+                  end = start
+
+              total = end - start + 1
+              if total > 100:
+                  return {
+                      "chapter_numbers": [],
+                      "range_status": "error: 单次最多 100 章，请由本地服务分批调用",
+                  }
+
+              return {
+                  "chapter_numbers": list(range(start, end + 1)),
+                  "range_status": "ok",
+              }
+        code_language: python3
+        outputs:
+          chapter_numbers:
+            children: 
+            type: array[number]
+          range_status:
+            children: 
+            type: string
+        selected: false
+        title: 章节范围规范
+        type: code
+        variables:
+        - value_selector:
+          - '2000000000001'
+          - book_id
+          value_type: number
+          variable: book_id
+        - value_selector:
+          - '2000000000001'
+          - start_chapter
+          value_type: number
+          variable: start_chapter
+        - value_selector:
+          - '2000000000001'
+          - end_chapter
+          value_type: number
+          variable: end_chapter
+      height: 52
+      id: '2000000000002'
+      position:
+        x: 380
+        y: 315
+      positionAbsolute:
+        x: 380
+        y: 315
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        error_handle_mode: terminated
+        flatten_output: true
+        height: 488
+        is_parallel: false
+        iterator_input_type: array[number]
+        iterator_selector:
+        - '2000000000002'
+        - chapter_numbers
+        output_selector:
+        - '2000000000006'
+        - chapter_result
+        output_type: array[string]
+        parallel_nums: 5
+        selected: true
+        start_node_id: 2000000000003start
+        title: 逐章获取原文
+        type: iteration
+        width: 1638
+      height: 488
+      id: '2000000000003'
+      position:
+        x: 690
+        y: 260
+      positionAbsolute:
+        x: 690
+        y: 260
+      selected: true
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 1638
+      zIndex: 1
+    - data:
+        desc: ''
+        isInIteration: true
+        selected: false
+        title: ''
+        type: iteration-start
+      draggable: false
+      height: 48
+      id: 2000000000003start
+      parentId: '2000000000003'
+      position:
+        x: 24
+        y: 68
+      positionAbsolute:
+        x: 714
+        y: 328
+      selectable: false
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom-iteration-start
+      width: 44
+      zIndex: 1002
+    - data:
+        isInIteration: true
+        isInLoop: false
+        is_team_authorization: true
+        iteration_id: '2000000000003'
+        paramSchemas:
+        - auto_generate: 
+          default: 
+          form: form
+          human_description:
+            en_US: 书籍ID
+            ja_JP: 书籍ID
+            pt_BR: 书籍ID
+            zh_Hans: 书籍ID
+          label:
+            en_US: book_id
+            ja_JP: book_id
+            pt_BR: book_id
+            zh_Hans: book_id
+          llm_description: 书籍ID
+          max: 
+          min: 
+          name: book_id
+          options: []
+          placeholder:
+            en_US: ''
+            ja_JP: ''
+            pt_BR: ''
+            zh_Hans: ''
+          precision: 
+          required: true
+          scope: 
+          template: 
+          type: number
+        - auto_generate: 
+          default: 
+          form: form
+          human_description:
+            en_US: 起始章节（从1开始）
+            ja_JP: 起始章节（从1开始）
+            pt_BR: 起始章节（从1开始）
+            zh_Hans: 起始章节（从1开始）
+          label:
+            en_US: start_chapter
+            ja_JP: start_chapter
+            pt_BR: start_chapter
+            zh_Hans: start_chapter
+          llm_description: 起始章节（从1开始）
+          max: 
+          min: 
+          name: start_chapter
+          options: []
+          placeholder:
+            en_US: ''
+            ja_JP: ''
+            pt_BR: ''
+            zh_Hans: ''
+          precision: 
+          required: true
+          scope: 
+          template: 
+          type: number
+        - auto_generate: 
+          default: 
+          form: form
+          human_description:
+            en_US: 结束章节
+            ja_JP: 结束章节
+            pt_BR: 结束章节
+            zh_Hans: 结束章节
+          label:
+            en_US: end_chapter
+            ja_JP: end_chapter
+            pt_BR: end_chapter
+            zh_Hans: end_chapter
+          llm_description: 结束章节
+          max: 
+          min: 
+          name: end_chapter
+          options: []
+          placeholder:
+            en_US: ''
+            ja_JP: ''
+            pt_BR: ''
+            zh_Hans: ''
+          precision: 
+          required: true
+          scope: 
+          template: 
+          type: number
+        - auto_generate: 
+          default: 
+          form: llm
+          human_description:
+            en_US: ''
+            ja_JP: ''
+            pt_BR: ''
+            zh_Hans: ''
+          label:
+            en_US: item_type
+            ja_JP: item_type
+            pt_BR: item_type
+            zh_Hans: item_type
+          llm_description: ''
+          max: 
+          min: 
+          name: item_type
+          options: []
+          placeholder:
+            en_US: ''
+            ja_JP: ''
+            pt_BR: ''
+            zh_Hans: ''
+          precision: 
+          required: false
+          scope: 
+          template: 
+          type: number
+        params:
+          book_id: ''
+          end_chapter: ''
+          item_type: ''
+          start_chapter: ''
+        provider_icon:
+          background: "#E6F4D7"
+          content: book
+        provider_id: 1f1d0a7c-eedb-446e-be0e-a887b71cd1db
+        provider_name: 获取书库书籍章节内容
+        provider_type: workflow
+        selected: false
+        title: 获取书库书籍章节内容
+        tool_configurations:
+          book_id:
+            type: variable
+            value:
+            - '2000000000001'
+            - book_id
+          start_chapter:
+            type: variable
+            value:
+            - '2000000000003'
+            - item
+          end_chapter:
+            type: variable
+            value:
+            - '2000000000003'
+            - item
+        tool_description: 根据书籍ID、起始章节和结束章节获取书库书籍相应章节的内容
+        tool_label: 获取书库书籍章节内容
+        tool_name: get_book_chapter_content
+        tool_node_version: '2'
+        tool_parameters:
+          item_type:
+            type: constant
+            value: 1
+        type: tool
+      height: 140
+      id: '2000000000004'
+      parentId: '2000000000003'
+      position:
+        x: 820
+        y: 328
+      positionAbsolute:
+        x: 1510
+        y: 588
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+      zIndex: 1002
+    - data:
+        code: |
+          def main(text: str, current_chapter: int):
+              import json
+
+              content = text or ""
+              data = {
+                  "chapter_index": int(current_chapter),
+                  "chapter_title": "",
+                  "content": content,
+                  "content_length": len(content),
+                  "fetch_status": "ok" if content else "empty",
+              }
+
+              return {
+                  "chapter_result": json.dumps(data, ensure_ascii=False),
+              }
+        code_language: python3
+        isInIteration: true
+        isInLoop: false
+        iteration_id: '2000000000003'
+        outputs:
+          chapter_result:
+            children: 
+            type: string
+        selected: false
+        title: 封装章节原文
+        type: code
+        variables:
+        - value_selector:
+          - '2000000000004'
+          - text
+          value_type: string
+          variable: text
+        - value_selector:
+          - '2000000000003'
+          - item
+          value_type: number
+          variable: current_chapter
+      height: 52
+      id: '2000000000006'
+      parentId: '2000000000003'
+      position:
+        x: 1380
+        y: 328
+      positionAbsolute:
+        x: 2070
+        y: 588
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+      zIndex: 1002
+    - data:
+        code: |
+          def main(book_id: int, start_chapter: int, end_chapter: int, range_status: str, items: list):
+              import json
+
+              chapters = []
+              for item in items or []:
+                  try:
+                      parsed = json.loads(item) if isinstance(item, str) else item
+                  except Exception:
+                      continue
+                  if isinstance(parsed, dict):
+                      chapters.append(parsed)
+
+              result = {
+                  "book_id": int(book_id),
+                  "start_chapter_index": int(start_chapter),
+                  "end_chapter_index": int(end_chapter),
+                  "range_status": range_status,
+                  "chapters": chapters,
+              }
+
+              return {
+                  "result": json.dumps(result, ensure_ascii=False),
+              }
+        code_language: python3
+        outputs:
+          result:
+            children: 
+            type: string
+        selected: false
+        title: 最终 JSON 输出
+        type: code
+        variables:
+        - value_selector:
+          - '2000000000001'
+          - book_id
+          value_type: number
+          variable: book_id
+        - value_selector:
+          - '2000000000001'
+          - start_chapter
+          value_type: number
+          variable: start_chapter
+        - value_selector:
+          - '2000000000001'
+          - end_chapter
+          value_type: number
+          variable: end_chapter
+        - value_selector:
+          - '2000000000002'
+          - range_status
+          value_type: string
+          variable: range_status
+        - value_selector:
+          - '2000000000003'
+          - output
+          value_type: array[string]
+          variable: items
+      height: 52
+      id: '2000000000008'
+      position:
+        x: 2200
+        y: 315
+      positionAbsolute:
+        x: 2200
+        y: 315
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        outputs:
+        - value_selector:
+          - '2000000000008'
+          - result
+          value_type: string
+          variable: result
+        selected: false
+        title: 输出
+        type: end
+      height: 88
+      id: '2000000000009'
+      position:
+        x: 2500
+        y: 315
+      positionAbsolute:
+        x: 2500
+        y: 315
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    viewport:
+      x: 124.25
+      y: 267
+      zoom: 0.25
+  rag_pipeline_variables: []

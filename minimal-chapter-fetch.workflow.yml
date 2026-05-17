@@ -1,0 +1,269 @@
+app:
+  description: 输入小说 ID 和章节范围，只返回章节原文 JSON，不接入 LLM。
+  icon: 📚
+  icon_background: '#EAF7F2'
+  mode: workflow
+  name: 小说章节原文最小获取
+  use_icon_as_answer_icon: false
+kind: app
+version: 0.5.0
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      enabled: false
+    opening_statement: ''
+    retriever_resource:
+      enabled: false
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+  graph:
+    edges:
+    - data:
+        sourceType: start
+        targetType: code
+      id: start-source-range-target
+      source: start
+      sourceHandle: source
+      target: range
+      targetHandle: target
+      type: custom
+    - data:
+        sourceType: code
+        targetType: iteration
+      id: range-source-iterate-target
+      source: range
+      sourceHandle: source
+      target: iterate
+      targetHandle: target
+      type: custom
+    - data:
+        isInIteration: true
+        iteration_id: iterate
+        sourceType: iteration-start
+        targetType: tool
+      id: iterate-start-source-fetch-target
+      source: iterate-start
+      sourceHandle: source
+      target: fetch
+      targetHandle: target
+      type: custom
+    - data:
+        isInIteration: true
+        iteration_id: iterate
+        sourceType: tool
+        targetType: code
+      id: fetch-source-wrap-target
+      source: fetch
+      sourceHandle: source
+      target: wrap
+      targetHandle: target
+      type: custom
+    - data:
+        sourceType: iteration
+        targetType: code
+      id: iterate-source-final-target
+      source: iterate
+      sourceHandle: source
+      target: final
+      targetHandle: target
+      type: custom
+    - data:
+        sourceType: code
+        targetType: end
+      id: final-source-end-target
+      source: final
+      sourceHandle: source
+      target: end
+      targetHandle: target
+      type: custom
+    nodes:
+    - data:
+        title: 输入
+        type: start
+        variables:
+        - label: book_id
+          required: true
+          type: number
+          variable: book_id
+        - label: start_chapter
+          required: true
+          type: number
+          variable: start_chapter
+        - label: end_chapter
+          required: true
+          type: number
+          variable: end_chapter
+      id: start
+      position: { x: 80, y: 260 }
+      type: custom
+    - data:
+        title: 章节范围规范
+        type: code
+        code_language: python3
+        code: |
+          def main(book_id: int, start_chapter: int, end_chapter: int):
+              try:
+                  book_id = int(book_id)
+                  start = int(start_chapter)
+                  end = int(end_chapter)
+              except Exception:
+                  return {"chapter_numbers": [], "range_status": "error: 输入必须是数字"}
+              if book_id <= 0 or start <= 0 or end <= 0:
+                  return {"chapter_numbers": [], "range_status": "error: book_id 和章节号必须大于 0"}
+              if end < start:
+                  end = start
+              if end - start + 1 > 100:
+                  return {"chapter_numbers": [], "range_status": "error: 单次最多 100 章，请由本地服务分批调用"}
+              return {"chapter_numbers": list(range(start, end + 1)), "range_status": "ok"}
+        outputs:
+          chapter_numbers: { type: array[number], children: null }
+          range_status: { type: string, children: null }
+        variables:
+        - variable: book_id
+          value_selector: [start, book_id]
+          value_type: number
+        - variable: start_chapter
+          value_selector: [start, start_chapter]
+          value_type: number
+        - variable: end_chapter
+          value_selector: [start, end_chapter]
+          value_type: number
+      id: range
+      position: { x: 360, y: 260 }
+      type: custom
+    - data:
+        title: 逐章获取
+        type: iteration
+        iterator_selector: [range, chapter_numbers]
+        iterator_input_type: array[number]
+        output_selector: [wrap, chapter_result]
+        output_type: array[string]
+        flatten_output: true
+        is_parallel: false
+        parallel_nums: 5
+        start_node_id: iterate-start
+      id: iterate
+      position: { x: 640, y: 220 }
+      type: custom
+    - data:
+        title: ''
+        type: iteration-start
+      id: iterate-start
+      parentId: iterate
+      type: custom-iteration-start
+    - data:
+        title: 获取书库书籍章节内容
+        type: tool
+        provider_type: workflow
+        provider_name: 获取书库书籍章节内容
+        tool_name: get_book_chapter_content
+        tool_label: 获取书库书籍章节内容
+        tool_description: 根据书籍ID、起始章节和结束章节获取书库书籍相应章节的内容
+        tool_configurations:
+          book_id:
+            type: variable
+            value: [start, book_id]
+          start_chapter:
+            type: variable
+            value: [iterate, item]
+          end_chapter:
+            type: variable
+            value: [iterate, item]
+        tool_parameters:
+          item_type:
+            type: constant
+            value: 1
+      id: fetch
+      parentId: iterate
+      type: custom
+    - data:
+        title: 封装章节原文
+        type: code
+        code_language: python3
+        code: |
+          def main(text: str, current_chapter: int):
+              import json
+              content = text or ""
+              data = {
+                  "chapter_index": int(current_chapter),
+                  "chapter_title": "",
+                  "content": content,
+                  "content_length": len(content),
+                  "fetch_status": "ok" if content else "empty",
+              }
+              return {"chapter_result": json.dumps(data, ensure_ascii=False)}
+        outputs:
+          chapter_result: { type: string, children: null }
+        variables:
+        - variable: text
+          value_selector: [fetch, text]
+          value_type: string
+        - variable: current_chapter
+          value_selector: [iterate, item]
+          value_type: number
+      id: wrap
+      parentId: iterate
+      type: custom
+    - data:
+        title: 最终 JSON
+        type: code
+        code_language: python3
+        code: |
+          def main(book_id: int, start_chapter: int, end_chapter: int, range_status: str, items: list):
+              import json
+              chapters = []
+              for item in items or []:
+                  try:
+                      parsed = json.loads(item) if isinstance(item, str) else item
+                      if isinstance(parsed, dict):
+                          chapters.append(parsed)
+                  except Exception:
+                      pass
+              result = {
+                  "book_id": int(book_id),
+                  "start_chapter_index": int(start_chapter),
+                  "end_chapter_index": int(end_chapter),
+                  "range_status": range_status,
+                  "chapters": chapters,
+              }
+              return {"result": json.dumps(result, ensure_ascii=False)}
+        outputs:
+          result: { type: string, children: null }
+        variables:
+        - variable: book_id
+          value_selector: [start, book_id]
+          value_type: number
+        - variable: start_chapter
+          value_selector: [start, start_chapter]
+          value_type: number
+        - variable: end_chapter
+          value_selector: [start, end_chapter]
+          value_type: number
+        - variable: range_status
+          value_selector: [range, range_status]
+          value_type: string
+        - variable: items
+          value_selector: [iterate, output]
+          value_type: array[string]
+      id: final
+      position: { x: 1680, y: 260 }
+      type: custom
+    - data:
+        title: 输出
+        type: end
+        outputs:
+        - variable: result
+          value_selector: [final, result]
+          value_type: string
+      id: end
+      position: { x: 1960, y: 260 }
+      type: custom

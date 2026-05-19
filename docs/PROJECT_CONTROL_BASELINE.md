@@ -1,6 +1,6 @@
 # 小说章节安全分析台：项目基线
 
-最后更新：2026-05-19 23:20，Asia/Shanghai
+最后更新：2026-05-20 00:31，Asia/Shanghai
 
 本文档是当前项目的唯一真实信息源。后续线程、后续迭代，只要涉及项目目标、架构、安全边界、运行配置、关键决策、路线图或运维方式变化，都必须同步更新本文档。
 
@@ -10,7 +10,7 @@
 - 本地路径：`/Users/staff/Desktop/Vibe coding/novel-chapter-gpt-service`
 - Git 远程仓库：`git@github.com:fuer121/Dify-Flow.git`
 - 默认分支：`main`
-- 当前线程已知的最近推送基线提交：`bdfafe1 Initial novel chapter GPT service`
+- 当前线程已知的最近推送基线提交：`16a0fa2 Add resilient staged final summaries`
 - GitHub CLI：已安装在 `~/.local/bin/gh`，当前登录用户为 `fuer121`
 
 ## 2. 项目目标
@@ -28,12 +28,12 @@
 
 ## 3. 当前运行快照
 
-截至 2026-05-19 19:44：
+截至 2026-05-20 00:31：
 
 - 服务进程：Node.js，监听 `*:5184`
-- 当前监听进程：`PID 99739`
+- 当前监听进程：`PID 37654`
 - 本机地址：`http://127.0.0.1:5184/`
-- 当前局域网地址：`http://172.16.75.46:5184/`
+- 当前局域网地址：`http://192.168.1.163:5184/`
 - 局域网 IP 可能随 DHCP 变化，重新确认命令：
 
 ```bash
@@ -69,14 +69,15 @@ ifconfig | rg -n "inet (10|172\\.(1[6-9]|2[0-9]|3[0-1])|192\\.168)\\."
 
 当前内存任务快照：
 
-- 当前没有导入任务或 L1 构建任务在跑。
-- 当前有 1 个分析任务正在运行：
-  - 任务 ID：`aa9010ea-6a25-40a0-84c5-968951bcba3b`
-  - 任务名：`前 100 章提炼分析`
-  - 书籍：`143170` / `剑来`
-  - 范围：`1-100`
-  - 当前进度：`3` 章完成，`2` 章失败，当前到 `GPT 理解章节 6`
-  - 已观察失败类型：`OpenAI 返回不是合法 JSON：Unexpected end of JSON input`
+- `GET /api/tasks` 当前返回空列表，没有导入、L1 或分析任务在当前进程内运行。
+
+当前部署验证：
+
+- 当前正式服务运行提交：`16a0fa2 Add resilient staged final summaries`
+- `http://127.0.0.1:5184/api/config` 正常。
+- `http://192.168.1.163:5184/api/config` 正常。
+- `http://127.0.0.1:5184/api/openai/test` 正常，返回 `200`。
+- `http://127.0.0.1:5184/api/dify/test` 返回 `Access token is invalid`，说明服务已连到 Dify Base，但当前 `DIFY_CHAPTER_WORKFLOW_API_KEY` 或 Dify 工作流访问凭证需要重新校验。
 
 重要安全说明：
 
@@ -465,7 +466,7 @@ npm run preview:prepare-data -- --force
 局域网检查：
 
 ```bash
-curl -s http://172.16.75.46:5184/api/config
+curl -s http://192.168.1.163:5184/api/config
 ```
 
 当前进程任务检查：
@@ -522,6 +523,12 @@ npm run preview:local
 - 预览服务可以随时重启，不影响线上 `5184` 正在运行的任务。
 
 ## 15. 变更记录
+
+- 2026-05-20：
+  - 正式环境已重启到 `16a0fa2 Add resilient staged final summaries`。
+  - 当前本机地址 `http://127.0.0.1:5184/` 正常，当前局域网地址 `http://192.168.1.163:5184/` 正常。
+  - OpenAI 连通性测试正常，`/api/openai/test` 返回 `200`。
+  - Dify 连通性测试返回 `Access token is invalid`，需要重新校验自托管 Dify 工作流 API Key 或对应工作流访问配置。
 
 - 2026-05-19：
   - 修复分析任务最终汇总阶段大输入超时问题。

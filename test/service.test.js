@@ -1236,6 +1236,87 @@ test("retries transient compacted final summary failures", async () => {
   }
 });
 
+test("rejects placeholder final summary and keeps run resumable", async () => {
+  for (let chapterIndex = 1; chapterIndex <= 3; chapterIndex += 1) {
+    await db.saveEncryptedChapter({
+      bookId: "book-placeholder-summary",
+      chapterIndex,
+      title: `第${chapterIndex}章`,
+      content: `第${chapterIndex}章正文`
+    });
+  }
+
+  const previousFetch = global.fetch;
+  let finalSummaryCalls = 0;
+
+  global.fetch = async (url, request) => {
+    if (String(url).includes("api.openai.com/v1/models")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ data: [] })
+      };
+    }
+
+    if (!String(url).includes("api.openai.com/v1/responses")) {
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    }
+    const body = JSON.parse(request.body);
+    const text = body.input[0].content[0].text;
+    const formatName = body.text?.format?.name || "";
+
+    if (formatName === "final_analysis") {
+      finalSummaryCalls += 1;
+      return {
+        ok: true,
+        json: async () => ({
+          id: "resp_placeholder_summary",
+          output: [{ content: [{ type: "output_text", text: JSON.stringify({ title: "N/A", summary: "N/A", items: [], failed_chapters: [] }) }] }]
+        })
+      };
+    }
+
+    assert.equal(formatName, "chapter_result");
+    const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
+    return {
+      ok: true,
+      json: async () => ({
+        id: `resp_placeholder_chapter_${chapterIndex}`,
+        output: [{
+          content: [{
+            type: "output_text",
+            text: JSON.stringify({
+              chapter_index: chapterIndex,
+              chapter_title: `第${chapterIndex}章`,
+              summary: `章节${chapterIndex}摘要`,
+              key_points: [],
+              evidence_notes: []
+            })
+          }]
+        }]
+      })
+    };
+  };
+
+  try {
+    const analysis = workflows.startAnalysisTask({
+      name: "占位汇总",
+      book_id: "book-placeholder-summary",
+      start_chapter: 1,
+      end_chapter: 3
+    });
+    await assert.rejects(() => waitForTask(analysis), /最终汇总结果疑似占位或为空/);
+    assert.equal(analysis.status, "failed");
+    assert.equal(finalSummaryCalls, 3);
+    const result = await workflows.publicAnalysisRunWithResult(analysis.id);
+    assert.equal(result.finalResult, null);
+    assert.equal(result.chapterResults.length, 3);
+    assert.equal(result.canResume, true);
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
 async function waitForTask(task) {
   const started = Date.now();
   while (!["completed", "failed", "cancelled"].includes(task.status)) {

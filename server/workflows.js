@@ -602,11 +602,13 @@ async function executeAnalysisTask(task, prepared) {
     chapterResults,
     failedChapters,
     userPrompt: settings.summary_prompt,
-    outputSchema: settings.output_schema
+    outputSchema: settings.output_schema,
+    sourceChapterCount: chapterResults.length
   });
 
   assertNotCancelled(task);
   const finalResult = parseJsonOrText(summary.value);
+  assertFinalSummaryUseful(finalResult, chapterResults.length);
   await saveFinalAnalysisResult(analysisId, finalResult);
   task.progress.completed += 1;
   const run = updateAnalysisRun(analysisId, {
@@ -631,11 +633,11 @@ async function reusableAnalysisChapter({ analysisId, chapter, promptHash }) {
   return decryptAnalysisChapterResult(analysisId, chapter.chapter_index);
 }
 
-async function summarizeAnalysisResults({ task, model, reasoningEffort, chapterResults, failedChapters, userPrompt, outputSchema }) {
+async function summarizeAnalysisResults({ task, model, reasoningEffort, chapterResults, failedChapters, userPrompt, outputSchema, sourceChapterCount }) {
   const directInput = buildSummaryInput({ chapterResults, failedChapters, userPrompt });
   const finalSchema = parseOutputSchemaOrNull(outputSchema);
   if (inputTextLength(directInput) <= DIRECT_SUMMARY_MAX_CHARS) {
-    return runFinalSummaryCall({ task, stageLabel: "GPT 汇总分析结果", model, reasoningEffort, userPrompt, input: directInput, schema: finalSchema });
+    return runFinalSummaryCall({ task, stageLabel: "GPT 汇总分析结果", model, reasoningEffort, userPrompt, input: directInput, schema: finalSchema, sourceChapterCount });
   }
 
   await waitIfPaused(task);
@@ -665,29 +667,38 @@ async function summarizeAnalysisResults({ task, model, reasoningEffort, chapterR
       failedChapters,
       userPrompt
     }),
-    schema: finalSchema
+    schema: finalSchema,
+    sourceChapterCount
   });
 }
 
-async function runFinalSummaryCall({ task, stageLabel, model, reasoningEffort, userPrompt, input, schema }) {
+async function runFinalSummaryCall({ task, stageLabel, model, reasoningEffort, userPrompt, input, schema, sourceChapterCount }) {
   if (schema && shouldUseJsonFinalSummary(userPrompt)) {
-    return runSummaryStageWithRetry(task, stageLabel, () => callOpenAIJson({
+    return runSummaryStageWithRetry(task, stageLabel, async () => {
+      const response = await callOpenAIJson({
+        model,
+        reasoningEffort,
+        instructions: "你是严谨的小说多章节汇总引擎。按用户汇总 Prompt 输出最终结果；如果用户要求 JSON，则只输出合法 JSON，否则直接输出文本，不要添加无关解释。",
+        input,
+        schema,
+        schemaName: "final_analysis",
+        maxOutputTokens: SUMMARY_FINAL_MAX_OUTPUT_TOKENS
+      });
+      assertFinalSummaryUseful(parseJsonOrText(response.value), sourceChapterCount);
+      return response;
+    });
+  }
+  return runSummaryStageWithRetry(task, stageLabel, async () => {
+    const response = await callOpenAIText({
       model,
       reasoningEffort,
       instructions: "你是严谨的小说多章节汇总引擎。按用户汇总 Prompt 输出最终结果；如果用户要求 JSON，则只输出合法 JSON，否则直接输出文本，不要添加无关解释。",
       input,
-      schema,
-      schemaName: "final_analysis",
       maxOutputTokens: SUMMARY_FINAL_MAX_OUTPUT_TOKENS
-    }));
-  }
-  return runSummaryStageWithRetry(task, stageLabel, () => callOpenAIText({
-    model,
-    reasoningEffort,
-    instructions: "你是严谨的小说多章节汇总引擎。按用户汇总 Prompt 输出最终结果；如果用户要求 JSON，则只输出合法 JSON，否则直接输出文本，不要添加无关解释。",
-    input,
-    maxOutputTokens: SUMMARY_FINAL_MAX_OUTPUT_TOKENS
-  }));
+    });
+    assertFinalSummaryUseful(parseJsonOrText(response.value), sourceChapterCount);
+    return response;
+  });
 }
 
 async function runSummaryStageWithRetry(task, stageLabel, operation) {
@@ -813,6 +824,39 @@ function parseJsonOrText(value) {
   } catch {
     return text;
   }
+}
+
+function assertFinalSummaryUseful(finalResult, sourceChapterCount) {
+  if (sourceChapterCount < 3) return;
+
+  if (typeof finalResult === "string") {
+    const text = finalResult.trim();
+    if (text && !isPlaceholderText(text)) return;
+    throw finalSummaryQualityError();
+  }
+
+  if (!finalResult || typeof finalResult !== "object") {
+    throw finalSummaryQualityError();
+  }
+
+  const summary = String(finalResult.summary || "").trim();
+  const title = String(finalResult.title || "").trim();
+  const items = Array.isArray(finalResult.items) ? finalResult.items : [];
+  const hasUsefulSummary = Boolean(summary) && !isPlaceholderText(summary);
+  const hasUsefulTitle = Boolean(title) && !isPlaceholderText(title);
+  if (items.length || hasUsefulSummary || hasUsefulTitle) return;
+  throw finalSummaryQualityError();
+}
+
+function isPlaceholderText(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return ["", "n/a", "na", "null", "none", "无", "暂无", "空"].includes(normalized);
+}
+
+function finalSummaryQualityError() {
+  const error = new Error("最终汇总结果疑似占位或为空，已拒绝保存。请续跑最终汇总。");
+  error.status = 502;
+  return error;
 }
 
 function buildL1AnalysisContext({ bookId, chapters, startChapter, endChapter }) {

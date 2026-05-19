@@ -32,12 +32,15 @@ import {
 import { buildChapterBatches, fetchChapterBatch } from "./dify.js";
 import {
   buildChapterInput,
+  buildCompressedSummaryInput,
   buildL1ChapterInput,
+  buildSummaryCompressionInput,
   buildSummaryInput,
   callOpenAIJson,
   callOpenAIText,
   chapterResultSchema,
   l1ChapterIndexSchema,
+  summaryCompressionSchema,
   testOpenAIConnection
 } from "./openai.js";
 import {
@@ -52,6 +55,9 @@ import {
   waitIfPaused
 } from "./tasks.js";
 import { sanitizeText } from "./sanitize.js";
+
+const DIRECT_SUMMARY_MAX_CHARS = 80_000;
+const SUMMARY_COMPRESSION_BATCH_CHARS = 45_000;
 
 export function startImportTask(payload) {
   const bookId = normalizeBookId(payload.book_id ?? payload.bookId);
@@ -588,15 +594,13 @@ async function executeAnalysisTask(task, prepared) {
     message: "正在汇总逐章结果"
   });
 
-  const summary = await callOpenAIText({
+  const summary = await summarizeAnalysisResults({
+    task,
     model,
     reasoningEffort,
-    instructions: "你是严谨的小说多章节汇总引擎。按用户汇总 Prompt 输出最终结果；如果用户要求 JSON，则只输出合法 JSON，否则直接输出文本，不要添加无关解释。",
-    input: buildSummaryInput({
-      chapterResults,
-      failedChapters,
-      userPrompt: settings.summary_prompt
-    })
+    chapterResults,
+    failedChapters,
+    userPrompt: settings.summary_prompt
   });
 
   assertNotCancelled(task);
@@ -623,6 +627,111 @@ async function reusableAnalysisChapter({ analysisId, chapter, promptHash }) {
   if (existing.content_hmac !== chapter.content_hmac) return null;
   if (existing.prompt_hash !== promptHash) return null;
   return decryptAnalysisChapterResult(analysisId, chapter.chapter_index);
+}
+
+async function summarizeAnalysisResults({ task, model, reasoningEffort, chapterResults, failedChapters, userPrompt }) {
+  const directInput = buildSummaryInput({ chapterResults, failedChapters, userPrompt });
+  if (inputTextLength(directInput) <= DIRECT_SUMMARY_MAX_CHARS) {
+    return callOpenAIText({
+      model,
+      reasoningEffort,
+      instructions: "你是严谨的小说多章节汇总引擎。按用户汇总 Prompt 输出最终结果；如果用户要求 JSON，则只输出合法 JSON，否则直接输出文本，不要添加无关解释。",
+      input: directInput
+    });
+  }
+
+  const batches = chunkChapterResults(chapterResults, SUMMARY_COMPRESSION_BATCH_CHARS);
+  const compressedResults = [];
+  for (let index = 0; index < batches.length; index += 1) {
+    await waitIfPaused(task);
+    updateTask(task, {
+      progress: { ...task.progress, current: `压缩汇总素材 ${index + 1}/${batches.length}` },
+      message: `正在压缩汇总素材 ${index + 1}/${batches.length}`
+    });
+    const batchIndexes = new Set(batches[index].map((entry) => Number(entry.chapter_index)));
+    const batchFailedChapters = failedChapters.filter((chapterIndex) => batchIndexes.has(Number(chapterIndex)));
+    const response = await callOpenAIJson({
+      model,
+      reasoningEffort,
+      instructions: "你是小说分析结果压缩器。请按 Schema 把当前批次逐章理解结果压缩成面向用户最终目标的结构化 JSON。",
+      input: buildSummaryCompressionInput({
+        chapterResults: batches[index],
+        failedChapters: batchFailedChapters,
+        batchIndex: index + 1,
+        totalBatches: batches.length,
+        userPrompt
+      }),
+      schema: summaryCompressionSchema(),
+      schemaName: "summary_compression"
+    });
+    const expectedChapters = batches[index].map((entry) => Number(entry.chapter_index)).filter(Number.isFinite);
+    validateCompressedCoverage({
+      batchIndex: index + 1,
+      expectedChapters,
+      compressed: response.value
+    });
+    compressedResults.push({
+      batch_index: index + 1,
+      chapter_indexes: expectedChapters,
+      ...response.value
+    });
+  }
+
+  await waitIfPaused(task);
+  updateTask(task, {
+    progress: { ...task.progress, current: "GPT 汇总压缩结果" },
+    message: "正在基于压缩素材生成最终汇总"
+  });
+  return callOpenAIText({
+    model,
+    reasoningEffort,
+    instructions: "你是严谨的小说多章节汇总引擎。按用户汇总 Prompt 输出最终结果；如果用户要求 JSON，则只输出合法 JSON，否则直接输出文本，不要添加无关解释。",
+    input: buildCompressedSummaryInput({
+      compressedResults,
+      failedChapters,
+      userPrompt
+    })
+  });
+}
+
+function chunkChapterResults(chapterResults, maxChars) {
+  const batches = [];
+  let current = [];
+  let currentSize = 2;
+  for (const result of chapterResults) {
+    const size = JSON.stringify(result).length + 1;
+    if (current.length && currentSize + size > maxChars) {
+      batches.push(current);
+      current = [];
+      currentSize = 2;
+    }
+    current.push(result);
+    currentSize += size;
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
+
+function inputTextLength(input) {
+  return input.reduce((sum, item) => (
+    sum + (item.content || []).reduce((inner, content) => inner + String(content.text || "").length, 0)
+  ), 0);
+}
+
+function validateCompressedCoverage({ batchIndex, expectedChapters, compressed }) {
+  const covered = new Set((compressed.covered_chapters || []).map(Number).filter(Number.isFinite));
+  const missing = expectedChapters.filter((chapterIndex) => !covered.has(chapterIndex));
+  if (missing.length) {
+    const error = new Error(`汇总素材压缩覆盖不完整：第 ${batchIndex} 批缺少章节 ${missing.join(", ")}`);
+    error.status = 502;
+    throw error;
+  }
+  const coveredOutsideBatch = [...covered].filter((chapterIndex) => !expectedChapters.includes(chapterIndex));
+  if (coveredOutsideBatch.length) {
+    const error = new Error(`汇总素材压缩覆盖异常：第 ${batchIndex} 批包含非本批章节 ${coveredOutsideBatch.join(", ")}`);
+    error.status = 502;
+    throw error;
+  }
 }
 
 function parseJsonOrText(value) {

@@ -384,6 +384,109 @@ export function buildSummaryInput({ chapterResults, failedChapters, userPrompt }
   ];
 }
 
+export function buildSummaryCompressionInput({ chapterResults, failedChapters, batchIndex, totalBatches, userPrompt }) {
+  return [
+    {
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text: [
+            "你正在为小说分析任务压缩逐章理解结果，供最终汇总使用。",
+            "请严格围绕用户最终分析目标进行压缩，保留与目标有关的事实、角色、关系、事件、线索、证据和章节引用。",
+            "不要添加原文长引用，不要输出 Markdown。",
+            `当前批次：${batchIndex}/${totalBatches}`,
+            "",
+            "用户最终汇总 Prompt：",
+            userPrompt,
+            "",
+            "逐章理解结果 JSON：",
+            JSON.stringify(chapterResults),
+            "",
+            "本批失败章节：",
+            JSON.stringify(failedChapters)
+          ].join("\n")
+        }
+      ]
+    }
+  ];
+}
+
+export function summaryCompressionSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      covered_chapters: {
+        type: "array",
+        items: { type: "integer" }
+      },
+      items: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            topic: { type: "string" },
+            facts: {
+              type: "array",
+              items: { type: "string" }
+            },
+            chapter_refs: {
+              type: "array",
+              items: { type: "integer" }
+            },
+            evidence_notes: {
+              type: "array",
+              items: { type: "string" }
+            },
+            uncertainty: { type: "string" }
+          },
+          required: ["topic", "facts", "chapter_refs", "evidence_notes", "uncertainty"]
+        }
+      },
+      must_keep: {
+        type: "array",
+        items: { type: "string" }
+      },
+      possible_conflicts: {
+        type: "array",
+        items: { type: "string" }
+      },
+      missing_or_failed_chapters: {
+        type: "array",
+        items: { type: "integer" }
+      }
+    },
+    required: ["covered_chapters", "items", "must_keep", "possible_conflicts", "missing_or_failed_chapters"]
+  };
+}
+
+export function buildCompressedSummaryInput({ compressedResults, failedChapters, userPrompt }) {
+  return [
+    {
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text: [
+            userPrompt,
+            "",
+            "以下是逐章理解结果的分批压缩摘要 JSON。请基于这些中间摘要进行最终汇总。",
+            "注意：中间摘要已经包含章节引用和关键证据线索；不要要求重新读取原文。",
+            "",
+            "分批压缩摘要 JSON：",
+            JSON.stringify(compressedResults),
+            "",
+            "失败章节：",
+            JSON.stringify(failedChapters)
+          ].join("\n")
+        }
+      ]
+    }
+  ];
+}
+
 export function buildL1ChapterInput({ chapterIndex, title, content }) {
   return [
     {

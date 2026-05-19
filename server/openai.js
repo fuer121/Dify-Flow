@@ -4,7 +4,7 @@ import tls from "node:tls";
 import { config, requireOpenAIConfig } from "./config.js";
 import { sanitizeDetails, sanitizeText } from "./sanitize.js";
 
-export async function callOpenAIJson({ model, reasoningEffort, instructions, input, schema, schemaName = "result" }) {
+export async function callOpenAIJson({ model, reasoningEffort, instructions, input, schema, schemaName = "result", maxOutputTokens }) {
   requireOpenAIConfig();
   const body = {
     model: model || config.openai.model,
@@ -23,6 +23,9 @@ export async function callOpenAIJson({ model, reasoningEffort, instructions, inp
       }
     }
   };
+  if (Number.isFinite(Number(maxOutputTokens)) && Number(maxOutputTokens) > 0) {
+    body.max_output_tokens = Number(maxOutputTokens);
+  }
 
   const response = await postOpenAIJson("responses", body);
 
@@ -46,7 +49,7 @@ export async function callOpenAIJson({ model, reasoningEffort, instructions, inp
   }
 }
 
-export async function callOpenAIText({ model, reasoningEffort, instructions, input }) {
+export async function callOpenAIText({ model, reasoningEffort, instructions, input, maxOutputTokens }) {
   requireOpenAIConfig();
   const body = {
     model: model || config.openai.model,
@@ -57,6 +60,9 @@ export async function callOpenAIText({ model, reasoningEffort, instructions, inp
     instructions,
     input
   };
+  if (Number.isFinite(Number(maxOutputTokens)) && Number(maxOutputTokens) > 0) {
+    body.max_output_tokens = Number(maxOutputTokens);
+  }
 
   const response = await postOpenAIJson("responses", body);
 

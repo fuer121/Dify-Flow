@@ -124,6 +124,7 @@ test("OpenAI request uses Responses API with store false and no background mode"
     assert.equal(capturedBody.store, false);
     assert.equal(Object.hasOwn(capturedBody, "background"), false);
     assert.equal(capturedBody.model, "gpt-5.5");
+    assert.equal(Object.hasOwn(capturedBody, "max_output_tokens"), false);
   } finally {
     global.fetch = previousFetch;
   }
@@ -163,6 +164,7 @@ test("OpenAI text request uses Responses API with store false and no schema form
     assert.equal(capturedBody.store, false);
     assert.equal(Object.hasOwn(capturedBody, "background"), false);
     assert.equal(Object.hasOwn(capturedBody, "text"), false);
+    assert.equal(Object.hasOwn(capturedBody, "max_output_tokens"), false);
   } finally {
     global.fetch = previousFetch;
   }
@@ -494,10 +496,15 @@ test("imports once, skips stored chapters, and analyzes from encrypted local sto
     if (String(url).includes("api.openai.com/v1/responses")) {
       openaiCalls += 1;
       const body = JSON.parse(request.body);
-      const isSummary = !body.text?.format;
-      const outputValue = isSummary
+      const formatName = body.text?.format?.name || "";
+      const text = body.input[0].content[0].text;
+      const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
+      const outputValue = formatName === "final_analysis"
         ? { title: "汇总", summary: "全书摘要", items: [], failed_chapters: [] }
-        : { chapter_index: openaiCalls, chapter_title: `第${openaiCalls}章`, summary: "章节摘要", key_points: [], evidence_notes: [] };
+        : { chapter_index: chapterIndex, chapter_title: `第${chapterIndex}章`, summary: "章节摘要", key_points: [], evidence_notes: [] };
+      if (formatName !== "final_analysis") {
+        assert.equal(formatName, "chapter_result");
+      }
       return {
         ok: true,
         json: async () => ({
@@ -581,8 +588,8 @@ test("analyzes selected non-contiguous chapters, preserves prompt snapshot, and 
       throw new Error(`Unexpected fetch URL: ${url}`);
     }
     const body = JSON.parse(request.body);
-    const isSummary = !body.text?.format;
-    if (isSummary) {
+    const formatName = body.text?.format?.name || "";
+    if (formatName === "final_analysis") {
       return {
         ok: true,
         json: async () => ({
@@ -592,6 +599,7 @@ test("analyzes selected non-contiguous chapters, preserves prompt snapshot, and 
       };
     }
 
+    assert.equal(formatName, "chapter_result");
     const text = body.input[0].content[0].text;
     const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
     requestedChapters.push(chapterIndex);
@@ -713,8 +721,8 @@ test("analysis keeps default input without L1 and appends L1 context only when e
     }
     const body = JSON.parse(request.body);
     const text = body.input[0].content[0].text;
-    const isSummary = !body.text?.format;
-    if (isSummary) {
+    const formatName = body.text?.format?.name || "";
+    if (formatName === "final_analysis") {
       summaryPrompts.push(text);
       return {
         ok: true,
@@ -725,6 +733,7 @@ test("analysis keeps default input without L1 and appends L1 context only when e
       };
     }
 
+    assert.equal(formatName, "chapter_result");
     chapterPrompts.push(text);
     return {
       ok: true,
@@ -797,7 +806,8 @@ test("stores plain text final analysis result when summary is not JSON", async (
       throw new Error(`Unexpected fetch URL: ${url}`);
     }
     const body = JSON.parse(request.body);
-    const isSummary = !body.text?.format;
+    const formatName = body.text?.format?.name || "";
+    const isSummary = !formatName;
     const outputValue = isSummary
       ? "这是纯文本最终汇总"
       : JSON.stringify({
@@ -862,12 +872,13 @@ test("exposes partial analysis results and resumes by skipping completed chapter
       throw new Error(`Unexpected fetch URL: ${url}`);
     }
     const body = JSON.parse(request.body);
-    const isSummary = !body.text?.format;
-    if (isSummary) {
+    const formatName = body.text?.format?.name || "";
+    if (formatName === "final_analysis") {
       summaryCalls += 1;
       if (failChapterTwo) {
         throw new Error("summary interrupted");
       }
+      assert.equal(body.max_output_tokens > 0, true);
       return {
         ok: true,
         json: async () => ({
@@ -877,6 +888,7 @@ test("exposes partial analysis results and resumes by skipping completed chapter
       };
     }
 
+    assert.equal(formatName, "chapter_result");
     const text = body.input[0].content[0].text;
     const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
     requestedChapters.push(chapterIndex);
@@ -969,11 +981,12 @@ test("resumes summary failure without rerunning completed chapters", async () =>
       throw new Error(`Unexpected fetch URL: ${url}`);
     }
     const body = JSON.parse(request.body);
-    const isSummary = !body.text?.format;
-    if (isSummary) {
+    const formatName = body.text?.format?.name || "";
+    if (formatName === "final_analysis") {
       if (failSummary) {
         throw new Error("summary network fail");
       }
+      assert.equal(body.max_output_tokens > 0, true);
       return {
         ok: true,
         json: async () => ({
@@ -983,6 +996,7 @@ test("resumes summary failure without rerunning completed chapters", async () =>
       };
     }
 
+    assert.equal(formatName, "chapter_result");
     const text = body.input[0].content[0].text;
     const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
     requestedChapters.push(chapterIndex);
@@ -1045,6 +1059,7 @@ test("compresses large summary inputs before final analysis", async () => {
   const previousFetch = global.fetch;
   let finalSummaryCalls = 0;
   let largestSummaryInput = 0;
+  let finalSummaryUsedSchema = false;
 
   global.fetch = async (url, request) => {
     if (String(url).includes("api.openai.com/v1/models")) {
@@ -1061,12 +1076,14 @@ test("compresses large summary inputs before final analysis", async () => {
     const body = JSON.parse(request.body);
     const text = body.input[0].content[0].text;
     const formatName = body.text?.format?.name || "";
-    if (!formatName) {
+    if (formatName === "final_analysis") {
+      finalSummaryUsedSchema = true;
       largestSummaryInput = Math.max(largestSummaryInput, text.length);
       if (text.includes("分批压缩摘要 JSON")) {
         finalSummaryCalls += 1;
         assert.match(text, /"chapter_index":1/);
         assert.match(text, /"chapter_index":90/);
+        assert.equal(body.max_output_tokens > 0, true);
         return {
           ok: true,
           json: async () => ({
@@ -1078,10 +1095,15 @@ test("compresses large summary inputs before final analysis", async () => {
       throw new Error("Large summary should use compression before final summary");
     }
 
+    if (!formatName) {
+      throw new Error("JSON summary tasks should use final_analysis schema");
+    }
+
     if (formatName === "summary_compression") {
       throw new Error("Large summary should use local compaction instead of OpenAI compression");
     }
 
+    assert.equal(formatName, "chapter_result");
     const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
     return {
       ok: true,
@@ -1113,7 +1135,8 @@ test("compresses large summary inputs before final analysis", async () => {
     await waitForTask(analysis);
     assert.equal(analysis.status, "completed");
     assert.equal(finalSummaryCalls, 1);
-    assert.ok(largestSummaryInput < 45_000);
+    assert.equal(finalSummaryUsedSchema, true);
+    assert.ok(largestSummaryInput < 30_000);
     const result = await workflows.publicAnalysisRunWithResult(analysis.id);
     assert.equal(result.finalResult.summary, "压缩后完成");
   } finally {
@@ -1155,8 +1178,9 @@ test("retries transient compacted final summary failures", async () => {
       throw new Error("Large summary should use local compaction instead of OpenAI compression");
     }
 
-    if (!formatName) {
+    if (formatName === "final_analysis") {
       finalSummaryCalls += 1;
+      assert.equal(body.max_output_tokens > 0, true);
       if (finalSummaryCalls === 1) {
         throw new Error("This operation was aborted");
       }
@@ -1169,6 +1193,11 @@ test("retries transient compacted final summary failures", async () => {
       };
     }
 
+    if (!formatName) {
+      throw new Error("JSON summary tasks should use final_analysis schema");
+    }
+
+    assert.equal(formatName, "chapter_result");
     const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
     return {
       ok: true,

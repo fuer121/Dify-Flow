@@ -55,7 +55,8 @@ import {
 import { sanitizeText } from "./sanitize.js";
 
 const DIRECT_SUMMARY_MAX_CHARS = 80_000;
-const SUMMARY_COMPACT_TARGET_CHARS = 28_000;
+const SUMMARY_COMPACT_TARGET_CHARS = 18_000;
+const SUMMARY_FINAL_MAX_OUTPUT_TOKENS = 4500;
 const SUMMARY_STAGE_MAX_ATTEMPTS = 3;
 const SUMMARY_STAGE_RETRY_DELAY_MS = 1200;
 
@@ -600,7 +601,8 @@ async function executeAnalysisTask(task, prepared) {
     reasoningEffort,
     chapterResults,
     failedChapters,
-    userPrompt: settings.summary_prompt
+    userPrompt: settings.summary_prompt,
+    outputSchema: settings.output_schema
   });
 
   assertNotCancelled(task);
@@ -629,15 +631,11 @@ async function reusableAnalysisChapter({ analysisId, chapter, promptHash }) {
   return decryptAnalysisChapterResult(analysisId, chapter.chapter_index);
 }
 
-async function summarizeAnalysisResults({ task, model, reasoningEffort, chapterResults, failedChapters, userPrompt }) {
+async function summarizeAnalysisResults({ task, model, reasoningEffort, chapterResults, failedChapters, userPrompt, outputSchema }) {
   const directInput = buildSummaryInput({ chapterResults, failedChapters, userPrompt });
+  const finalSchema = parseOutputSchemaOrNull(outputSchema);
   if (inputTextLength(directInput) <= DIRECT_SUMMARY_MAX_CHARS) {
-    return runSummaryStageWithRetry(task, "GPT 汇总分析结果", () => callOpenAIText({
-      model,
-      reasoningEffort,
-      instructions: "你是严谨的小说多章节汇总引擎。按用户汇总 Prompt 输出最终结果；如果用户要求 JSON，则只输出合法 JSON，否则直接输出文本，不要添加无关解释。",
-      input: directInput
-    }));
+    return runFinalSummaryCall({ task, stageLabel: "GPT 汇总分析结果", model, reasoningEffort, userPrompt, input: directInput, schema: finalSchema });
   }
 
   await waitIfPaused(task);
@@ -656,15 +654,39 @@ async function summarizeAnalysisResults({ task, model, reasoningEffort, chapterR
     progress: { ...task.progress, current: "GPT 汇总压缩结果" },
     message: "正在基于压缩素材生成最终汇总"
   });
-  return runSummaryStageWithRetry(task, "GPT 汇总压缩结果", () => callOpenAIText({
+  return runFinalSummaryCall({
+    task,
+    stageLabel: "GPT 汇总压缩结果",
     model,
     reasoningEffort: "low",
-    instructions: "你是严谨的小说多章节汇总引擎。按用户汇总 Prompt 输出最终结果；如果用户要求 JSON，则只输出合法 JSON，否则直接输出文本，不要添加无关解释。",
+    userPrompt,
     input: buildCompressedSummaryInput({
       compressedResults,
       failedChapters,
       userPrompt
-    })
+    }),
+    schema: finalSchema
+  });
+}
+
+async function runFinalSummaryCall({ task, stageLabel, model, reasoningEffort, userPrompt, input, schema }) {
+  if (schema && shouldUseJsonFinalSummary(userPrompt)) {
+    return runSummaryStageWithRetry(task, stageLabel, () => callOpenAIJson({
+      model,
+      reasoningEffort,
+      instructions: "你是严谨的小说多章节汇总引擎。按用户汇总 Prompt 输出最终结果；如果用户要求 JSON，则只输出合法 JSON，否则直接输出文本，不要添加无关解释。",
+      input,
+      schema,
+      schemaName: "final_analysis",
+      maxOutputTokens: SUMMARY_FINAL_MAX_OUTPUT_TOKENS
+    }));
+  }
+  return runSummaryStageWithRetry(task, stageLabel, () => callOpenAIText({
+    model,
+    reasoningEffort,
+    instructions: "你是严谨的小说多章节汇总引擎。按用户汇总 Prompt 输出最终结果；如果用户要求 JSON，则只输出合法 JSON，否则直接输出文本，不要添加无关解释。",
+    input,
+    maxOutputTokens: SUMMARY_FINAL_MAX_OUTPUT_TOKENS
   }));
 }
 
@@ -708,6 +730,20 @@ function shouldRetrySummaryStage(error) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseOutputSchemaOrNull(value) {
+  try {
+    const schema = JSON.parse(String(value || ""));
+    return schema && typeof schema === "object" ? schema : null;
+  } catch {
+    return null;
+  }
+}
+
+function shouldUseJsonFinalSummary(userPrompt) {
+  const prompt = String(userPrompt || "").toLowerCase();
+  return !prompt.includes("不要 json") && !prompt.includes("纯文本") && !prompt.includes("plain text");
 }
 
 function inputTextLength(input) {
@@ -769,6 +805,7 @@ function clipText(value, maxChars) {
 }
 
 function parseJsonOrText(value) {
+  if (value && typeof value === "object") return value;
   const text = String(value || "").trim();
   if (!text) return "";
   try {

@@ -57,7 +57,9 @@ import {
 import { sanitizeText } from "./sanitize.js";
 
 const DIRECT_SUMMARY_MAX_CHARS = 80_000;
-const SUMMARY_COMPRESSION_BATCH_CHARS = 45_000;
+const SUMMARY_COMPRESSION_BATCH_CHARS = 18_000;
+const SUMMARY_STAGE_MAX_ATTEMPTS = 3;
+const SUMMARY_STAGE_RETRY_DELAY_MS = 1200;
 
 export function startImportTask(payload) {
   const bookId = normalizeBookId(payload.book_id ?? payload.bookId);
@@ -650,7 +652,7 @@ async function summarizeAnalysisResults({ task, model, reasoningEffort, chapterR
     });
     const batchIndexes = new Set(batches[index].map((entry) => Number(entry.chapter_index)));
     const batchFailedChapters = failedChapters.filter((chapterIndex) => batchIndexes.has(Number(chapterIndex)));
-    const response = await callOpenAIJson({
+    const response = await runSummaryStageWithRetry(task, `压缩汇总素材 ${index + 1}/${batches.length}`, () => callOpenAIJson({
       model,
       reasoningEffort,
       instructions: "你是小说分析结果压缩器。请按 Schema 把当前批次逐章理解结果压缩成面向用户最终目标的结构化 JSON。",
@@ -663,7 +665,7 @@ async function summarizeAnalysisResults({ task, model, reasoningEffort, chapterR
       }),
       schema: summaryCompressionSchema(),
       schemaName: "summary_compression"
-    });
+    }));
     const expectedChapters = batches[index].map((entry) => Number(entry.chapter_index)).filter(Number.isFinite);
     validateCompressedCoverage({
       batchIndex: index + 1,
@@ -682,7 +684,7 @@ async function summarizeAnalysisResults({ task, model, reasoningEffort, chapterR
     progress: { ...task.progress, current: "GPT 汇总压缩结果" },
     message: "正在基于压缩素材生成最终汇总"
   });
-  return callOpenAIText({
+  return runSummaryStageWithRetry(task, "GPT 汇总压缩结果", () => callOpenAIText({
     model,
     reasoningEffort,
     instructions: "你是严谨的小说多章节汇总引擎。按用户汇总 Prompt 输出最终结果；如果用户要求 JSON，则只输出合法 JSON，否则直接输出文本，不要添加无关解释。",
@@ -691,7 +693,48 @@ async function summarizeAnalysisResults({ task, model, reasoningEffort, chapterR
       failedChapters,
       userPrompt
     })
-  });
+  }));
+}
+
+async function runSummaryStageWithRetry(task, stageLabel, operation) {
+  let lastError;
+  for (let attempt = 1; attempt <= SUMMARY_STAGE_MAX_ATTEMPTS; attempt += 1) {
+    await waitIfPaused(task);
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (!shouldRetrySummaryStage(error) || attempt >= SUMMARY_STAGE_MAX_ATTEMPTS) {
+        throw error;
+      }
+      updateTask(task, {
+        progress: { ...task.progress, current: stageLabel },
+        message: `${stageLabel} 失败，准备重试 ${attempt + 1}/${SUMMARY_STAGE_MAX_ATTEMPTS}：${sanitizeText(error.message)}`
+      }, "warning");
+      await delay(SUMMARY_STAGE_RETRY_DELAY_MS * attempt);
+    }
+  }
+  throw lastError;
+}
+
+function shouldRetrySummaryStage(error) {
+  const message = String(error?.message || "").toLowerCase();
+  if (message.includes("汇总素材压缩覆盖")) return false;
+  if (error?.status === 429 || error?.status >= 500) return true;
+  return [
+    "aborted",
+    "timeout",
+    "timed out",
+    "fetch failed",
+    "network",
+    "网络连接失败",
+    "unexpected end of json input",
+    "不是合法 json"
+  ].some((pattern) => message.includes(pattern));
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function chunkChapterResults(chapterResults, maxChars) {

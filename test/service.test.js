@@ -1246,6 +1246,119 @@ test("rejects compressed summary when chapter coverage is incomplete", async () 
   }
 });
 
+test("retries transient summary compression failures", async () => {
+  const chapterCount = 90;
+  for (let chapterIndex = 1; chapterIndex <= chapterCount; chapterIndex += 1) {
+    await db.saveEncryptedChapter({
+      bookId: "book-large-summary-retry",
+      chapterIndex,
+      title: `第${chapterIndex}章`,
+      content: `第${chapterIndex}章正文`
+    });
+  }
+
+  const previousFetch = global.fetch;
+  let compressionAttempts = 0;
+  let finalSummaryCalls = 0;
+
+  global.fetch = async (url, request) => {
+    if (String(url).includes("api.openai.com/v1/models")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ data: [] })
+      };
+    }
+
+    if (!String(url).includes("api.openai.com/v1/responses")) {
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    }
+    const body = JSON.parse(request.body);
+    const text = body.input[0].content[0].text;
+    const formatName = body.text?.format?.name || "";
+
+    if (formatName === "summary_compression") {
+      compressionAttempts += 1;
+      if (compressionAttempts === 1) {
+        throw new Error("This operation was aborted");
+      }
+      const coveredChapters = extractChapterIndexesFromCompressionInput(text);
+      return {
+        ok: true,
+        json: async () => ({
+          id: `resp_large_retry_compress_${compressionAttempts}`,
+          output: [{
+            content: [{
+              type: "output_text",
+              text: JSON.stringify({
+                covered_chapters: coveredChapters,
+                items: [{
+                  topic: `批次${compressionAttempts}摘要`,
+                  facts: ["重试后保留事实"],
+                  chapter_refs: coveredChapters,
+                  evidence_notes: ["保留章节引用"],
+                  uncertainty: ""
+                }],
+                must_keep: ["关键保留项"],
+                possible_conflicts: [],
+                missing_or_failed_chapters: []
+              })
+            }]
+          }]
+        })
+      };
+    }
+
+    if (!formatName) {
+      finalSummaryCalls += 1;
+      return {
+        ok: true,
+        json: async () => ({
+          id: "resp_large_retry_final",
+          output: [{ content: [{ type: "output_text", text: JSON.stringify({ title: "大汇总", summary: "重试后完成", items: [], failed_chapters: [] }) }] }]
+        })
+      };
+    }
+
+    const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
+    return {
+      ok: true,
+      json: async () => ({
+        id: `resp_large_retry_chapter_${chapterIndex}`,
+        output: [{
+          content: [{
+            type: "output_text",
+            text: JSON.stringify({
+              chapter_index: chapterIndex,
+              chapter_title: `第${chapterIndex}章`,
+              summary: `章节${chapterIndex}摘要${"长摘要".repeat(140)}`,
+              key_points: [`关键点${chapterIndex}${"内容".repeat(120)}`],
+              evidence_notes: [`证据${chapterIndex}${"线索".repeat(120)}`]
+            })
+          }]
+        }]
+      })
+    };
+  };
+
+  try {
+    const analysis = workflows.startAnalysisTask({
+      name: "大输入汇总重试",
+      book_id: "book-large-summary-retry",
+      start_chapter: 1,
+      end_chapter: chapterCount
+    });
+    await waitForTask(analysis);
+    assert.equal(analysis.status, "completed");
+    assert.ok(compressionAttempts > 1);
+    assert.equal(finalSummaryCalls, 1);
+    const result = await workflows.publicAnalysisRunWithResult(analysis.id);
+    assert.equal(result.finalResult.summary, "重试后完成");
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
 async function waitForTask(task) {
   const started = Date.now();
   while (!["completed", "failed", "cancelled"].includes(task.status)) {

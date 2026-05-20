@@ -135,6 +135,7 @@ export function TaskBox({ task, onCancel, onPause, onResume }) {
 
 export function StatusPill({ status }) {
   const label = {
+    idle: "空闲",
     queued: "排队",
     running: "运行",
     paused: "暂停",

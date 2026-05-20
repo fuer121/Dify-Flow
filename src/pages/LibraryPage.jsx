@@ -8,8 +8,8 @@ import {
   RefreshCcw,
   Trash2
 } from "lucide-react";
-import { apiGet, apiPost } from "../api.js";
-import { BookList, IconButton, Panel, TaskBox } from "../ui.jsx";
+import { apiGet, apiPost, formatTime } from "../api.js";
+import { IconButton, Panel, StatusPill, TaskBox } from "../ui.jsx";
 
 const initialImportForm = {
   book_id: "",
@@ -232,11 +232,22 @@ export function LibraryPage({
 
   return (
     <section className="library-layout library-layout-single">
+      <Panel
+        className="library-directory-panel"
+        icon={Database}
+        title="本地书库"
+        action={<IconButton icon={RefreshCcw} label="刷新" onClick={onBooksChanged} />}
+      >
+        <LibraryDirectory
+          books={books}
+          selectedBookId={selectedBookId}
+          onSelect={selectBook}
+        />
+      </Panel>
       <aside className="side">
         <Panel
           icon={BookOpen}
           title="全书导入"
-          action={<IconButton icon={RefreshCcw} label="刷新" onClick={onBooksChanged} />}
         >
           <div className="form-grid import-form-grid">
             <label>
@@ -421,9 +432,12 @@ export function LibraryPage({
           />
           <L2FactPreview facts={l2Facts} />
         </Panel>
-
-        <Panel icon={Database} title="本地书库">
-          <BookList books={books} selectedBookId={selectedBookId} onSelect={selectBook} />
+        <Panel icon={Database} title="书籍管理">
+          <div className="selected-book-card">
+            <span>当前选中</span>
+            <strong>{selectedBook?.book_name || selectedBookId || "未选择书籍"}</strong>
+            <small>{selectedBook ? `${selectedBook.book_id} · ${selectedBook.chapter_count || 0} 章 · ${chapterRange(selectedBook)}` : "先从顶部书库目录选择一本书"}</small>
+          </div>
           <button className="danger" type="button" onClick={deleteSelectedBook} disabled={!selectedBookId}>
             <Trash2 size={16} />
             删除选中书籍
@@ -431,6 +445,43 @@ export function LibraryPage({
         </Panel>
       </aside>
     </section>
+  );
+}
+
+function LibraryDirectory({ books, selectedBookId, onSelect }) {
+  if (!books.length) return <div className="empty-state">暂无书籍</div>;
+  const totalBooks = books.length;
+  const totalChapters = books.reduce((sum, book) => sum + Number(book.chapter_count || 0), 0);
+  return (
+    <div className="library-directory">
+      <div className="library-directory-summary">
+        <span>{totalBooks} 本书</span>
+        <span>{totalChapters} 章已入库</span>
+        <span>导入来源：本机共享库</span>
+      </div>
+      <div className="library-directory-grid">
+        {books.map((book) => (
+          <button
+            key={book.book_id}
+            type="button"
+            className={book.book_id === selectedBookId ? "library-book-card active" : "library-book-card"}
+            onClick={() => onSelect(book.book_id)}
+          >
+            <div>
+              <strong>{book.book_name || book.book_id}</strong>
+              <small>{book.book_id}</small>
+            </div>
+            <div className="library-book-meta">
+              <span>{book.chapter_count || 0} 章</span>
+              <span>{chapterRange(book)}</span>
+              <span>导入人：本机共享库</span>
+              <span>更新时间：{formatTime(book.updated_at)}</span>
+            </div>
+            <StatusPill status={book.last_import_status || "idle"} />
+          </button>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -442,6 +493,12 @@ function validChapterNumber(value) {
 function sanitizeChapterInput(value) {
   const digits = String(value || "").replace(/\D/g, "");
   return digits.replace(/^0+(?=\d)/, "").replace(/^0$/, "");
+}
+
+function chapterRange(book) {
+  const first = book?.first_chapter || "-";
+  const last = book?.last_chapter || "-";
+  return `${first}-${last}`;
 }
 
 function CoverageSummary({ coverage, chapters }) {

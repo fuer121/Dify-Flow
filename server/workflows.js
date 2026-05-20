@@ -57,6 +57,7 @@ import { sanitizeText } from "./sanitize.js";
 const DIRECT_SUMMARY_MAX_CHARS = 80_000;
 const SUMMARY_COMPACT_TARGET_CHARS = 18_000;
 const SUMMARY_FINAL_MAX_OUTPUT_TOKENS = 4500;
+const CUSTOM_FIELD_SUMMARY_MAX_OUTPUT_TOKENS = 3000;
 const SUMMARY_STAGE_MAX_ATTEMPTS = 3;
 const SUMMARY_STAGE_RETRY_DELAY_MS = 1200;
 
@@ -659,17 +660,30 @@ async function summarizeAnalysisResults({ task, model, reasoningEffort, chapterR
     progress: { ...task.progress, current: "GPT 汇总压缩结果" },
     message: "正在基于压缩素材生成最终汇总"
   });
+  const compressedInput = buildCompressedSummaryInput({
+    compressedResults,
+    failedChapters,
+    userPrompt
+  });
+  if (shouldSplitCustomFinalSummary(finalSchema)) {
+    return runCustomFieldSummaryCalls({
+      task,
+      model,
+      reasoningEffort: "low",
+      userPrompt,
+      compressedResults,
+      failedChapters,
+      schema: finalSchema,
+      sourceChapterCount
+    });
+  }
   return runFinalSummaryCall({
     task,
     stageLabel: "GPT 汇总压缩结果",
     model,
     reasoningEffort: "low",
     userPrompt,
-    input: buildCompressedSummaryInput({
-      compressedResults,
-      failedChapters,
-      userPrompt
-    }),
+    input: compressedInput,
     schema: finalSchema,
     sourceChapterCount
   });
@@ -703,6 +717,121 @@ async function runFinalSummaryCall({ task, stageLabel, model, reasoningEffort, i
     assertFinalSummaryUseful(parseJsonOrText(response.value), sourceChapterCount);
     return response;
   });
+}
+
+function shouldSplitCustomFinalSummary(schema) {
+  if (schema?.schemaName !== "custom_final_analysis") return false;
+  const properties = schema.schema?.properties;
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) return false;
+  return Object.keys(properties).length >= 2;
+}
+
+async function runCustomFieldSummaryCalls({ task, model, reasoningEffort, userPrompt, compressedResults, failedChapters, schema, sourceChapterCount }) {
+  const properties = schema.schema.properties || {};
+  const finalValue = {};
+  const responseIds = [];
+  const fieldNames = Object.keys(properties);
+
+  for (const fieldName of fieldNames) {
+    await waitIfPaused(task);
+    updateTask(task, {
+      progress: { ...task.progress, current: `GPT 分字段汇总 ${fieldName}` },
+      message: `正在生成最终 JSON 字段：${fieldName}`
+    });
+
+    const fieldSchema = buildSingleFieldSummarySchema({
+      fieldName,
+      fieldSchema: properties[fieldName]
+    });
+    const response = await runSummaryStageWithRetry(task, `GPT 分字段汇总 ${fieldName}`, async () => {
+      const result = await callOpenAIJson({
+        model,
+        reasoningEffort,
+        instructions: "你是严谨的小说多章节汇总引擎。当前只生成用户最终 JSON 模板中的一个顶层字段；只输出合法 JSON，不要添加无关解释。",
+        input: buildCustomFieldSummaryInput({
+          userPrompt,
+          compressedResults,
+          failedChapters,
+          fieldName,
+          fieldSchema: properties[fieldName]
+        }),
+        schema: fieldSchema,
+        schemaName: safeSchemaName(`custom_field_${fieldName}`),
+        maxOutputTokens: CUSTOM_FIELD_SUMMARY_MAX_OUTPUT_TOKENS,
+        strict: false
+      });
+      if (!result.value || typeof result.value !== "object" || Array.isArray(result.value) || !Object.hasOwn(result.value, fieldName)) {
+        const error = new Error(`分字段汇总缺少字段：${fieldName}`);
+        error.status = 502;
+        throw error;
+      }
+      return result;
+    });
+
+    finalValue[fieldName] = response.value[fieldName];
+    if (response.responseId) responseIds.push(response.responseId);
+  }
+
+  assertFinalSummaryUseful(finalValue, sourceChapterCount);
+  return {
+    value: finalValue,
+    responseId: responseIds.join(",") || null
+  };
+}
+
+function buildSingleFieldSummarySchema({ fieldName, fieldSchema }) {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      [fieldName]: fieldSchema || looseJsonValueSchema()
+    },
+    required: [fieldName]
+  };
+}
+
+function buildCustomFieldSummaryInput({ userPrompt, compressedResults, failedChapters, fieldName, fieldSchema }) {
+  return [
+    {
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text: [
+            userPrompt,
+            "",
+            "以下是逐章理解结果的分批压缩摘要 JSON。请基于这些中间摘要进行最终汇总。",
+            "注意：中间摘要已经包含章节引用和关键证据线索；不要要求重新读取原文。",
+            "",
+            `当前只生成最终 JSON 的一个顶层字段：${fieldName}`,
+            "输出要求：",
+            `- 只输出一个 JSON 对象，且只包含 ${fieldName} 这一个顶层字段。`,
+            "- 字段含义、颗粒度、命名和取舍标准必须服从用户汇总 Prompt 中同名字段。",
+            "- 如果该字段确实没有可用信息，输出符合字段类型的空值；不要输出 N/A、暂无、占位说明。",
+            "- 不要输出 Markdown，不要输出其他顶层字段。",
+            "",
+            "当前字段 Schema JSON：",
+            JSON.stringify(fieldSchema || looseJsonValueSchema()),
+            "",
+            "分批压缩摘要 JSON：",
+            JSON.stringify(compressedResults),
+            "",
+            "失败章节：",
+            JSON.stringify(failedChapters)
+          ].join("\n")
+        }
+      ]
+    }
+  ];
+}
+
+function safeSchemaName(value) {
+  const normalized = String(value || "")
+    .replace(/[^A-Za-z0-9_-]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 60);
+  return normalized || "custom_field";
 }
 
 async function runSummaryStageWithRetry(task, stageLabel, operation) {

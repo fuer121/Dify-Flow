@@ -357,6 +357,7 @@ Prompt：
 - 正式环境已把 `OPENAI_REQUEST_TIMEOUT_MS` 提高到 `600000`，用于给本地瘦身后的最终汇总更长等待窗口。
 - 最终汇总只在汇总 Prompt 明确要求匹配“给定 JSON Schema”时走默认 `final_analysis` JSON Schema，并设置 `max_output_tokens=4500`。
 - 如果汇总 Prompt 自己定义 JSON 模板，后端会尝试从最后一个合法 JSON 对象模板推导 `custom_final_analysis` Schema，用结构化输出稳定生成，同时保留用户自定义字段结构。
+- 对长输入的自定义 JSON 模板汇总，后端会按顶层字段分多次生成，例如先生成 `major_characters`，再生成 `world_rules`，最后在本地合并为完整 JSON。这样降低单次输出长度，并避免被默认 `title/summary/items/failed_chapters` 格式污染。
 - 如果无法从 Prompt 提取合法 JSON 模板，则按 Prompt 原格式走文本输出；后端会尝试解析 JSON 保存，但不会改写成默认 `title/summary/items/failed_chapters` 结构。
 - 本地瘦身目标已从约 2.8 万字符降到约 1.8 万字符，优先保障 100 章级任务能续跑完成；代价是最终汇总素材更摘要化。
 - 最终汇总保存前会做基础质量闸门：当 3 章以上任务返回 `N/A`、空摘要、空 `items` 且没有其他有效自定义字段时，任务标记失败并保留断点续跑，不把占位结果写成完成态。
@@ -572,6 +573,11 @@ npm run preview:local
   - 为自定义 JSON 汇总 Prompt 新增模板推导：当 Prompt 末尾存在合法 JSON 对象模板时，后端自动生成 `custom_final_analysis` Schema。
   - 该路径既避免默认 `title/summary/items/failed_chapters` 结构污染，也比纯文本 JSON 长生成更稳定。
   - 空数组模板字段使用宽松 JSON 值数组，避免把 `major_characters: []` 锁死成只能输出空数组或字符串数组。
+
+- 2026-05-20：
+  - 继续优化长输入自定义 JSON 汇总：进入本地瘦身路径后，按用户 JSON 模板的顶层字段逐个调用模型生成，再由后端本地合并完整结果。
+  - 该策略主要解决兼容网关在单次超长最终输出时容易 `fetch failed` 或超时的问题；不会改变短输入任务、默认 `final_analysis` Schema 任务、Markdown 或纯文本汇总任务。
+  - 已完成的逐章分析结果仍可断点复用，续跑时只需要重新执行最终分字段汇总阶段。
 
 - 2026-05-19：
   - 修复分析任务最终汇总阶段大输入超时问题。

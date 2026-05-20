@@ -1331,6 +1331,23 @@ test("keeps custom JSON prompt shape instead of forcing default final schema", a
 
 test("derives final schema from large custom JSON prompt template", async () => {
   const chapterCount = 90;
+  const finalFieldValues = {
+    major_characters: [{ name: "陈平安", chapters: [1, 2, 3] }],
+    world_rules: ["规矩一"],
+    major_relationships: [],
+    major_locations: [],
+    major_forces: [],
+    cultivation_system: [],
+    important_items: [],
+    major_events: [],
+    major_foreshadowing: [],
+    core_themes: [],
+    visual_assets: [],
+    ip_assets: [],
+    tone_and_style: { overall: "克制" },
+    corrected_understanding: []
+  };
+  const finalFieldNames = Object.keys(finalFieldValues);
   for (let chapterIndex = 1; chapterIndex <= chapterCount; chapterIndex += 1) {
     await db.saveEncryptedChapter({
       bookId: "book-large-custom-json-template",
@@ -1343,6 +1360,7 @@ test("derives final schema from large custom JSON prompt template", async () => 
   const previousFetch = global.fetch;
   let finalSummaryCalls = 0;
   let largestSummaryInput = 0;
+  const generatedFields = [];
 
   global.fetch = async (url, request) => {
     if (String(url).includes("api.openai.com/v1/models")) {
@@ -1360,44 +1378,32 @@ test("derives final schema from large custom JSON prompt template", async () => 
     const text = body.input[0].content[0].text;
     const formatName = body.text?.format?.name || "";
 
-    if (formatName === "custom_final_analysis") {
+    if (formatName.startsWith("custom_field_")) {
       finalSummaryCalls += 1;
       largestSummaryInput = Math.max(largestSummaryInput, text.length);
       assert.equal(body.text.format.strict, false);
-      assert.equal(body.text.format.schema.properties.major_characters.type, "array");
-      assert.equal(body.text.format.schema.properties.tone_and_style.type, "object");
+      const fieldName = formatName.replace(/^custom_field_/, "");
+      generatedFields.push(fieldName);
+      assert.ok(finalFieldNames.includes(fieldName));
+      assert.match(text, new RegExp(`当前只生成最终 JSON 的一个顶层字段：${fieldName}`));
+      assert.deepEqual(Object.keys(body.text.format.schema.properties), [fieldName]);
       assert.equal(body.max_output_tokens > 0, true);
       return {
         ok: true,
         json: async () => ({
-          id: "resp_large_custom_template_final",
+          id: `resp_large_custom_template_${fieldName}`,
           output: [{
             content: [{
               type: "output_text",
-              text: JSON.stringify({
-                major_characters: [{ name: "陈平安", chapters: [1, 2, 3] }],
-                world_rules: ["规矩一"],
-                major_relationships: [],
-                major_locations: [],
-                major_forces: [],
-                cultivation_system: [],
-                important_items: [],
-                major_events: [],
-                major_foreshadowing: [],
-                core_themes: [],
-                visual_assets: [],
-                ip_assets: [],
-                tone_and_style: { overall: "克制" },
-                corrected_understanding: []
-              })
+              text: JSON.stringify({ [fieldName]: finalFieldValues[fieldName] })
             }]
           }]
         })
       };
     }
 
-    if (formatName === "final_analysis" || formatName === "summary_compression") {
-      throw new Error("Large custom JSON template should use derived schema, not default schema or model compression");
+    if (formatName === "custom_final_analysis" || formatName === "final_analysis" || formatName === "summary_compression") {
+      throw new Error("Large custom JSON template should use per-field derived schema, not one large final schema or model compression");
     }
 
     assert.equal(formatName, "chapter_result");
@@ -1451,7 +1457,8 @@ test("derives final schema from large custom JSON prompt template", async () => 
       }
     });
     await waitForTask(analysis);
-    assert.equal(finalSummaryCalls, 1);
+    assert.equal(finalSummaryCalls, finalFieldNames.length);
+    assert.deepEqual(generatedFields.sort(), finalFieldNames.sort());
     assert.ok(largestSummaryInput < 30_000);
     const result = await workflows.publicAnalysisRunWithResult(analysis.id);
     assert.deepEqual(Object.keys(result.finalResult).sort(), [

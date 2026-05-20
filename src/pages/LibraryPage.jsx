@@ -585,17 +585,14 @@ function L2CoverageSummary({ coverage }) {
 
 function L1Preview({ chapters }) {
   if (!chapters.length) return null;
+  const chapter = chapters[0];
   return (
     <div className="index-preview">
       <h3>L1 索引预览</h3>
-      <div className="index-preview-grid">
-        {chapters.slice(0, 5).map((chapter) => (
-          <article key={`chapter-${chapter.chapter_index}`}>
-            <strong>章节 {chapter.chapter_index}</strong>
-            <p>{chapter.summary || chapter.error_summary || "暂无摘要"}</p>
-          </article>
-        ))}
-      </div>
+      <article>
+        <strong>章节 {chapter.chapter_index}</strong>
+        <p>{chapter.summary || chapter.error_summary || "暂无摘要"}</p>
+      </article>
     </div>
   );
 }

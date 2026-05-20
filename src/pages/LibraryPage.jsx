@@ -61,7 +61,6 @@ export function LibraryPage({
   const [l1Chapters, setL1Chapters] = useState([]);
   const [l2Coverage, setL2Coverage] = useState(null);
   const [l2Facts, setL2Facts] = useState([]);
-  const [libraryExpanded, setLibraryExpanded] = useState(false);
   const [importForm, setImportForm] = useState({
     ...initialImportForm,
     book_id: initialBookId,
@@ -242,11 +241,8 @@ export function LibraryPage({
         >
           <LibraryDirectory
             books={books}
-            selectedBook={selectedBook}
             selectedBookId={selectedBookId}
             onSelect={selectBook}
-            expanded={libraryExpanded}
-            onToggleExpanded={() => setLibraryExpanded((value) => !value)}
             onDeleteSelected={deleteSelectedBook}
           />
         </Panel>
@@ -445,64 +441,50 @@ export function LibraryPage({
   );
 }
 
-function LibraryDirectory({ books, selectedBook, selectedBookId, expanded, onToggleExpanded, onSelect, onDeleteSelected }) {
+function LibraryDirectory({ books, selectedBookId, onSelect, onDeleteSelected }) {
   if (!books.length) return <div className="empty-state">暂无书籍</div>;
   const totalBooks = books.length;
-  const book = selectedBook || books[0];
   return (
     <div className="library-directory">
       <div className="library-directory-summary">
         <span>{totalBooks} 本书</span>
       </div>
-      <div className="selected-library-book">
-        <div className="selected-library-book-main">
-          <span>当前书籍</span>
-          <strong>{book.book_name || book.book_id}</strong>
-          <small>{book.book_id}</small>
-        </div>
-        <div className="library-book-meta">
-          <span>{book.chapter_count || 0} 章</span>
-          <span>{chapterRange(book)}</span>
-          <span>导入人：本机共享库</span>
-          <span>更新时间：{formatTime(book.updated_at)}</span>
-        </div>
-        <StatusPill status={book.last_import_status || "idle"} />
-        <div className="library-directory-actions">
-          <button className="secondary" type="button" onClick={onToggleExpanded}>
-            {expanded ? "收起书库" : "切换书籍"}
-          </button>
-          <button className="danger inline" type="button" onClick={onDeleteSelected} disabled={!selectedBookId}>
-            <Trash2 size={15} />
-            删除
-          </button>
-        </div>
-      </div>
-      {expanded ? (
-        <div className="library-directory-grid">
-          {books.map((entry) => (
-            <button
+      <div className="library-book-list" role="list">
+        {books.map((entry) => {
+          const active = entry.book_id === selectedBookId;
+          return (
+            <div
               key={entry.book_id}
-              type="button"
-              className={entry.book_id === selectedBookId ? "library-book-card active" : "library-book-card"}
-              onClick={() => {
-                onSelect(entry.book_id);
-                onToggleExpanded();
-              }}
+              className={active ? "library-book-row active" : "library-book-row"}
+              role="listitem"
             >
-              <div>
-                <strong>{entry.book_name || entry.book_id}</strong>
-                <small>{entry.book_id}</small>
-              </div>
-              <div className="library-book-meta compact">
-                <span>{entry.chapter_count || 0} 章</span>
-                <span>{chapterRange(entry)}</span>
-                <span>{formatTime(entry.updated_at)}</span>
-              </div>
+              <button
+                type="button"
+                className="library-book-select"
+                onClick={() => onSelect(entry.book_id)}
+              >
+                <div className="library-book-title">
+                  <strong>{entry.book_name || entry.book_id}</strong>
+                  <small>{entry.book_id}</small>
+                </div>
+                <div className="library-book-meta compact">
+                  <span>{entry.chapter_count || 0} 章</span>
+                  <span>{chapterRange(entry)}</span>
+                  <span>导入人：本机共享库</span>
+                  <span>{formatTime(entry.updated_at)}</span>
+                </div>
+              </button>
               <StatusPill status={entry.last_import_status || "idle"} />
-            </button>
-          ))}
-        </div>
-      ) : null}
+              {active ? (
+                <button className="danger inline" type="button" onClick={onDeleteSelected}>
+                  <Trash2 size={15} />
+                  删除
+                </button>
+              ) : null}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }

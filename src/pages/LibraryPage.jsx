@@ -470,7 +470,6 @@ function LibraryDirectory({ books, selectedBookId, onSelect, onDeleteSelected })
                 <div className="library-book-meta compact">
                   <span>{entry.chapter_count || 0} 章</span>
                   <span>{chapterRange(entry)}</span>
-                  <span>导入人：本机共享库</span>
                   <span>{formatTime(entry.updated_at)}</span>
                 </div>
               </button>

@@ -315,6 +315,15 @@ h1 {
   grid-template-columns: minmax(300px, 0.68fr) minmax(720px, 1.32fr);
 }
 
+.library-layout-single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.library-layout-single .side {
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  align-items: start;
+}
+
 .analysis-layout {
   grid-template-columns: minmax(300px, 0.52fr) minmax(780px, 1.48fr);
 }

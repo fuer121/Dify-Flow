@@ -1,6 +1,6 @@
 # 小说章节安全分析台：项目基线
 
-最后更新：2026-05-20 02:10，Asia/Shanghai
+最后更新：2026-05-20 17:40，Asia/Shanghai
 
 本文档是当前项目的唯一真实信息源。后续线程、后续迭代，只要涉及项目目标、架构、安全边界、运行配置、关键决策、路线图或运维方式变化，都必须同步更新本文档。
 
@@ -10,7 +10,7 @@
 - 本地路径：`/Users/staff/Desktop/Vibe coding/novel-chapter-gpt-service`
 - Git 远程仓库：`git@github.com:fuer121/Dify-Flow.git`
 - 默认分支：`main`
-- 当前线程已知的最近推送基线版本：`Add editable index prompts`，精确提交哈希以 `git log -1 --oneline` 为准
+- 当前项目基线提交：以 `git log -1 --oneline -- docs/PROJECT_CONTROL_BASELINE.md` 为准
 - GitHub CLI：已安装在 `~/.local/bin/gh`，当前登录用户为 `fuer121`
 
 ## 2. 项目目标
@@ -28,12 +28,13 @@
 
 ## 3. 当前运行快照
 
-截至 2026-05-20 00:31：
+截至 2026-05-20 17:40：
 
 - 服务进程：Node.js，监听 `*:5184`
-- 当前监听进程：`PID 37654`
+- 当前监听进程：`PID 41886`
 - 本机地址：`http://127.0.0.1:5184/`
-- 当前局域网地址：`http://192.168.1.163:5184/`
+- 当前局域网地址：`http://172.16.75.46:5184/`
+- 当前 VPN/内网地址：`http://10.8.11.29:5184/`
 - 局域网 IP 可能随 DHCP 变化，重新确认命令：
 
 ```bash
@@ -74,9 +75,10 @@ ifconfig | rg -n "inet (10|172\\.(1[6-9]|2[0-9]|3[0-1])|192\\.168)\\."
 
 当前部署验证：
 
-- 当前正式服务运行版本：`Add editable index prompts`，精确提交哈希以 `git log -1 --oneline` 为准
+- 当前正式服务运行版本：`0cb303c Refocus prompt library on analysis prompts`
 - `http://127.0.0.1:5184/api/config` 正常。
-- `http://192.168.1.163:5184/api/config` 正常。
+- `http://172.16.75.46:5184/api/config` 正常。
+- `http://10.8.11.29:5184/api/config` 正常。
 - `http://127.0.0.1:5184/api/openai/test` 正常，返回 `200`。
 - `http://127.0.0.1:5184/api/dify/test` 返回 `Access token is invalid`，说明服务已连到 Dify Base，但当前 `DIFY_CHAPTER_WORKFLOW_API_KEY` 或 Dify 工作流访问凭证需要重新校验。
 
@@ -96,15 +98,25 @@ SQLite 数据目录：`data/`
 
 当前 L1 逐章索引状态：
 
-- `143170`：482 个完成，797 个失败
-- `1721648`：63 个完成
+- `143170` / `剑来`：1279 章中 484 个完成，795 个失败，0 个缺失
+- `1721648` / `废材那又怎样`：755 章中 63 个完成，0 个失败，692 个缺失
+- `215243` / `第一瞳术师`：20 章中 0 个完成，0 个失败，20 个缺失
+
+当前 L2 类型化事实索引状态：
+
+- `143170` / `剑来`：1279 章中 0 个完成，0 个失败，1279 个缺失，0 条事实
+- `1721648` / `废材那又怎样`：755 章中 0 个完成，0 个失败，755 个缺失，0 条事实
+- `215243` / `第一瞳术师`：20 章中 0 个完成，0 个失败，20 个缺失，0 条事实
 
 当前分析任务历史状态：
 
-- `completed`：2 个
-- `cancelled`：2 个
-- `failed`：1 个
-- `queued`：1 个。新版本开始，分析运行时会写入 `analysis_runs.status=running`；旧历史任务可能仍保留旧状态。
+- `completed`：4 个
+- `cancelled`：1 个
+
+当前分析 Prompt 库：
+
+- 共 3 条分析 Prompt
+- 分类：`剑来` 2 条，`通用` 1 条
 
 历史窗口索引数据：
 
@@ -501,7 +513,8 @@ npm run preview:prepare-data -- --force
 局域网检查：
 
 ```bash
-curl -s http://192.168.1.163:5184/api/config
+curl -s http://172.16.75.46:5184/api/config
+curl -s http://10.8.11.29:5184/api/config
 ```
 
 当前进程任务检查：
@@ -558,6 +571,12 @@ npm run preview:local
 - 预览服务可以随时重启，不影响线上 `5184` 正在运行的任务。
 
 ## 15. 变更记录
+
+- 2026-05-20：
+  - Checkpoint 当前项目基线：正式服务运行在 `0cb303c Refocus prompt library on analysis prompts`。
+  - 当前 `GET /api/tasks` 为空，没有导入、L1、L2 或分析任务在当前进程内运行。
+  - 当前可访问地址更新为本机 `127.0.0.1:5184`、局域网 `172.16.75.46:5184`、VPN/内网 `10.8.11.29:5184`。
+  - 更新书库、L1 覆盖、L2 覆盖、分析任务和分析 Prompt 库数量快照。
 
 - 2026-05-20：
   - Prompt 库重定位为“分析 Prompt 库”，只把最终分析/汇总 Prompt 作为主字段。

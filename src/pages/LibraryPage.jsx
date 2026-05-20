@@ -233,24 +233,25 @@ export function LibraryPage({
 
   return (
     <section className="library-layout library-layout-single">
-      <Panel
-        className="library-directory-panel"
-        icon={Database}
-        title="本地书库"
-        action={<IconButton icon={RefreshCcw} label="刷新" onClick={onBooksChanged} />}
-      >
-        <LibraryDirectory
-          books={books}
-          selectedBook={selectedBook}
-          selectedBookId={selectedBookId}
-          onSelect={selectBook}
-          expanded={libraryExpanded}
-          onToggleExpanded={() => setLibraryExpanded((value) => !value)}
-          onDeleteSelected={deleteSelectedBook}
-        />
-      </Panel>
-      <aside className="side">
+      <div className="library-management-grid">
         <Panel
+          className="library-directory-panel"
+          icon={Database}
+          title="本地书库"
+          action={<IconButton icon={RefreshCcw} label="刷新" onClick={onBooksChanged} />}
+        >
+          <LibraryDirectory
+            books={books}
+            selectedBook={selectedBook}
+            selectedBookId={selectedBookId}
+            onSelect={selectBook}
+            expanded={libraryExpanded}
+            onToggleExpanded={() => setLibraryExpanded((value) => !value)}
+            onDeleteSelected={deleteSelectedBook}
+          />
+        </Panel>
+        <Panel
+          className="library-import-panel"
           icon={BookOpen}
           title="全书导入"
         >
@@ -319,7 +320,9 @@ export function LibraryPage({
             onResume={onImportResume}
           />
         </Panel>
+      </div>
 
+      <aside className="side">
         <Panel icon={Layers} title="基础索引">
           <div className="form-grid compact">
             <label>

@@ -445,14 +445,11 @@ export function LibraryPage({
 function LibraryDirectory({ books, selectedBook, selectedBookId, expanded, onToggleExpanded, onSelect, onDeleteSelected }) {
   if (!books.length) return <div className="empty-state">暂无书籍</div>;
   const totalBooks = books.length;
-  const totalChapters = books.reduce((sum, book) => sum + Number(book.chapter_count || 0), 0);
   const book = selectedBook || books[0];
   return (
     <div className="library-directory">
       <div className="library-directory-summary">
         <span>{totalBooks} 本书</span>
-        <span>{totalChapters} 章已入库</span>
-        <span>共享数据源：本机服务</span>
       </div>
       <div className="selected-library-book">
         <div className="selected-library-book-main">

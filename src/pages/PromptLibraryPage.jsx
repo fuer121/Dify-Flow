@@ -15,7 +15,6 @@ const emptyDraft = {
   id: "",
   name: "",
   category: "通用",
-  chapter_prompt: "",
   summary_prompt: ""
 };
 
@@ -43,13 +42,13 @@ export function PromptLibraryPage({ books, promptGroups, onPromptGroupsChanged, 
   ), [categoryFilter, promptGroups]);
 
   function selectGroup(group) {
-    if (dirty && !window.confirm("当前 Prompt 组有未保存修改，确定切换吗？")) return;
+    if (dirty && !window.confirm("当前分析 Prompt 有未保存修改，确定切换吗？")) return;
     setSelectedId(group.id);
     setDraft(group);
   }
 
   function startCreate() {
-    if (dirty && !window.confirm("当前 Prompt 组有未保存修改，确定新建吗？")) return;
+    if (dirty && !window.confirm("当前分析 Prompt 有未保存修改，确定新建吗？")) return;
     setSelectedId("");
     setDraft({
       ...emptyDraft,
@@ -64,7 +63,6 @@ export function PromptLibraryPage({ books, promptGroups, onPromptGroupsChanged, 
       const payload = {
         name: draft.name,
         category: draft.category,
-        chapter_prompt: draft.chapter_prompt,
         summary_prompt: draft.summary_prompt
       };
       const data = draft.id
@@ -83,7 +81,7 @@ export function PromptLibraryPage({ books, promptGroups, onPromptGroupsChanged, 
 
   async function deleteGroup() {
     if (!draft.id) return;
-    const confirmed = window.confirm(`删除 Prompt 组《${draft.name}》？`);
+    const confirmed = window.confirm(`删除分析 Prompt《${draft.name}》？`);
     if (!confirmed) return;
     setBusy(true);
     setError("");
@@ -109,7 +107,7 @@ export function PromptLibraryPage({ books, promptGroups, onPromptGroupsChanged, 
       <aside className="task-rail">
         <Panel
           icon={Folder}
-          title="Prompt 分类"
+          title="分析 Prompt 分类"
           action={<IconButton icon={RefreshCcw} label="刷新" onClick={onPromptGroupsChanged} />}
         >
           <div className="category-list">
@@ -121,7 +119,7 @@ export function PromptLibraryPage({ books, promptGroups, onPromptGroupsChanged, 
                 onClick={() => setCategoryFilter(category)}
               >
                 <strong>{category}</strong>
-                <span>{category === "全部" ? promptGroups.length : promptGroups.filter((group) => group.category === category).length} 组</span>
+                <span>{category === "全部" ? promptGroups.length : promptGroups.filter((group) => group.category === category).length} 条</span>
               </button>
             ))}
           </div>
@@ -129,7 +127,7 @@ export function PromptLibraryPage({ books, promptGroups, onPromptGroupsChanged, 
 
         <Panel
           icon={ClipboardList}
-          title="Prompt 组"
+          title="分析 Prompt"
           action={<IconButton icon={Plus} label="新建" onClick={startCreate} />}
         >
           <PromptGroupList groups={filteredGroups} selectedId={selectedId} onSelect={selectGroup} />
@@ -139,16 +137,16 @@ export function PromptLibraryPage({ books, promptGroups, onPromptGroupsChanged, 
       <section className="workspace">
         <Panel
           icon={ClipboardList}
-          title={draft.id ? "编辑 Prompt 组" : "新建 Prompt 组"}
+          title={draft.id ? "编辑分析 Prompt" : "新建分析 Prompt"}
           action={<PromptMeta draft={draft} />}
         >
           <div className="prompt-editor">
             <div className={dirty ? "draft-banner active" : "draft-banner"}>
-              {dirty ? "有未保存修改。保存后才会写入 Prompt 库。" : "当前 Prompt 组已保存。"}
+              {dirty ? "有未保存修改。保存后才会写入分析 Prompt 库。" : "当前分析 Prompt 已保存。"}
             </div>
             <div className="form-grid prompt-group-form-grid">
               <label>
-                <span>Prompt 组名称</span>
+                <span>名称</span>
                 <input
                   value={draft.name}
                   placeholder="例如：角色身份形象提取"
@@ -172,18 +170,11 @@ export function PromptLibraryPage({ books, promptGroups, onPromptGroupsChanged, 
             </div>
 
             <label>
-              <span>逐章 Prompt</span>
-              <textarea
-                className="prompt-library-textarea"
-                value={draft.chapter_prompt}
-                onChange={(event) => updateDraft({ chapter_prompt: event.target.value })}
-              />
-            </label>
-            <label>
-              <span>汇总 Prompt</span>
+              <span>分析 Prompt</span>
               <textarea
                 className="prompt-library-textarea"
                 value={draft.summary_prompt}
+                placeholder="写清楚这次要总结的主体、维度、筛选目标和输出要求。"
                 onChange={(event) => updateDraft({ summary_prompt: event.target.value })}
               />
             </label>
@@ -191,7 +182,7 @@ export function PromptLibraryPage({ books, promptGroups, onPromptGroupsChanged, 
             <div className="form-actions">
               <button className="secondary" type="button" onClick={saveGroup} disabled={busy}>
                 {busy ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
-                保存 Prompt 组
+                保存分析 Prompt
               </button>
               <button className="danger inline" type="button" onClick={deleteGroup} disabled={busy || !draft.id}>
                 <Trash2 size={16} />
@@ -206,7 +197,7 @@ export function PromptLibraryPage({ books, promptGroups, onPromptGroupsChanged, 
 }
 
 function PromptGroupList({ groups, selectedId, onSelect }) {
-  if (!groups.length) return <div className="empty-state">暂无 Prompt 组</div>;
+  if (!groups.length) return <div className="empty-state">暂无分析 Prompt</div>;
   return (
     <div className="prompt-group-list">
       {groups.map((group) => (
@@ -225,7 +216,7 @@ function PromptGroupList({ groups, selectedId, onSelect }) {
 }
 
 function PromptMeta({ draft }) {
-  if (!draft.id) return <div className="stats"><span>新 Prompt 组</span></div>;
+  if (!draft.id) return <div className="stats"><span>新分析 Prompt</span></div>;
   return (
     <div className="stats">
       <span>{draft.category || "未分类"}</span>
@@ -238,12 +229,10 @@ function samePromptGroup(left, right) {
   return JSON.stringify({
     name: left?.name || "",
     category: left?.category || "",
-    chapter_prompt: left?.chapter_prompt || "",
     summary_prompt: left?.summary_prompt || ""
   }) === JSON.stringify({
     name: right?.name || "",
     category: right?.category || "",
-    chapter_prompt: right?.chapter_prompt || "",
     summary_prompt: right?.summary_prompt || ""
   });
 }

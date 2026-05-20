@@ -2,16 +2,16 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   BookOpen,
   Database,
-  FileText,
   Layers,
+  Lock,
+  LockOpen,
   Loader2,
   Play,
   RefreshCcw,
-  Search,
   Trash2
 } from "lucide-react";
-import { apiGet, apiPost } from "../api.js";
-import { BookList, ChapterTable, IconButton, Panel, TaskBox } from "../ui.jsx";
+import { apiGet, apiPost, formatTime } from "../api.js";
+import { IconButton, Panel, StatusPill, TaskBox } from "../ui.jsx";
 
 const initialImportForm = {
   book_id: "",
@@ -21,37 +21,58 @@ const initialImportForm = {
   force: false
 };
 
+const L2_CATEGORIES = [
+  { value: "character", label: "人物" },
+  { value: "relationship", label: "关系" },
+  { value: "cultivation", label: "境界" },
+  { value: "force", label: "势力" },
+  { value: "item", label: "物品" },
+  { value: "location", label: "地点" },
+  { value: "event", label: "事件" },
+  { value: "foreshadowing", label: "伏笔" },
+  { value: "other", label: "其他" }
+];
+
 export function LibraryPage({
   books,
   config,
+  indexPrompts,
   importTask,
   importBusy,
   l1Task,
   l1Busy,
+  l2Task,
+  l2Busy,
   onStartImport,
   onStartL1Index,
+  onStartL2Index,
   onImportCancel,
   onImportPause,
   onImportResume,
   onL1Cancel,
   onL1Pause,
   onL1Resume,
+  onL2Cancel,
+  onL2Pause,
+  onL2Resume,
   onBooksChanged,
+  onIndexPromptsSave,
   setError
 }) {
   const initialBookId = importTask?.payload?.bookId || books[0]?.book_id || "";
   const [selectedBookId, setSelectedBookId] = useState(initialBookId);
-  const [chapters, setChapters] = useState([]);
   const [l1Coverage, setL1Coverage] = useState(null);
   const [l1Chapters, setL1Chapters] = useState([]);
+  const [l2Coverage, setL2Coverage] = useState(null);
+  const [l2Facts, setL2Facts] = useState([]);
+  const [promptSaving, setPromptSaving] = useState({ l1: false, l2: false });
   const [importForm, setImportForm] = useState({
     ...initialImportForm,
     book_id: initialBookId,
     auto_l1_index: false
   });
   const [l1Form, setL1Form] = useState({ start_chapter: "1", end_chapter: "100", force: false });
-  const [chaptersBusy, setChaptersBusy] = useState(false);
-  const [chapterFilter, setChapterFilter] = useState({ query: "", l1: "all" });
+  const [l2Form, setL2Form] = useState({ start_chapter: "1", end_chapter: "100", force: false, mode: "all", category: "" });
 
   const loadL1Data = useCallback(async (bookId, startChapter, endChapter) => {
     if (!validChapterNumber(startChapter) || !validChapterNumber(endChapter)) return;
@@ -68,23 +89,34 @@ export function LibraryPage({
     }
   }, [setError]);
 
+  const loadL2Data = useCallback(async (bookId, startChapter, endChapter, category = "") => {
+    if (!validChapterNumber(startChapter) || !validChapterNumber(endChapter)) return;
+    try {
+      const query = `start_chapter=${encodeURIComponent(startChapter)}&end_chapter=${encodeURIComponent(endChapter)}&category=${encodeURIComponent(category)}&limit=80`;
+      const [coverageData, factsData] = await Promise.all([
+        apiGet(`/api/books/${encodeURIComponent(bookId)}/l2-indexes/coverage?${query}`),
+        apiGet(`/api/books/${encodeURIComponent(bookId)}/l2-facts?${query}`)
+      ]);
+      setL2Coverage(coverageData.coverage);
+      setL2Facts(factsData.facts || []);
+    } catch (error) {
+      setError(error.message);
+    }
+  }, [setError]);
+
   async function loadChapters(bookId) {
     if (!bookId) {
-      setChapters([]);
       return;
     }
-    setChaptersBusy(true);
     setError("");
     try {
       const data = await apiGet(`/api/books/${encodeURIComponent(bookId)}/chapters`);
-      setChapters(data.chapters || []);
       const first = data.chapters?.[0]?.chapter_index || 1;
       const last = data.chapters?.[data.chapters.length - 1]?.chapter_index || 100;
       setL1Form((form) => ({ ...form, start_chapter: String(first), end_chapter: String(last) }));
+      setL2Form((form) => ({ ...form, start_chapter: String(first), end_chapter: String(last) }));
     } catch (error) {
       setError(error.message);
-    } finally {
-      setChaptersBusy(false);
     }
   }
 
@@ -108,6 +140,12 @@ export function LibraryPage({
     void loadL1Data(selectedBookId, l1Form.start_chapter, l1Form.end_chapter);
   }, [selectedBookId, l1Form.start_chapter, l1Form.end_chapter, l1Task?.id, l1Task?.status, loadL1Data]);
 
+  useEffect(() => {
+    if (!selectedBookId) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadL2Data(selectedBookId, l2Form.start_chapter, l2Form.end_chapter, l2Form.category);
+  }, [selectedBookId, l2Form.start_chapter, l2Form.end_chapter, l2Form.category, l2Task?.id, l2Task?.status, loadL2Data]);
+
   const selectedBook = useMemo(
     () => books.find((book) => book.book_id === selectedBookId) || null,
     [books, selectedBookId]
@@ -115,21 +153,6 @@ export function LibraryPage({
   const boundBook = useMemo(
     () => books.find((book) => book.book_id === importForm.book_id.trim()) || null,
     [books, importForm.book_id]
-  );
-  const l1ByChapter = useMemo(
-    () => new Map(l1Chapters.map((chapter) => [chapter.chapter_index, chapter])),
-    [l1Chapters]
-  );
-  const l1DisplayRange = useMemo(
-    () => ({
-      start: validChapterNumber(l1Form.start_chapter) ? Number(l1Form.start_chapter) : 1,
-      end: validChapterNumber(l1Form.end_chapter) ? Number(l1Form.end_chapter) : 0
-    }),
-    [l1Form.start_chapter, l1Form.end_chapter]
-  );
-  const filteredChapters = useMemo(
-    () => filterChapters(chapters, l1ByChapter, l1DisplayRange, chapterFilter),
-    [chapters, l1ByChapter, l1DisplayRange, chapterFilter]
   );
 
   async function startImport() {
@@ -164,6 +187,40 @@ export function LibraryPage({
     });
   }
 
+  async function saveIndexPrompt(type, prompt) {
+    setPromptSaving((state) => ({ ...state, [type]: true }));
+    setError("");
+    try {
+      const payload = type === "l1"
+        ? { l1_index_prompt: prompt }
+        : { l2_index_prompt: prompt };
+      await onIndexPromptsSave(payload);
+    } catch (error) {
+      setError(error.message);
+      throw error;
+    } finally {
+      setPromptSaving((state) => ({ ...state, [type]: false }));
+    }
+  }
+
+  async function startL2Index(modeOverride) {
+    if (!selectedBookId) {
+      setError("请先选择一本书。");
+      return;
+    }
+    if (!validChapterNumber(l2Form.start_chapter) || !validChapterNumber(l2Form.end_chapter)) {
+      setError("L2 起始章节和结束章节必须填写为大于 0 的整数。");
+      return;
+    }
+    await onStartL2Index({
+      bookId: selectedBookId,
+      startChapter: Number(l2Form.start_chapter),
+      endChapter: Number(l2Form.end_chapter),
+      force: l2Form.force,
+      mode: modeOverride || l2Form.mode
+    });
+  }
+
   async function deleteSelectedBook() {
     if (!selectedBookId) return;
     const label = selectedBook?.book_name || selectedBookId;
@@ -173,7 +230,6 @@ export function LibraryPage({
     try {
       await apiPost(`/api/books/${encodeURIComponent(selectedBookId)}/delete`, {});
       setSelectedBookId("");
-      setChapters([]);
       await onBooksChanged();
     } catch (error) {
       setError(error.message);
@@ -196,12 +252,25 @@ export function LibraryPage({
   }
 
   return (
-    <section className="library-layout">
-      <aside className="side">
+    <section className="library-layout library-layout-single">
+      <div className="library-management-grid">
         <Panel
+          className="library-directory-panel"
+          icon={Database}
+          title="本地书库"
+          action={<IconButton icon={RefreshCcw} label="刷新" onClick={onBooksChanged} />}
+        >
+          <LibraryDirectory
+            books={books}
+            selectedBookId={selectedBookId}
+            onSelect={selectBook}
+            onDeleteSelected={deleteSelectedBook}
+          />
+        </Panel>
+        <Panel
+          className="library-import-panel"
           icon={BookOpen}
           title="全书导入"
-          action={<IconButton icon={RefreshCcw} label="刷新" onClick={onBooksChanged} />}
         >
           <div className="form-grid import-form-grid">
             <label>
@@ -268,7 +337,9 @@ export function LibraryPage({
             onResume={onImportResume}
           />
         </Panel>
+      </div>
 
+      <aside className="side">
         <Panel icon={Layers} title="基础索引">
           <div className="form-grid compact">
             <label>
@@ -303,7 +374,14 @@ export function LibraryPage({
           <CoverageSummary
             coverage={l1Coverage}
             chapters={l1Chapters}
-            onFilter={(mode) => setChapterFilter((current) => ({ ...current, l1: mode }))}
+          />
+          <IndexPromptEditor
+            key={`l1-${indexPrompts.l1_index_prompt_hash}`}
+            title="L1 构建 Prompt"
+            value={indexPrompts.l1_index_prompt}
+            hash={indexPrompts.l1_index_prompt_hash}
+            saving={promptSaving.l1}
+            onSave={(prompt) => saveIndexPrompt("l1", prompt)}
           />
           <button className="primary" type="button" onClick={startL1Index} disabled={l1Busy || !selectedBookId || !config.openaiConfigured}>
             {l1Busy ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
@@ -315,34 +393,135 @@ export function LibraryPage({
             onPause={onL1Pause}
             onResume={onL1Resume}
           />
-        </Panel>
-
-        <Panel icon={Database} title="本地书库">
-          <BookList books={books} selectedBookId={selectedBookId} onSelect={selectBook} />
-          <button className="danger" type="button" onClick={deleteSelectedBook} disabled={!selectedBookId}>
-            <Trash2 size={16} />
-            删除选中书籍
-          </button>
-        </Panel>
-      </aside>
-
-      <section className="main">
-        <Panel
-          icon={FileText}
-          title="章节元数据"
-          action={<SummaryStats book={selectedBook} chapters={chapters} filteredCount={filteredChapters.length} loading={chaptersBusy} />}
-        >
-          <ChapterTableToolbar
-            filter={chapterFilter}
-            onChange={setChapterFilter}
-            total={chapters.length}
-            filtered={filteredChapters.length}
-          />
-          <ChapterTable chapters={filteredChapters} l1ByChapter={l1ByChapter} l1Range={l1DisplayRange} />
           <L1Preview chapters={l1Chapters} />
         </Panel>
-      </section>
+
+        <Panel icon={Database} title="L2 类型化事实">
+          <div className="form-grid compact">
+            <label>
+              <span>起始章节</span>
+              <input
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]*"
+                value={l2Form.start_chapter}
+                onChange={(event) => setL2Form({ ...l2Form, start_chapter: sanitizeChapterInput(event.target.value) })}
+              />
+            </label>
+            <label>
+              <span>结束章节</span>
+              <input
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]*"
+                value={l2Form.end_chapter}
+                onChange={(event) => setL2Form({ ...l2Form, end_chapter: sanitizeChapterInput(event.target.value) })}
+              />
+            </label>
+            <label>
+              <span>分类筛选</span>
+              <select value={l2Form.category} onChange={(event) => setL2Form({ ...l2Form, category: event.target.value })}>
+                <option value="">全部分类</option>
+                {L2_CATEGORIES.map((category) => (
+                  <option key={category.value} value={category.value}>{category.label}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>构建模式</span>
+              <select value={l2Form.mode} onChange={(event) => setL2Form({ ...l2Form, mode: event.target.value })}>
+                <option value="all">构建全部缺失/过期</option>
+                <option value="missing">只补缺失</option>
+                <option value="retry_failed">只重试失败</option>
+              </select>
+            </label>
+            <label className="check-row">
+              <input
+                type="checkbox"
+                checked={l2Form.force}
+                onChange={(event) => setL2Form({ ...l2Form, force: event.target.checked })}
+              />
+              <span>强制重建</span>
+            </label>
+          </div>
+          <L2CoverageSummary coverage={l2Coverage} />
+          <IndexPromptEditor
+            key={`l2-${indexPrompts.l2_index_prompt_hash}`}
+            title="L2 构建 Prompt"
+            value={indexPrompts.l2_index_prompt}
+            hash={indexPrompts.l2_index_prompt_hash}
+            saving={promptSaving.l2}
+            onSave={(prompt) => saveIndexPrompt("l2", prompt)}
+          />
+          <div className="action-row wrap">
+            <button className="primary" type="button" onClick={() => startL2Index()} disabled={l2Busy || !selectedBookId || !config.openaiConfigured}>
+              {l2Busy ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
+              {l2Busy ? "索引中" : "构建 L2"}
+            </button>
+            <button className="secondary" type="button" onClick={() => startL2Index("missing")} disabled={l2Busy || !selectedBookId || !config.openaiConfigured}>
+              补缺失
+            </button>
+            <button className="secondary" type="button" onClick={() => startL2Index("retry_failed")} disabled={l2Busy || !selectedBookId || !config.openaiConfigured}>
+              重试失败
+            </button>
+          </div>
+          <TaskBox
+            task={l2Task}
+            onCancel={onL2Cancel}
+            onPause={onL2Pause}
+            onResume={onL2Resume}
+          />
+          <L2FactPreview facts={l2Facts} />
+        </Panel>
+      </aside>
     </section>
+  );
+}
+
+function LibraryDirectory({ books, selectedBookId, onSelect, onDeleteSelected }) {
+  if (!books.length) return <div className="empty-state">暂无书籍</div>;
+  const totalBooks = books.length;
+  return (
+    <div className="library-directory">
+      <div className="library-directory-summary">
+        <span>{totalBooks} 本书</span>
+      </div>
+      <div className="library-book-list" role="list">
+        {books.map((entry) => {
+          const active = entry.book_id === selectedBookId;
+          return (
+            <div
+              key={entry.book_id}
+              className={active ? "library-book-row active" : "library-book-row"}
+              role="listitem"
+            >
+              <button
+                type="button"
+                className="library-book-select"
+                onClick={() => onSelect(entry.book_id)}
+              >
+                <div className="library-book-title">
+                  <strong>{entry.book_name || entry.book_id}</strong>
+                  <small>{entry.book_id}</small>
+                </div>
+                <div className="library-book-meta compact">
+                  <span>{entry.chapter_count || 0} 章</span>
+                  <span>{chapterRange(entry)}</span>
+                  <span>{formatTime(entry.updated_at)}</span>
+                </div>
+              </button>
+              <StatusPill status={entry.last_import_status || "idle"} />
+              {active ? (
+                <button className="danger inline" type="button" onClick={onDeleteSelected}>
+                  <Trash2 size={15} />
+                  删除
+                </button>
+              ) : null}
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -356,26 +535,13 @@ function sanitizeChapterInput(value) {
   return digits.replace(/^0+(?=\d)/, "").replace(/^0$/, "");
 }
 
-function filterChapters(chapters, l1ByChapter, l1Range, filter) {
-  const query = String(filter.query || "").trim().toLowerCase();
-  return chapters.filter((chapter) => {
-    const l1 = l1ByChapter.get(chapter.chapter_index);
-    const inL1Range = chapter.chapter_index >= l1Range.start && chapter.chapter_index <= l1Range.end;
-    if (filter.l1 === "completed" && l1?.status !== "completed") return false;
-    if (filter.l1 === "failed" && l1?.status !== "failed") return false;
-    if (filter.l1 === "missing" && (!inL1Range || l1)) return false;
-    if (filter.l1 === "unfinished" && (!inL1Range || l1?.status === "completed")) return false;
-    if (!query) return true;
-    return [
-      chapter.chapter_index,
-      chapter.title,
-      chapter.fetch_status,
-      chapter.content_hmac
-    ].some((value) => String(value || "").toLowerCase().includes(query));
-  });
+function chapterRange(book) {
+  const first = book?.first_chapter || "-";
+  const last = book?.last_chapter || "-";
+  return `${first}-${last}`;
 }
 
-function CoverageSummary({ coverage, chapters, onFilter }) {
+function CoverageSummary({ coverage, chapters }) {
   if (!coverage) return <div className="index-summary">暂无 L1 覆盖信息</div>;
   const total = Math.max(coverage.chapters.total || 0, 1);
   const completed = coverage.chapters.completed || 0;
@@ -392,10 +558,9 @@ function CoverageSummary({ coverage, chapters, onFilter }) {
         <span style={{ width: `${finishedRatio}%` }} />
       </div>
       <div className="index-summary">
-        <button type="button" onClick={() => onFilter?.("missing")}>缺失 {coverage.chapters.missing}</button>
-        <button type="button" onClick={() => onFilter?.("failed")}>失败 {coverage.chapters.failed}</button>
-        <button type="button" onClick={() => onFilter?.("unfinished")}>未完成 {unfinished}</button>
-        <button type="button" onClick={() => onFilter?.("all")}>查看全部</button>
+        <span>缺失 {coverage.chapters.missing}</span>
+        <span>失败 {coverage.chapters.failed}</span>
+        <span>未完成 {unfinished}</span>
       </div>
       <p className="coverage-note">
         {failedChapters.length
@@ -408,54 +573,127 @@ function CoverageSummary({ coverage, chapters, onFilter }) {
   );
 }
 
-function ChapterTableToolbar({ filter, onChange, total, filtered }) {
+function L2CoverageSummary({ coverage }) {
+  if (!coverage) return <div className="index-summary">暂无 L2 覆盖信息</div>;
+  const total = Math.max(coverage.chapters.total || 0, 1);
+  const completed = coverage.chapters.completed || 0;
+  const finishedRatio = Math.round((completed / total) * 100);
   return (
-    <div className="table-toolbar">
-      <label className="search-field">
-        <Search size={15} />
-        <input
-          value={filter.query}
-          placeholder="搜索章节、标题、HMAC"
-          onChange={(event) => onChange((current) => ({ ...current, query: event.target.value }))}
-        />
-      </label>
-      <select value={filter.l1} onChange={(event) => onChange((current) => ({ ...current, l1: event.target.value }))}>
-        <option value="all">全部章节</option>
-        <option value="completed">L1 已完成</option>
-        <option value="unfinished">L1 未完成</option>
-        <option value="missing">L1 缺失</option>
-        <option value="failed">L1 失败</option>
-      </select>
-      <span>{filtered}/{total} 章</span>
+    <div className="coverage-card">
+      <div className="coverage-head">
+        <strong>L2 覆盖 {finishedRatio}%</strong>
+        <span>{completed}/{coverage.chapters.total} 章 · {coverage.chapters.facts || 0} 条事实</span>
+      </div>
+      <div className="coverage-bar" aria-label={`L2 覆盖 ${finishedRatio}%`}>
+        <span style={{ width: `${finishedRatio}%` }} />
+      </div>
+      <div className="index-summary">
+        <span>缺失 {coverage.chapters.missing}</span>
+        <span>失败 {coverage.chapters.failed}</span>
+        <span>过期 {coverage.chapters.outdated}</span>
+      </div>
+      <p className="coverage-note">
+        {coverage.failed_chapters?.length
+          ? `失败章节：${compactChapterList(coverage.failed_chapters.slice(0, 16))}`
+          : "L2 是可复用事实层，汇总任务会优先从这里召回。"}
+      </p>
     </div>
   );
 }
 
 function L1Preview({ chapters }) {
   if (!chapters.length) return null;
+  const chapter = chapters[0];
   return (
     <div className="index-preview">
       <h3>L1 索引预览</h3>
-      <div className="index-preview-grid">
-        {chapters.slice(0, 5).map((chapter) => (
-          <article key={`chapter-${chapter.chapter_index}`}>
-            <strong>章节 {chapter.chapter_index}</strong>
-            <p>{chapter.summary || chapter.error_summary || "暂无摘要"}</p>
-          </article>
-        ))}
-      </div>
+      <article>
+        <strong>章节 {chapter.chapter_index}</strong>
+        <p>{chapter.summary || chapter.error_summary || "暂无摘要"}</p>
+      </article>
     </div>
   );
 }
 
-function SummaryStats({ book, chapters, filteredCount, loading }) {
+function L2FactPreview({ facts }) {
+  const fact = facts[0];
   return (
-    <div className="stats">
-      <span>{loading ? "读取中" : `${book?.chapter_count || chapters.length || 0} 章`}</span>
-      {filteredCount !== chapters.length ? <span>筛选 {filteredCount} 章</span> : null}
-      <span>{book?.last_import_status || "idle"}</span>
+    <div className="index-preview">
+      <h3>L2 结果预览</h3>
+      {fact ? (
+        <article>
+          <strong>第 {fact.chapter_index} 章 · {categoryLabel(fact.category)} · {fact.entity || "未命名主体"}</strong>
+          <p>{fact.fact || "暂无事实正文"}</p>
+          <small>重要度 {formatScore(fact.importance)} · 置信度 {formatScore(fact.confidence)}</small>
+        </article>
+      ) : (
+        <article className="index-preview-empty">
+          <strong>暂无可预览事实</strong>
+          <p>构建 L2 后，这里会展示当前范围和分类下的首条类型化事实。</p>
+        </article>
+      )}
     </div>
   );
+}
+
+function IndexPromptEditor({ title, value, hash, saving, onSave }) {
+  const [locked, setLocked] = useState(true);
+  const [draft, setDraft] = useState(value);
+  const shortHash = String(hash || "").slice(0, 10);
+
+  async function handleSave() {
+    try {
+      await onSave(draft);
+      setLocked(true);
+    } catch {
+      // The parent already shows the user-facing error.
+    }
+  }
+
+  return (
+    <div className="index-prompt-card">
+      <div className="index-prompt-head">
+        <div>
+          <h3>{title}</h3>
+          <small>Hash {shortHash || "-"}</small>
+        </div>
+        <button
+          className="secondary inline"
+          type="button"
+          onClick={() => {
+            if (!locked) setDraft(value);
+            setLocked((state) => !state);
+          }}
+        >
+          {locked ? <Lock size={15} /> : <LockOpen size={15} />}
+          {locked ? "解锁编辑" : "锁定"}
+        </button>
+      </div>
+      <textarea
+        value={draft}
+        readOnly={locked}
+        onChange={(event) => setDraft(event.target.value)}
+        aria-label={title}
+      />
+      {!locked ? (
+        <div className="action-row wrap">
+          <button className="primary inline" type="button" onClick={handleSave} disabled={saving}>
+            {saving ? <Loader2 className="spin" size={15} /> : null}
+            保存 Prompt
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function categoryLabel(value) {
+  return L2_CATEGORIES.find((category) => category.value === value)?.label || value || "其他";
+}
+
+function formatScore(value) {
+  const number = Number(value || 0);
+  return Number.isFinite(number) ? number.toFixed(2) : "0.00";
 }
 
 function compactChapterList(indexes) {

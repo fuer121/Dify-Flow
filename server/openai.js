@@ -4,7 +4,7 @@ import tls from "node:tls";
 import { config, requireOpenAIConfig } from "./config.js";
 import { sanitizeDetails, sanitizeText } from "./sanitize.js";
 
-export async function callOpenAIJson({ model, reasoningEffort, instructions, input, schema, schemaName = "result" }) {
+export async function callOpenAIJson({ model, reasoningEffort, instructions, input, schema, schemaName = "result", maxOutputTokens, strict = true }) {
   requireOpenAIConfig();
   const body = {
     model: model || config.openai.model,
@@ -19,10 +19,13 @@ export async function callOpenAIJson({ model, reasoningEffort, instructions, inp
         type: "json_schema",
         name: schemaName,
         schema,
-        strict: true
+        strict: Boolean(strict)
       }
     }
   };
+  if (Number.isFinite(Number(maxOutputTokens)) && Number(maxOutputTokens) > 0) {
+    body.max_output_tokens = Number(maxOutputTokens);
+  }
 
   const response = await postOpenAIJson("responses", body);
 
@@ -46,7 +49,7 @@ export async function callOpenAIJson({ model, reasoningEffort, instructions, inp
   }
 }
 
-export async function callOpenAIText({ model, reasoningEffort, instructions, input }) {
+export async function callOpenAIText({ model, reasoningEffort, instructions, input, maxOutputTokens }) {
   requireOpenAIConfig();
   const body = {
     model: model || config.openai.model,
@@ -57,6 +60,9 @@ export async function callOpenAIText({ model, reasoningEffort, instructions, inp
     instructions,
     input
   };
+  if (Number.isFinite(Number(maxOutputTokens)) && Number(maxOutputTokens) > 0) {
+    body.max_output_tokens = Number(maxOutputTokens);
+  }
 
   const response = await postOpenAIJson("responses", body);
 
@@ -487,7 +493,7 @@ export function buildCompressedSummaryInput({ compressedResults, failedChapters,
   ];
 }
 
-export function buildL1ChapterInput({ chapterIndex, title, content }) {
+export function buildL1ChapterInput({ chapterIndex, title, content, indexPrompt }) {
   return [
     {
       role: "user",
@@ -495,8 +501,7 @@ export function buildL1ChapterInput({ chapterIndex, title, content }) {
         {
           type: "input_text",
           text: [
-            "请为当前小说章节建立可复用 L1 基础索引。",
-            "要求：只依据本章原文；不要输出 Markdown；不要引用长段原文；实体和事件尽量短句化，保留可用于后续分析的事实。",
+            indexPrompt || defaultL1IndexPrompt(),
             "",
             `章节编号：${chapterIndex}`,
             `章节标题：${title || ""}`,
@@ -508,6 +513,124 @@ export function buildL1ChapterInput({ chapterIndex, title, content }) {
       ]
     }
   ];
+}
+
+export function buildL2ChapterInput({ chapterIndex, title, content, l1Index, indexPrompt }) {
+  return [
+    {
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text: [
+            indexPrompt || defaultL2IndexPrompt(),
+            "",
+            `章节编号：${chapterIndex}`,
+            `章节标题：${title || ""}`,
+            "",
+            "可选 L1 路标 JSON：",
+            JSON.stringify(l1Index || null),
+            "",
+            "章节原文：",
+            content
+          ].join("\n")
+        }
+      ]
+    }
+  ];
+}
+
+export function defaultL1IndexPrompt() {
+  return [
+    "请为当前小说章节建立可复用 L1 基础索引。",
+    "要求：只依据本章原文；不要输出 Markdown；不要引用长段原文；实体和事件尽量短句化，保留可用于后续分析的事实。"
+  ].join("\n");
+}
+
+export function defaultL2IndexPrompt() {
+  return [
+    "请为当前小说章节建立 L2 类型化事实索引。",
+    "目标：提取可复用、可检索、可追溯的事实单元，不要写长摘要，不要输出 Markdown。",
+    "分类只能使用：character、relationship、cultivation、force、item、location、event、foreshadowing、other。",
+    "每条事实必须短而明确，保留主体、相关主体、事实类型、重要度、置信度和少量证据摘记。",
+    "不要补充本章原文之外的信息；如果本章没有可复用事实，facts 输出空数组。"
+  ].join("\n");
+}
+
+export function buildIndexSummaryInput({ facts, reviewedChapters, missingChapters, userPrompt, sourceStats }) {
+  return [
+    {
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text: [
+            userPrompt,
+            "",
+            "以下是从本地 L2 类型化事实索引召回的事实。请基于这些事实完成最终汇总。",
+            "要求：尊重事实的章节引用、重要度和置信度；不要虚构未出现的信息；如信息不足，可以在结果中体现不确定性。",
+            "",
+            "召回统计 JSON：",
+            JSON.stringify(sourceStats || {}),
+            "",
+            "L2 事实 JSON：",
+            JSON.stringify(facts || []),
+            "",
+            "原文复核补充 JSON：",
+            JSON.stringify(reviewedChapters || []),
+            "",
+            "索引缺口章节：",
+            JSON.stringify(missingChapters || [])
+          ].join("\n")
+        }
+      ]
+    }
+  ];
+}
+
+export function l2ChapterFactsSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      facts: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            category: {
+              type: "string",
+              enum: ["character", "relationship", "cultivation", "force", "item", "location", "event", "foreshadowing", "other"]
+            },
+            entity: { type: "string" },
+            aliases: {
+              type: "array",
+              items: { type: "string" }
+            },
+            tags: {
+              type: "array",
+              items: { type: "string" }
+            },
+            related_entities: {
+              type: "array",
+              items: { type: "string" }
+            },
+            fact_type: { type: "string" },
+            fact: { type: "string" },
+            evidence: {
+              type: "array",
+              items: { type: "string" }
+            },
+            importance: { type: "number" },
+            confidence: { type: "number" }
+          },
+          required: ["category", "entity", "aliases", "tags", "related_entities", "fact_type", "fact", "evidence", "importance", "confidence"]
+        }
+      }
+    },
+    required: ["facts"]
+  };
 }
 
 export function buildL1WindowInput({ windowStart, windowEnd, chapterIndexes }) {

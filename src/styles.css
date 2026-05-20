@@ -315,6 +315,131 @@ h1 {
   grid-template-columns: minmax(300px, 0.68fr) minmax(720px, 1.32fr);
 }
 
+.library-layout-single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.library-management-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.08fr) minmax(300px, 0.92fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.library-layout-single .side {
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  align-items: start;
+}
+
+.library-directory-panel {
+  align-self: start;
+}
+
+.library-directory {
+  display: grid;
+  gap: 12px;
+}
+
+.library-directory-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.library-directory-summary span {
+  padding: 6px 9px;
+  border-radius: 999px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 780;
+}
+
+.library-book-list {
+  display: grid;
+  gap: 8px;
+}
+
+.library-book-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.library-book-row.active {
+  border-color: rgba(29, 111, 85, 0.28);
+  background: var(--accent-soft);
+}
+
+.library-book-select {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.72fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+
+.library-book-select:hover {
+  color: var(--accent-deep);
+}
+
+.library-book-title {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.library-book-title strong,
+.selected-book-card strong {
+  overflow-wrap: anywhere;
+}
+
+.library-book-title small,
+.selected-book-card small,
+.selected-book-card span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.library-book-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.library-book-meta span {
+  padding: 5px 7px;
+  border-radius: 999px;
+  background: #eef1ef;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 740;
+}
+
+.library-book-meta.compact span {
+  font-size: 11px;
+}
+
+.selected-book-card {
+  display: grid;
+  gap: 5px;
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
 .analysis-layout {
   grid-template-columns: minmax(300px, 0.52fr) minmax(780px, 1.48fr);
 }
@@ -877,9 +1002,61 @@ textarea:focus {
   line-height: 1.55;
 }
 
+.index-prompt-card {
+  display: grid;
+  gap: 9px;
+  margin-top: 12px;
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.index-prompt-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.index-prompt-head h3 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.index-prompt-head small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.index-prompt-card textarea {
+  min-height: 132px;
+  padding: 10px;
+  resize: vertical;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.index-prompt-card textarea[readonly] {
+  color: var(--muted);
+  background: #f4f6f4;
+}
+
 .l1-context-row small {
   color: var(--muted);
   font-size: 12px;
+}
+
+.index-route-note {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .table-wrap {
@@ -1053,6 +1230,10 @@ code {
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 0.62fr 0.62fr;
 }
 
+.library-import-panel .import-form-grid {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
 .prompt-group-form-grid {
   grid-template-columns: minmax(0, 1fr) minmax(220px, 0.7fr);
 }
@@ -1087,6 +1268,15 @@ code {
   display: grid;
   gap: 10px;
   margin-top: 12px;
+}
+
+.prompt-advanced-card {
+  margin-top: 0;
+}
+
+.prompt-advanced-field {
+  display: grid;
+  gap: 6px;
 }
 
 .selector-summary {
@@ -1194,6 +1384,22 @@ code {
 .result-stack {
   display: grid;
   gap: 12px;
+}
+
+.source-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.source-stats span {
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 760;
 }
 
 .result-summary {
@@ -1362,6 +1568,18 @@ code {
 }
 
 @media (max-width: 720px) {
+  .library-management-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .library-book-row,
+  .library-book-select {
+    grid-template-columns: 1fr;
+    align-items: flex-start;
+  }
+}
+
+@media (max-width: 720px) {
   .shell {
     width: min(100% - 16px, 1440px);
     padding-top: 10px;
@@ -1375,6 +1593,7 @@ code {
   .form-grid.compact,
   .analysis-form-grid,
   .import-form-grid,
+  .library-import-panel .import-form-grid,
   .prompt-group-form-grid,
   .form-actions,
   .table-toolbar {

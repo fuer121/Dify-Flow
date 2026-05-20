@@ -11,7 +11,12 @@ import {
   getExistingChapterIndexes,
   getL1ChapterIndex,
   getL1Coverage,
+  getL2ChapterStatus,
+  getL2Coverage,
   getPromptSettings,
+  l1IndexPromptHash,
+  l2IndexPromptHash,
+  listL2Facts,
   listAnalysisChapterMetadata,
   listChapterMetadata,
   listL1ChapterIndexes,
@@ -25,6 +30,8 @@ import {
   saveEncryptedChapter,
   saveFinalAnalysisResult,
   saveL1ChapterIndex,
+  saveL2ChapterFacts,
+  saveL2ChapterStatus,
   schemaHash,
   updateAnalysisRun,
   updateBookImportStatus
@@ -34,13 +41,14 @@ import {
   buildChapterInput,
   buildCompressedSummaryInput,
   buildL1ChapterInput,
-  buildSummaryCompressionInput,
+  buildL2ChapterInput,
+  buildIndexSummaryInput,
   buildSummaryInput,
   callOpenAIJson,
   callOpenAIText,
   chapterResultSchema,
+  l2ChapterFactsSchema,
   l1ChapterIndexSchema,
-  summaryCompressionSchema,
   testOpenAIConnection
 } from "./openai.js";
 import {
@@ -57,7 +65,12 @@ import {
 import { sanitizeText } from "./sanitize.js";
 
 const DIRECT_SUMMARY_MAX_CHARS = 80_000;
-const SUMMARY_COMPRESSION_BATCH_CHARS = 45_000;
+const SUMMARY_COMPACT_TARGET_CHARS = 18_000;
+const SUMMARY_FINAL_MAX_OUTPUT_TOKENS = 4500;
+const CUSTOM_FIELD_SUMMARY_MAX_OUTPUT_TOKENS = 3000;
+const SUMMARY_STAGE_MAX_ATTEMPTS = 3;
+const SUMMARY_STAGE_RETRY_DELAY_MS = 1200;
+const L2_SCHEMA_VERSION = "l2-facts-v1";
 
 export function startImportTask(payload) {
   const bookId = normalizeBookId(payload.book_id ?? payload.bookId);
@@ -93,17 +106,37 @@ export function startL1IndexTask(payload) {
   return task;
 }
 
+export function startL2IndexTask(payload) {
+  const bookId = normalizeBookId(payload.book_id ?? payload.bookId);
+  const range = normalizeRange(payload.start_chapter ?? payload.startChapter, payload.end_chapter ?? payload.endChapter);
+  const force = Boolean(payload.force);
+  const mode = normalizeL2BuildMode(payload.mode || payload.build_mode || payload.buildMode);
+  const task = createTask("l2-index", {
+    bookId,
+    startChapter: range.startChapter,
+    endChapter: range.endChapter,
+    force,
+    mode
+  });
+
+  void runL2IndexTask(task, { bookId, ...range, force, mode });
+  return task;
+}
+
 export function startAnalysisTask(payload) {
   const bookId = normalizeBookId(payload.book_id ?? payload.bookId);
   const range = normalizeRange(payload.start_chapter ?? payload.startChapter, payload.end_chapter ?? payload.endChapter);
   const chapterIndexes = normalizeChapterIndexes(payload.chapter_indexes ?? payload.chapterIndexes);
   const name = String(payload.name || "").trim();
+  const analysisMode = normalizeAnalysisMode(payload.analysis_mode ?? payload.analysisMode);
+  const sourceReviewBudget = normalizeOptionalBudget(payload.source_review_budget ?? payload.sourceReviewBudget);
   const task = createTask("analysis", {
     name,
     bookId,
     startChapter: range.startChapter,
     endChapter: range.endChapter,
-    chapterCount: chapterIndexes.length || range.total
+    chapterCount: chapterIndexes.length || range.total,
+    analysisMode
   });
 
   void runAnalysisTask(task, {
@@ -112,7 +145,9 @@ export function startAnalysisTask(payload) {
     ...range,
     chapterIndexes,
     promptPatch: payload.prompt || {},
-    useL1Context: Boolean(payload.use_l1_context ?? payload.useL1Context)
+    useL1Context: Boolean(payload.use_l1_context ?? payload.useL1Context),
+    analysisMode,
+    sourceReviewBudget
   });
   return task;
 }
@@ -266,7 +301,7 @@ async function runL1IndexTask(task, { bookId, startChapter, endChapter, force })
   const promptSettings = getPromptSettings();
   const model = promptSettings.model;
   const reasoningEffort = promptSettings.reasoning_effort;
-  const indexPromptHash = l1PromptHash();
+  const indexPromptHash = l1IndexPromptHash(promptSettings);
   try {
     const chapters = listChapterMetadata(bookId)
       .filter((chapter) => chapter.chapter_index >= startChapter && chapter.chapter_index <= endChapter);
@@ -314,7 +349,8 @@ async function runL1IndexTask(task, { bookId, startChapter, endChapter, force })
           input: buildL1ChapterInput({
             chapterIndex: chapter.chapter_index,
             title: chapter.title,
-            content
+            content,
+            indexPrompt: promptSettings.l1_index_prompt
           }),
           schema: l1ChapterIndexSchema(),
           schemaName: "l1_chapter_index"
@@ -367,6 +403,136 @@ async function runL1IndexTask(task, { bookId, startChapter, endChapter, force })
   }
 }
 
+async function runL2IndexTask(task, { bookId, startChapter, endChapter, force, mode }) {
+  const promptSettings = getPromptSettings();
+  const model = promptSettings.model;
+  const reasoningEffort = promptSettings.reasoning_effort;
+  const indexPromptHash = l2IndexPromptHash(promptSettings);
+  try {
+    const chapters = listChapterMetadata(bookId)
+      .filter((chapter) => chapter.chapter_index >= startChapter && chapter.chapter_index <= endChapter);
+    if (!chapters.length) {
+      const error = new Error("本地章节库没有可构建 L2 索引的章节，请先导入章节原文。");
+      error.status = 422;
+      throw error;
+    }
+
+    await testOpenAIConnection();
+    markTaskRunning(task, {
+      progress: {
+        total: chapters.length,
+        completed: 0,
+        failed: 0,
+        skipped: 0,
+        current: "准备构建 L2 类型化事实索引"
+      }
+    });
+
+    for (const chapter of chapters) {
+      await waitIfPaused(task);
+      const existing = getL2ChapterStatus(bookId, chapter.chapter_index);
+      const fresh = existing?.status === "completed"
+        && existing.source_hmac === chapter.content_hmac
+        && existing.model === model
+        && existing.prompt_hash === indexPromptHash
+        && existing.schema_version === L2_SCHEMA_VERSION;
+      if (!force && mode === "retry_failed" && existing?.status !== "failed") {
+        task.progress.skipped += 1;
+        updateTask(task, {
+          progress: { ...task.progress, current: `跳过章节 ${chapter.chapter_index}` },
+          message: `章节 ${chapter.chapter_index} 不是失败状态，跳过。`
+        });
+        continue;
+      }
+      if (!force && mode === "missing" && existing) {
+        task.progress.skipped += 1;
+        updateTask(task, {
+          progress: { ...task.progress, current: `跳过章节 ${chapter.chapter_index}` },
+          message: `章节 ${chapter.chapter_index} 已有 L2 记录，跳过。`
+        });
+        continue;
+      }
+      if (!force && mode === "all" && fresh) {
+        task.progress.skipped += 1;
+        updateTask(task, {
+          progress: { ...task.progress, current: `跳过章节 ${chapter.chapter_index}` },
+          message: `章节 ${chapter.chapter_index} L2 索引已存在，跳过。`
+        });
+        continue;
+      }
+
+      updateTask(task, {
+        progress: { ...task.progress, current: `L2 事实索引 ${chapter.chapter_index}` },
+        message: `正在构建章节 ${chapter.chapter_index} L2 事实索引`
+      });
+
+      try {
+        assertNotCancelled(task);
+        const content = await decryptChapterContent(bookId, chapter.chapter_index);
+        const l1Index = getL1ChapterIndex(bookId, chapter.chapter_index);
+        const response = await callOpenAIJson({
+          model,
+          reasoningEffort,
+          instructions: "你是小说 L2 类型化事实索引引擎。只输出符合 Schema 的 JSON。",
+          input: buildL2ChapterInput({
+            chapterIndex: chapter.chapter_index,
+            title: chapter.title,
+            content,
+            l1Index,
+            indexPrompt: promptSettings.l2_index_prompt
+          }),
+          schema: l2ChapterFactsSchema(),
+          schemaName: "l2_chapter_facts"
+        });
+        await saveL2ChapterFacts({
+          bookId,
+          chapterIndex: chapter.chapter_index,
+          status: "completed",
+          sourceHmac: chapter.content_hmac,
+          model,
+          promptHash: indexPromptHash,
+          schemaVersion: L2_SCHEMA_VERSION,
+          facts: response.value?.facts || []
+        });
+        task.progress.completed += 1;
+        updateTask(task, {
+          progress: { ...task.progress, current: `章节 ${chapter.chapter_index} L2 完成` },
+          message: `章节 ${chapter.chapter_index} L2 索引完成`
+        });
+        assertNotCancelled(task);
+      } catch (error) {
+        if (error?.status === 499) throw error;
+        const safeMessage = sanitizeText(error.message);
+        saveL2ChapterStatus({
+          bookId,
+          chapterIndex: chapter.chapter_index,
+          status: "failed",
+          sourceHmac: chapter.content_hmac,
+          model,
+          promptHash: indexPromptHash,
+          schemaVersion: L2_SCHEMA_VERSION,
+          errorSummary: safeMessage
+        });
+        task.progress.failed += 1;
+        updateTask(task, {
+          progress: { ...task.progress, current: `章节 ${chapter.chapter_index} L2 失败` },
+          message: `章节 ${chapter.chapter_index} L2 失败：${safeMessage}`
+        }, "warning");
+        if (isFatalUpstreamError(safeMessage)) {
+          throw new Error(`L2 构建已停止：${safeMessage}`, { cause: error });
+        }
+      }
+    }
+
+    completeTask(task, {
+      bookId,
+      coverage: getL2Coverage({ bookId, startChapter, endChapter, model, promptHash: indexPromptHash, schemaVersion: L2_SCHEMA_VERSION })
+    });
+  } catch (error) {
+    failTask(task, error);
+  }
+}
+
 async function runAnalysisTask(task, options) {
   const resume = Boolean(options.resume);
   const analysisId = options.analysisId || task.id;
@@ -388,7 +554,7 @@ async function runAnalysisTask(task, options) {
   }
 }
 
-async function prepareNewAnalysis(analysisId, { name, bookId, startChapter, endChapter, chapterIndexes, promptPatch, useL1Context }) {
+async function prepareNewAnalysis(analysisId, { name, bookId, startChapter, endChapter, chapterIndexes, promptPatch, useL1Context, analysisMode, sourceReviewBudget }) {
   const settings = normalizePromptSettings({ ...getPromptSettings(), ...promptPatch });
   const chapters = resolveSelectedChapters({ bookId, startChapter, endChapter, chapterIndexes });
   if (chapters.length === 0) {
@@ -412,7 +578,7 @@ async function prepareNewAnalysis(analysisId, { name, bookId, startChapter, endC
     promptHash: promptHash(settings),
     schemaHash: schemaHash(settings),
     chapterCount: chapters.length,
-    promptSnapshot: { ...settings, use_l1_context: useL1Context }
+    promptSnapshot: { ...settings, use_l1_context: useL1Context, analysis_mode: analysisMode, source_review_budget: sourceReviewBudget }
   });
 
   return {
@@ -423,6 +589,8 @@ async function prepareNewAnalysis(analysisId, { name, bookId, startChapter, endC
     chapters,
     settings,
     useL1Context,
+    analysisMode,
+    sourceReviewBudget,
     chapterPromptHash: promptHash(settings),
     outputSchemaHash: schemaHash(settings),
     resume: false
@@ -462,6 +630,8 @@ async function prepareResumedAnalysis(run) {
     chapters,
     settings: normalizedSettings,
     useL1Context: Boolean(settings.use_l1_context),
+    analysisMode: normalizeAnalysisMode(settings.analysis_mode || "full_text"),
+    sourceReviewBudget: normalizeOptionalBudget(settings.source_review_budget),
     chapterPromptHash: run.prompt_hash || promptHash(normalizedSettings),
     outputSchemaHash: run.schema_hash || schemaHash(normalizedSettings),
     resume: true
@@ -477,6 +647,8 @@ async function executeAnalysisTask(task, prepared) {
     chapters,
     settings,
     useL1Context,
+    analysisMode,
+    sourceReviewBudget,
     chapterPromptHash,
     outputSchemaHash,
     resume
@@ -499,6 +671,22 @@ async function executeAnalysisTask(task, prepared) {
       current: resume ? "准备续跑分析" : "准备逐章分析"
     }
   });
+
+  if (analysisMode !== "full_text") {
+    return executeIndexAnalysisTask(task, {
+      analysisId,
+      bookId,
+      startChapter,
+      endChapter,
+      chapters,
+      settings,
+      model,
+      reasoningEffort,
+      outputSchemaHash,
+      analysisMode,
+      sourceReviewBudget
+    });
+  }
 
   const chapterResults = [];
   const failedChapters = [];
@@ -600,11 +788,14 @@ async function executeAnalysisTask(task, prepared) {
     reasoningEffort,
     chapterResults,
     failedChapters,
-    userPrompt: settings.summary_prompt
+    userPrompt: settings.summary_prompt,
+    outputSchema: settings.output_schema,
+    sourceChapterCount: chapterResults.length
   });
 
   assertNotCancelled(task);
   const finalResult = parseJsonOrText(summary.value);
+  assertFinalSummaryUseful(finalResult, chapterResults.length);
   await saveFinalAnalysisResult(analysisId, finalResult);
   task.progress.completed += 1;
   const run = updateAnalysisRun(analysisId, {
@@ -620,6 +811,146 @@ async function executeAnalysisTask(task, prepared) {
   });
 }
 
+async function executeIndexAnalysisTask(task, { analysisId, bookId, startChapter, endChapter, chapters, settings, model, reasoningEffort, outputSchemaHash, analysisMode, sourceReviewBudget }) {
+  const selectedIndexes = chapters.map((chapter) => chapter.chapter_index);
+  const categories = inferL2CategoriesFromPrompt(settings.summary_prompt);
+  const entityQuery = inferEntityQueryFromPrompt(settings.summary_prompt);
+  const indexPromptHash = l2IndexPromptHash(settings);
+  await waitIfPaused(task);
+  updateTask(task, {
+    progress: { ...task.progress, current: "L2 召回事实" },
+    message: "正在从本地 L2 索引召回相关事实"
+  });
+
+  const facts = (await listL2Facts({
+    bookId,
+    startChapter,
+    endChapter,
+    categories,
+    entity: entityQuery,
+    limit: 1000,
+    includeContent: true
+  })).filter((fact) => selectedIndexes.includes(fact.chapter_index));
+  const indexedChapters = new Set(facts.map((fact) => fact.chapter_index));
+  const missingChapters = selectedIndexes.filter((index) => !indexedChapters.has(index));
+  const sourceStats = {
+    analysis_mode: analysisMode,
+    recalled_facts: facts.length,
+    recalled_chapters: indexedChapters.size,
+    source_review_chapters: 0,
+    source_review_budget: sourceReviewBudgetForMode(analysisMode, chapters.length, sourceReviewBudget),
+    missing_chapters: missingChapters,
+    categories,
+    entity_query: entityQuery
+  };
+
+  const reviewedChapters = [];
+  const reviewCandidates = analysisMode === "fast_index"
+    ? []
+    : selectSourceReviewCandidates({ facts, chapters, budget: sourceStats.source_review_budget });
+  for (const chapter of reviewCandidates) {
+    await waitIfPaused(task);
+    updateTask(task, {
+      progress: { ...task.progress, current: `原文复核 ${chapter.chapter_index}` },
+      message: `正在按预算复核章节 ${chapter.chapter_index}`
+    });
+    const content = await decryptChapterContent(bookId, chapter.chapter_index);
+    const response = await callOpenAIJson({
+      model,
+      reasoningEffort: "low",
+      instructions: "你是小说事实复核引擎。只针对用户汇总目标补充本章关键事实，输出符合 Schema 的 JSON。",
+      input: buildL2ChapterInput({
+        chapterIndex: chapter.chapter_index,
+        title: chapter.title,
+        content,
+        l1Index: null,
+        indexPrompt: settings.l2_index_prompt
+      }),
+      schema: l2ChapterFactsSchema(),
+      schemaName: "l2_source_review"
+    });
+    const reviewFacts = (response.value?.facts || []).map((fact) => ({ ...fact, review_source: "source_review" }));
+    await saveL2ChapterFacts({
+      bookId,
+      chapterIndex: chapter.chapter_index,
+      status: "completed",
+      sourceHmac: chapter.content_hmac,
+      model,
+      promptHash: indexPromptHash,
+      schemaVersion: L2_SCHEMA_VERSION,
+      facts: reviewFacts
+    });
+    reviewedChapters.push({
+      chapter_index: chapter.chapter_index,
+      title: chapter.title,
+      facts: reviewFacts
+    });
+    sourceStats.source_review_chapters += 1;
+  }
+
+  await waitIfPaused(task);
+  updateTask(task, {
+    progress: { ...task.progress, current: "GPT 索引汇总结果" },
+    message: "正在基于 L2 召回事实生成最终汇总"
+  });
+  const finalSchema = deriveFinalSummarySchema({
+    userPrompt: settings.summary_prompt,
+    configuredSchema: parseOutputSchemaOrNull(settings.output_schema)
+  });
+  const summary = await runFinalSummaryCall({
+    task,
+    stageLabel: "GPT 索引汇总结果",
+    model,
+    reasoningEffort,
+    input: buildIndexSummaryInput({
+      facts,
+      reviewedChapters,
+      missingChapters,
+      userPrompt: settings.summary_prompt,
+      sourceStats
+    }),
+    schema: finalSchema,
+    sourceChapterCount: Math.max(facts.length, reviewedChapters.length, 1)
+  });
+
+  assertNotCancelled(task);
+  const finalResult = parseJsonOrText(summary.value);
+  assertFinalSummaryUseful(finalResult, Math.max(facts.length, reviewedChapters.length, 1));
+  await saveFinalAnalysisResult(analysisId, finalResult);
+  task.progress.completed = task.progress.total;
+  const run = updateAnalysisRun(analysisId, {
+    status: "completed",
+    source_stats: JSON.stringify(sourceStats),
+    error_summary: sourceStats.missing_chapters.length ? `L2 索引缺口章节：${sourceStats.missing_chapters.slice(0, 30).join(", ")}` : ""
+  });
+  completeTask(task, {
+    analysisId,
+    run: publicAnalysisRun(run),
+    finalResult,
+    failedChapters: [],
+    schemaHash: outputSchemaHash,
+    sourceStats
+  });
+}
+
+function selectSourceReviewCandidates({ facts, chapters, budget }) {
+  if (!budget) return [];
+  const byIndex = new Map(chapters.map((chapter) => [chapter.chapter_index, chapter]));
+  const scores = new Map();
+  for (const fact of facts) {
+    const confidence = Number(fact.confidence || 0);
+    const importance = Number(fact.importance || 0);
+    if (importance < 0.65 && confidence >= 0.55) continue;
+    const score = (importance * 2) + (1 - confidence);
+    scores.set(fact.chapter_index, Math.max(scores.get(fact.chapter_index) || 0, score));
+  }
+  return [...scores.entries()]
+    .sort((left, right) => right[1] - left[1])
+    .map(([chapterIndex]) => byIndex.get(chapterIndex))
+    .filter(Boolean)
+    .slice(0, budget);
+}
+
 async function reusableAnalysisChapter({ analysisId, chapter, promptHash }) {
   const existing = getAnalysisChapterMetadata(analysisId, chapter.chapter_index);
   if (!existing || existing.status !== "completed") return null;
@@ -629,87 +960,387 @@ async function reusableAnalysisChapter({ analysisId, chapter, promptHash }) {
   return decryptAnalysisChapterResult(analysisId, chapter.chapter_index);
 }
 
-async function summarizeAnalysisResults({ task, model, reasoningEffort, chapterResults, failedChapters, userPrompt }) {
+async function summarizeAnalysisResults({ task, model, reasoningEffort, chapterResults, failedChapters, userPrompt, outputSchema, sourceChapterCount }) {
   const directInput = buildSummaryInput({ chapterResults, failedChapters, userPrompt });
+  const finalSchema = deriveFinalSummarySchema({
+    userPrompt,
+    configuredSchema: parseOutputSchemaOrNull(outputSchema)
+  });
   if (inputTextLength(directInput) <= DIRECT_SUMMARY_MAX_CHARS) {
-    return callOpenAIText({
-      model,
-      reasoningEffort,
-      instructions: "你是严谨的小说多章节汇总引擎。按用户汇总 Prompt 输出最终结果；如果用户要求 JSON，则只输出合法 JSON，否则直接输出文本，不要添加无关解释。",
-      input: directInput
-    });
+    return runFinalSummaryCall({ task, stageLabel: "GPT 汇总分析结果", model, reasoningEffort, userPrompt, input: directInput, schema: finalSchema, sourceChapterCount });
   }
 
-  const batches = chunkChapterResults(chapterResults, SUMMARY_COMPRESSION_BATCH_CHARS);
-  const compressedResults = [];
-  for (let index = 0; index < batches.length; index += 1) {
-    await waitIfPaused(task);
-    updateTask(task, {
-      progress: { ...task.progress, current: `压缩汇总素材 ${index + 1}/${batches.length}` },
-      message: `正在压缩汇总素材 ${index + 1}/${batches.length}`
-    });
-    const batchIndexes = new Set(batches[index].map((entry) => Number(entry.chapter_index)));
-    const batchFailedChapters = failedChapters.filter((chapterIndex) => batchIndexes.has(Number(chapterIndex)));
-    const response = await callOpenAIJson({
-      model,
-      reasoningEffort,
-      instructions: "你是小说分析结果压缩器。请按 Schema 把当前批次逐章理解结果压缩成面向用户最终目标的结构化 JSON。",
-      input: buildSummaryCompressionInput({
-        chapterResults: batches[index],
-        failedChapters: batchFailedChapters,
-        batchIndex: index + 1,
-        totalBatches: batches.length,
-        userPrompt
-      }),
-      schema: summaryCompressionSchema(),
-      schemaName: "summary_compression"
-    });
-    const expectedChapters = batches[index].map((entry) => Number(entry.chapter_index)).filter(Number.isFinite);
-    validateCompressedCoverage({
-      batchIndex: index + 1,
-      expectedChapters,
-      compressed: response.value
-    });
-    compressedResults.push({
-      batch_index: index + 1,
-      chapter_indexes: expectedChapters,
-      ...response.value
-    });
-  }
+  await waitIfPaused(task);
+  updateTask(task, {
+    progress: { ...task.progress, current: "本地整理汇总素材" },
+    message: "正在本地整理长输入汇总素材"
+  });
+  const compressedResults = compactChapterResultsForSummary({
+    chapterResults,
+    failedChapters,
+    userPrompt
+  });
 
   await waitIfPaused(task);
   updateTask(task, {
     progress: { ...task.progress, current: "GPT 汇总压缩结果" },
     message: "正在基于压缩素材生成最终汇总"
   });
-  return callOpenAIText({
-    model,
-    reasoningEffort,
-    instructions: "你是严谨的小说多章节汇总引擎。按用户汇总 Prompt 输出最终结果；如果用户要求 JSON，则只输出合法 JSON，否则直接输出文本，不要添加无关解释。",
-    input: buildCompressedSummaryInput({
+  const compressedInput = buildCompressedSummaryInput({
+    compressedResults,
+    failedChapters,
+    userPrompt
+  });
+  if (shouldSplitCustomFinalSummary(finalSchema)) {
+    return runCustomFieldSummaryCalls({
+      task,
+      model,
+      reasoningEffort: "low",
+      userPrompt,
       compressedResults,
       failedChapters,
-      userPrompt
-    })
+      schema: finalSchema,
+      sourceChapterCount
+    });
+  }
+  return runFinalSummaryCall({
+    task,
+    stageLabel: "GPT 汇总压缩结果",
+    model,
+    reasoningEffort: "low",
+    userPrompt,
+    input: compressedInput,
+    schema: finalSchema,
+    sourceChapterCount
   });
 }
 
-function chunkChapterResults(chapterResults, maxChars) {
-  const batches = [];
-  let current = [];
-  let currentSize = 2;
-  for (const result of chapterResults) {
-    const size = JSON.stringify(result).length + 1;
-    if (current.length && currentSize + size > maxChars) {
-      batches.push(current);
-      current = [];
-      currentSize = 2;
-    }
-    current.push(result);
-    currentSize += size;
+async function runFinalSummaryCall({ task, stageLabel, model, reasoningEffort, input, schema, sourceChapterCount }) {
+  if (schema?.schema) {
+    return runSummaryStageWithRetry(task, stageLabel, async () => {
+      const response = await callOpenAIJson({
+        model,
+        reasoningEffort,
+        instructions: "你是严谨的小说多章节汇总引擎。按用户汇总 Prompt 输出最终结果；如果用户要求 JSON，则只输出合法 JSON，否则直接输出文本，不要添加无关解释。",
+        input,
+        schema: schema.schema,
+        schemaName: schema.schemaName,
+        maxOutputTokens: SUMMARY_FINAL_MAX_OUTPUT_TOKENS,
+        strict: schema.strict
+      });
+      assertFinalSummaryUseful(parseJsonOrText(response.value), sourceChapterCount);
+      return response;
+    });
   }
-  if (current.length) batches.push(current);
-  return batches;
+  return runSummaryStageWithRetry(task, stageLabel, async () => {
+    const response = await callOpenAIText({
+      model,
+      reasoningEffort,
+      instructions: "你是严谨的小说多章节汇总引擎。按用户汇总 Prompt 输出最终结果；如果用户要求 JSON，则只输出合法 JSON，否则直接输出文本，不要添加无关解释。",
+      input,
+      maxOutputTokens: SUMMARY_FINAL_MAX_OUTPUT_TOKENS
+    });
+    assertFinalSummaryUseful(parseJsonOrText(response.value), sourceChapterCount);
+    return response;
+  });
+}
+
+function shouldSplitCustomFinalSummary(schema) {
+  if (schema?.schemaName !== "custom_final_analysis") return false;
+  const properties = schema.schema?.properties;
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) return false;
+  return Object.keys(properties).length >= 2;
+}
+
+async function runCustomFieldSummaryCalls({ task, model, reasoningEffort, userPrompt, compressedResults, failedChapters, schema, sourceChapterCount }) {
+  const properties = schema.schema.properties || {};
+  const finalValue = {};
+  const responseIds = [];
+  const fieldNames = Object.keys(properties);
+
+  for (const fieldName of fieldNames) {
+    await waitIfPaused(task);
+    updateTask(task, {
+      progress: { ...task.progress, current: `GPT 分字段汇总 ${fieldName}` },
+      message: `正在生成最终 JSON 字段：${fieldName}`
+    });
+
+    const fieldSchema = buildSingleFieldSummarySchema({
+      fieldName,
+      fieldSchema: properties[fieldName]
+    });
+    const response = await runSummaryStageWithRetry(task, `GPT 分字段汇总 ${fieldName}`, async () => {
+      const result = await callOpenAIJson({
+        model,
+        reasoningEffort,
+        instructions: "你是严谨的小说多章节汇总引擎。当前只生成用户最终 JSON 模板中的一个顶层字段；只输出合法 JSON，不要添加无关解释。",
+        input: buildCustomFieldSummaryInput({
+          userPrompt,
+          compressedResults,
+          failedChapters,
+          fieldName,
+          fieldSchema: properties[fieldName]
+        }),
+        schema: fieldSchema,
+        schemaName: safeSchemaName(`custom_field_${fieldName}`),
+        maxOutputTokens: CUSTOM_FIELD_SUMMARY_MAX_OUTPUT_TOKENS,
+        strict: false
+      });
+      if (!result.value || typeof result.value !== "object" || Array.isArray(result.value) || !Object.hasOwn(result.value, fieldName)) {
+        const error = new Error(`分字段汇总缺少字段：${fieldName}`);
+        error.status = 502;
+        throw error;
+      }
+      return result;
+    });
+
+    finalValue[fieldName] = response.value[fieldName];
+    if (response.responseId) responseIds.push(response.responseId);
+  }
+
+  assertFinalSummaryUseful(finalValue, sourceChapterCount);
+  return {
+    value: finalValue,
+    responseId: responseIds.join(",") || null
+  };
+}
+
+function buildSingleFieldSummarySchema({ fieldName, fieldSchema }) {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      [fieldName]: fieldSchema || looseJsonValueSchema()
+    },
+    required: [fieldName]
+  };
+}
+
+function buildCustomFieldSummaryInput({ userPrompt, compressedResults, failedChapters, fieldName, fieldSchema }) {
+  return [
+    {
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text: [
+            userPrompt,
+            "",
+            "以下是逐章理解结果的分批压缩摘要 JSON。请基于这些中间摘要进行最终汇总。",
+            "注意：中间摘要已经包含章节引用和关键证据线索；不要要求重新读取原文。",
+            "",
+            `当前只生成最终 JSON 的一个顶层字段：${fieldName}`,
+            "输出要求：",
+            `- 只输出一个 JSON 对象，且只包含 ${fieldName} 这一个顶层字段。`,
+            "- 字段含义、颗粒度、命名和取舍标准必须服从用户汇总 Prompt 中同名字段。",
+            "- 如果该字段确实没有可用信息，输出符合字段类型的空值；不要输出 N/A、暂无、占位说明。",
+            "- 不要输出 Markdown，不要输出其他顶层字段。",
+            "",
+            "当前字段 Schema JSON：",
+            JSON.stringify(fieldSchema || looseJsonValueSchema()),
+            "",
+            "分批压缩摘要 JSON：",
+            JSON.stringify(compressedResults),
+            "",
+            "失败章节：",
+            JSON.stringify(failedChapters)
+          ].join("\n")
+        }
+      ]
+    }
+  ];
+}
+
+function safeSchemaName(value) {
+  const normalized = String(value || "")
+    .replace(/[^A-Za-z0-9_-]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 60);
+  return normalized || "custom_field";
+}
+
+async function runSummaryStageWithRetry(task, stageLabel, operation) {
+  let lastError;
+  for (let attempt = 1; attempt <= SUMMARY_STAGE_MAX_ATTEMPTS; attempt += 1) {
+    await waitIfPaused(task);
+    try {
+      const result = await operation();
+      assertNotCancelled(task);
+      return result;
+    } catch (error) {
+      lastError = error;
+      if (!shouldRetrySummaryStage(error) || attempt >= SUMMARY_STAGE_MAX_ATTEMPTS) {
+        throw error;
+      }
+      updateTask(task, {
+        progress: { ...task.progress, current: stageLabel },
+        message: `${stageLabel} 失败，准备重试 ${attempt + 1}/${SUMMARY_STAGE_MAX_ATTEMPTS}：${sanitizeText(error.message)}`
+      }, "warning");
+      await delay(SUMMARY_STAGE_RETRY_DELAY_MS * attempt);
+    }
+  }
+  throw lastError;
+}
+
+function shouldRetrySummaryStage(error) {
+  const message = String(error?.message || "").toLowerCase();
+  if (error?.status === 429 || error?.status >= 500) return true;
+  return [
+    "aborted",
+    "timeout",
+    "timed out",
+    "fetch failed",
+    "network",
+    "网络连接失败",
+    "unexpected end of json input",
+    "不是合法 json"
+  ].some((pattern) => message.includes(pattern));
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseOutputSchemaOrNull(value) {
+  try {
+    const schema = JSON.parse(String(value || ""));
+    return schema && typeof schema === "object" ? schema : null;
+  } catch {
+    return null;
+  }
+}
+
+function deriveFinalSummarySchema({ userPrompt, configuredSchema }) {
+  if (configuredSchema && shouldUseJsonFinalSummary(userPrompt)) {
+    return {
+      schema: configuredSchema,
+      schemaName: "final_analysis",
+      strict: true
+    };
+  }
+
+  const promptSchema = schemaFromPromptJsonTemplate(userPrompt);
+  if (promptSchema) {
+    return {
+      schema: promptSchema,
+      schemaName: "custom_final_analysis",
+      strict: false
+    };
+  }
+
+  return null;
+}
+
+function shouldUseJsonFinalSummary(userPrompt) {
+  const prompt = String(userPrompt || "");
+  const lower = prompt.toLowerCase();
+  if (
+    /不要\s*(输出)?\s*json/i.test(prompt)
+    || /不(?:要|用|需要)\s*(输出)?\s*json/i.test(prompt)
+    || /禁止\s*(输出)?\s*json/i.test(prompt)
+    || /纯文本/.test(prompt)
+    || /(?<!不)(?<!不要)(?<!禁止)(?:输出|使用|采用|按照|按|以)[^。；\n]*markdown/i.test(prompt)
+    || /(?<!不)(?<!不要)(?<!禁止)markdown[^。；\n]*(?:格式|输出|呈现)/i.test(prompt)
+    || /(?<!不)(?<!不要)(?<!禁止)表格/.test(prompt)
+    || /按(?:照)?[^。；\n]*(格式|模板)[^。；\n]*(输出|呈现)/.test(prompt)
+    || lower.includes("plain text")
+  ) {
+    return false;
+  }
+  return /json\s*schema/i.test(prompt)
+    || /schema\s*json/i.test(prompt)
+    || /给定\s*(?:的)?\s*(?:json\s*)?schema/i.test(prompt)
+    || /匹配[^。；\n]*(?:json\s*)?schema/i.test(prompt)
+    || /符合[^。；\n]*(?:json\s*)?schema/i.test(prompt)
+    || /按[^。；\n]*(?:json\s*)?schema/i.test(prompt)
+    || /最终输出必须匹配给定\s*json\s*schema/i.test(prompt);
+}
+
+function schemaFromPromptJsonTemplate(userPrompt) {
+  const template = extractLastJsonObjectTemplate(userPrompt);
+  if (!template || Array.isArray(template)) return null;
+  return schemaFromJsonTemplate(template);
+}
+
+function extractLastJsonObjectTemplate(value) {
+  const text = String(value || "");
+  for (let end = text.length - 1; end >= 0; end -= 1) {
+    if (text[end] !== "}") continue;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let start = end; start >= 0; start -= 1) {
+      const char = text[start];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === "\\") {
+          escaped = true;
+        } else if (char === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+      if (char === "\"") {
+        inString = true;
+        continue;
+      }
+      if (char === "}") depth += 1;
+      if (char === "{") {
+        depth -= 1;
+        if (depth === 0) {
+          try {
+            const parsed = JSON.parse(text.slice(start, end + 1));
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+          } catch {
+            break;
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function schemaFromJsonTemplate(value) {
+  if (Array.isArray(value)) {
+    return {
+      type: "array",
+      items: value.length ? schemaFromJsonTemplate(value[0]) : looseJsonValueSchema()
+    };
+  }
+  if (value && typeof value === "object") {
+    const properties = {};
+    const required = [];
+    for (const [key, entry] of Object.entries(value)) {
+      properties[key] = schemaFromJsonTemplate(entry);
+      required.push(key);
+    }
+    return {
+      type: "object",
+      additionalProperties: true,
+      properties,
+      required
+    };
+  }
+  if (typeof value === "number") return { type: Number.isInteger(value) ? "integer" : "number" };
+  if (typeof value === "boolean") return { type: "boolean" };
+  if (value === null) return looseJsonValueSchema();
+  return { type: "string" };
+}
+
+function looseJsonValueSchema() {
+  return {
+    anyOf: [
+      { type: "string" },
+      { type: "number" },
+      { type: "integer" },
+      { type: "boolean" },
+      { type: "object", additionalProperties: true },
+      { type: "array", items: { anyOf: [{ type: "string" }, { type: "number" }, { type: "integer" }, { type: "boolean" }, { type: "object", additionalProperties: true } ] } }
+    ]
+  };
 }
 
 function inputTextLength(input) {
@@ -718,23 +1349,60 @@ function inputTextLength(input) {
   ), 0);
 }
 
-function validateCompressedCoverage({ batchIndex, expectedChapters, compressed }) {
-  const covered = new Set((compressed.covered_chapters || []).map(Number).filter(Number.isFinite));
-  const missing = expectedChapters.filter((chapterIndex) => !covered.has(chapterIndex));
-  if (missing.length) {
-    const error = new Error(`汇总素材压缩覆盖不完整：第 ${batchIndex} 批缺少章节 ${missing.join(", ")}`);
-    error.status = 502;
-    throw error;
+function compactChapterResultsForSummary({ chapterResults, failedChapters, userPrompt }) {
+  const count = Math.max(1, chapterResults.length);
+  const promptReserve = String(userPrompt || "").length + JSON.stringify(failedChapters || []).length + 1500;
+  const perChapterBudget = Math.max(160, Math.min(420, Math.floor((SUMMARY_COMPACT_TARGET_CHARS - promptReserve) / count)));
+  return chapterResults.map((result) => compactChapterResult(result, perChapterBudget));
+}
+
+function compactChapterResult(result, budget) {
+  const chapterIndex = Number(result?.chapter_index || 0);
+  const title = clipText(result?.chapter_title || result?.title || "", 80);
+  const summaryBudget = Math.max(80, Math.floor(budget * 0.48));
+  const keyPointBudget = Math.max(55, Math.floor(budget * 0.22));
+  const evidenceBudget = Math.max(40, Math.floor(budget * 0.12));
+  const fallback = summarizeUnknownResult(result, Math.max(100, Math.floor(budget * 0.7)));
+  return {
+    chapter_index: chapterIndex,
+    chapter_title: title,
+    summary: clipText(result?.summary || fallback, summaryBudget),
+    key_points: compactStringArray(result?.key_points, 2, keyPointBudget),
+    evidence_notes: compactStringArray(result?.evidence_notes, 1, evidenceBudget)
+  };
+}
+
+function compactStringArray(value, maxItems, maxChars) {
+  const items = Array.isArray(value) ? value : [];
+  return items
+    .map((item) => clipText(item, maxChars))
+    .filter(Boolean)
+    .slice(0, maxItems);
+}
+
+function summarizeUnknownResult(value, maxChars) {
+  if (!value || typeof value !== "object") return clipText(value, maxChars);
+  const fragments = [];
+  for (const [key, entry] of Object.entries(value)) {
+    if (["chapter_index", "chapter_title", "title"].includes(key)) continue;
+    if (typeof entry === "string") {
+      fragments.push(`${key}: ${entry}`);
+    } else if (Array.isArray(entry)) {
+      fragments.push(`${key}: ${entry.slice(0, 3).map((item) => typeof item === "string" ? item : JSON.stringify(item)).join("; ")}`);
+    }
+    if (fragments.join(" ").length >= maxChars) break;
   }
-  const coveredOutsideBatch = [...covered].filter((chapterIndex) => !expectedChapters.includes(chapterIndex));
-  if (coveredOutsideBatch.length) {
-    const error = new Error(`汇总素材压缩覆盖异常：第 ${batchIndex} 批包含非本批章节 ${coveredOutsideBatch.join(", ")}`);
-    error.status = 502;
-    throw error;
-  }
+  return clipText(fragments.join(" "), maxChars);
+}
+
+function clipText(value, maxChars) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 3))}...`;
 }
 
 function parseJsonOrText(value) {
+  if (value && typeof value === "object") return value;
   const text = String(value || "").trim();
   if (!text) return "";
   try {
@@ -742,6 +1410,66 @@ function parseJsonOrText(value) {
   } catch {
     return text;
   }
+}
+
+function parseJsonObject(value) {
+  if (!value) return null;
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  try {
+    const parsed = JSON.parse(String(value));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function assertFinalSummaryUseful(finalResult, sourceChapterCount) {
+  if (sourceChapterCount < 3) return;
+
+  if (typeof finalResult === "string") {
+    const text = finalResult.trim();
+    if (text && !isPlaceholderText(text)) return;
+    throw finalSummaryQualityError();
+  }
+
+  if (!finalResult || typeof finalResult !== "object") {
+    throw finalSummaryQualityError();
+  }
+
+  const summary = String(finalResult.summary || "").trim();
+  const title = String(finalResult.title || "").trim();
+  const items = Array.isArray(finalResult.items) ? finalResult.items : [];
+  const hasUsefulSummary = Boolean(summary) && !isPlaceholderText(summary);
+  const hasUsefulTitle = Boolean(title) && !isPlaceholderText(title);
+  if (items.length || hasUsefulSummary || hasUsefulTitle || hasAnyUsefulCustomValue(finalResult)) return;
+  throw finalSummaryQualityError();
+}
+
+function hasAnyUsefulCustomValue(value) {
+  for (const [key, entry] of Object.entries(value)) {
+    if (["title", "summary", "items", "failed_chapters"].includes(key)) continue;
+    if (isUsefulFinalValue(entry)) return true;
+  }
+  return false;
+}
+
+function isUsefulFinalValue(value) {
+  if (typeof value === "string") return Boolean(value.trim()) && !isPlaceholderText(value);
+  if (typeof value === "number" || typeof value === "boolean") return true;
+  if (Array.isArray(value)) return value.some((item) => isUsefulFinalValue(item));
+  if (value && typeof value === "object") return Object.values(value).some((entry) => isUsefulFinalValue(entry));
+  return false;
+}
+
+function isPlaceholderText(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return ["", "n/a", "na", "null", "none", "无", "暂无", "空"].includes(normalized);
+}
+
+function finalSummaryQualityError() {
+  const error = new Error("最终汇总结果疑似占位或为空，已拒绝保存。请续跑最终汇总。");
+  error.status = 502;
+  return error;
 }
 
 function buildL1AnalysisContext({ bookId, chapters, startChapter, endChapter }) {
@@ -824,20 +1552,40 @@ export function publicAnalysisRun(run) {
     status: run.status,
     chapter_count: run.chapter_count,
     error_summary: run.error_summary,
+    source_stats: parseJsonObject(run.source_stats),
     created_at: run.created_at,
     updated_at: run.updated_at
   };
+}
+
+export function getL2IndexCoverageForBook({ bookId, startChapter, endChapter }) {
+  const settings = getPromptSettings();
+  return getL2Coverage({
+    bookId,
+    startChapter,
+    endChapter,
+    model: settings.model,
+    promptHash: l2IndexPromptHash(settings),
+    schemaVersion: L2_SCHEMA_VERSION
+  });
+}
+
+export async function listL2FactsForBook({ bookId, startChapter, endChapter, category, entity, limit }) {
+  return listL2Facts({
+    bookId,
+    startChapter,
+    endChapter,
+    categories: category ? String(category).split(",") : [],
+    entity,
+    limit,
+    includeContent: true
+  });
 }
 
 function rangeIndexes(start, end) {
   const indexes = [];
   for (let index = start; index <= end; index += 1) indexes.push(index);
   return indexes;
-}
-
-function l1PromptHash() {
-  // Keep the legacy hash so already-built chapter L1 indexes remain reusable.
-  return "l1-v1-chapter-window-10";
 }
 
 function isFatalUpstreamError(message) {
@@ -848,6 +1596,51 @@ function normalizeChapterIndexes(value) {
   if (!Array.isArray(value)) return [];
   const indexes = value.map((entry) => normalizeChapterIndex(entry));
   return [...new Set(indexes)].sort((left, right) => left - right);
+}
+
+function normalizeAnalysisMode(value) {
+  return ["fast_index", "balanced", "precision", "full_text"].includes(value) ? value : "balanced";
+}
+
+function normalizeL2BuildMode(value) {
+  return ["all", "missing", "retry_failed"].includes(value) ? value : "all";
+}
+
+function normalizeOptionalBudget(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const number = Number.parseInt(value, 10);
+  if (!Number.isFinite(number) || number < 0) return null;
+  return Math.min(100, number);
+}
+
+function sourceReviewBudgetForMode(mode, chapterCount, override) {
+  if (Number.isInteger(override)) return override;
+  if (mode === "fast_index") return 0;
+  if (mode === "precision") return Math.min(30, Math.max(5, Math.ceil(chapterCount * 0.03)));
+  if (mode === "balanced") return Math.min(10, Math.max(3, Math.ceil(chapterCount * 0.01)));
+  return 0;
+}
+
+function inferL2CategoriesFromPrompt(prompt) {
+  const text = String(prompt || "").toLowerCase();
+  const categories = new Set();
+  if (/人物|角色|主角|配角|身份|character|role/.test(text)) categories.add("character");
+  if (/关系|羁绊|师徒|敌友|relationship/.test(text)) categories.add("relationship");
+  if (/境界|修炼|功法|体系|cultivation/.test(text)) categories.add("cultivation");
+  if (/宗门|势力|门派|组织|force|faction|sect/.test(text)) categories.add("force");
+  if (/武器|法宝|物品|道具|item|weapon/.test(text)) categories.add("item");
+  if (/地点|地图|空间|location|place/.test(text)) categories.add("location");
+  if (/事件|剧情|时间线|event|timeline/.test(text)) categories.add("event");
+  if (/伏笔|线索|foreshadow/.test(text)) categories.add("foreshadowing");
+  return categories.size ? [...categories] : [];
+}
+
+function inferEntityQueryFromPrompt(prompt) {
+  const text = String(prompt || "");
+  const matches = [...text.matchAll(/[《“「『]([^》”」』]{1,24})[》”」』]/g)]
+    .map((match) => match[1])
+    .filter((value) => !/json|schema|markdown/i.test(value));
+  return matches[0] || "";
 }
 
 function resolveSelectedChapters({ bookId, startChapter, endChapter, chapterIndexes }) {

@@ -4,12 +4,12 @@ import {
   ChevronRight,
   Copy,
   FileText,
+  Gauge,
   Layers,
   Loader2,
   Plus,
   Play,
   RefreshCcw,
-  Save,
   Settings2,
   Table2,
   Trash2
@@ -26,7 +26,9 @@ const initialAnalysisForm = {
   name: "",
   book_id: "",
   start_chapter: "1",
-  end_chapter: "20"
+  end_chapter: "20",
+  analysis_mode: "balanced",
+  source_review_budget: ""
 };
 
 export function AnalysisPage({
@@ -58,11 +60,13 @@ export function AnalysisPage({
   const [selectedIndexes, setSelectedIndexes] = useState([]);
   const [useL1Context, setUseL1Context] = useState(false);
   const [l1Coverage, setL1Coverage] = useState(null);
+  const [l2Coverage, setL2Coverage] = useState(null);
   const selectionOverrideRef = useRef(null);
   const [selectionOverrideToken, setSelectionOverrideToken] = useState(0);
   const [chaptersExpanded, setChaptersExpanded] = useState(false);
   const [selectedAnalysis, setSelectedAnalysis] = useState(null);
   const [busy, setBusy] = useState({ analysis: false, prompts: false, chapters: false, list: false });
+  const [advancedPromptExpanded, setAdvancedPromptExpanded] = useState(false);
 
   useEffect(() => {
     if (analysisTask?.result?.analysisId && selectedAnalysis?.id === analysisTask.result.analysisId) {
@@ -170,8 +174,12 @@ export function AnalysisPage({
     }
     try {
       const query = `start_chapter=${encodeURIComponent(analysisForm.start_chapter)}&end_chapter=${encodeURIComponent(analysisForm.end_chapter)}`;
-      const data = await apiGet(`/api/books/${encodeURIComponent(analysisForm.book_id)}/l1-indexes/coverage?${query}`);
-      setL1Coverage(data.coverage);
+      const [l1Data, l2Data] = await Promise.all([
+        apiGet(`/api/books/${encodeURIComponent(analysisForm.book_id)}/l1-indexes/coverage?${query}`),
+        apiGet(`/api/books/${encodeURIComponent(analysisForm.book_id)}/l2-indexes/coverage?${query}`)
+      ]);
+      setL1Coverage(l1Data.coverage);
+      setL2Coverage(l2Data.coverage);
     } catch (error) {
       setError(error.message);
     }
@@ -196,6 +204,8 @@ export function AnalysisPage({
       end_chapter: Number(analysisForm.end_chapter),
       chapter_indexes: chapterIndexes,
       use_l1_context: useL1Context,
+      analysis_mode: analysisForm.analysis_mode,
+      source_review_budget: analysisForm.source_review_budget === "" ? undefined : Number(analysisForm.source_review_budget),
       prompt: {
         ...promptDraft,
         output_schema: outputSchemaForPrompt(promptDraft)
@@ -295,7 +305,6 @@ export function AnalysisPage({
     setPromptDraft((current) => ({
       ...current,
       name: group.name,
-      chapter_prompt: group.chapter_prompt,
       summary_prompt: group.summary_prompt
     }));
   }
@@ -304,6 +313,7 @@ export function AnalysisPage({
     setAnalysisForm((form) => ({ ...form, ...patch }));
     if (patch.book_id !== undefined || patch.start_chapter !== undefined || patch.end_chapter !== undefined) {
       setL1Coverage(null);
+      setL2Coverage(null);
     }
   }
 
@@ -391,6 +401,30 @@ export function AnalysisPage({
                 onChange={(event) => updateAnalysisForm({ end_chapter: sanitizeChapterInput(event.target.value) })}
               />
             </label>
+            <label>
+              <span>分析模式</span>
+              <select
+                value={analysisForm.analysis_mode}
+                onChange={(event) => updateAnalysisForm({ analysis_mode: event.target.value })}
+              >
+                <option value="balanced">平衡推荐</option>
+                <option value="fast_index">快速探索</option>
+                <option value="precision">精准复核</option>
+                <option value="full_text">全文精读</option>
+              </select>
+            </label>
+            <label>
+              <span>复核预算</span>
+              <input
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]*"
+                placeholder="默认"
+                value={analysisForm.source_review_budget}
+                onChange={(event) => updateAnalysisForm({ source_review_budget: sanitizeChapterInput(event.target.value) })}
+                disabled={analysisForm.analysis_mode === "fast_index" || analysisForm.analysis_mode === "full_text"}
+              />
+            </label>
           </div>
 
           <div className="selector-card">
@@ -437,10 +471,13 @@ export function AnalysisPage({
             <span>附加 L1 上下文</span>
             <small>{formatCoverage(l1Coverage)}</small>
           </label>
+          <div className="index-route-note">
+            {analysisRouteNote(analysisForm.analysis_mode, l2Coverage, selectedIndexes.length, analysisForm.source_review_budget)}
+          </div>
         </Panel>
 
         <div className="split">
-          <Panel icon={Settings2} title="Prompt 配置">
+          <Panel icon={Settings2} title="分析 Prompt">
             <PromptEditor
               prompt={promptDraft}
               promptGroups={promptGroups}
@@ -450,6 +487,8 @@ export function AnalysisPage({
               onSave={savePrompts}
               busy={busy.prompts}
               dirty={promptDirty}
+              advancedExpanded={advancedPromptExpanded}
+              onAdvancedExpandedChange={setAdvancedPromptExpanded}
             />
           </Panel>
 
@@ -517,6 +556,22 @@ function formatCoverage(coverage) {
   return `章节 ${coverage.chapters.completed}/${coverage.chapters.total}`;
 }
 
+function analysisRouteNote(mode, coverage, selectedCount, budget) {
+  if (mode === "full_text") return "全文精读会逐章读取原文，适合小范围高保真分析。";
+  if (mode === "fast_index") return `快速探索只使用 L2 索引；当前覆盖 ${coverageText(coverage)}。`;
+  const defaultBudget = mode === "precision"
+    ? Math.min(30, Math.max(5, Math.ceil(selectedCount * 0.03)))
+    : Math.min(10, Math.max(3, Math.ceil(selectedCount * 0.01)));
+  const reviewBudget = budget === "" ? defaultBudget : Number(budget || 0);
+  const label = mode === "precision" ? "精准复核" : "平衡推荐";
+  return `${label}会先召回 L2 事实，最多复核 ${reviewBudget} 章原文；当前 L2 覆盖 ${coverageText(coverage)}。`;
+}
+
+function coverageText(coverage) {
+  if (!coverage?.chapters) return "读取中";
+  return `${coverage.chapters.completed}/${coverage.chapters.total} 章，${coverage.chapters.facts || 0} 条事实`;
+}
+
 function summarizeSelection(selectedIndexes, totalInRange, coverage) {
   const selected = selectedIndexes.length;
   const selectedText = `${selected}/${totalInRange} 章已选`;
@@ -570,7 +625,18 @@ function AnalysisHistory({ analyses, books, selectedId, onSelect, onCopy, onDele
   );
 }
 
-function PromptEditor({ prompt, promptGroups, selectedPromptGroupId, onPromptGroupChange, onChange, onSave, busy, dirty }) {
+function PromptEditor({
+  prompt,
+  promptGroups,
+  selectedPromptGroupId,
+  onPromptGroupChange,
+  onChange,
+  onSave,
+  busy,
+  dirty,
+  advancedExpanded,
+  onAdvancedExpandedChange
+}) {
   function updatePrompt(patch) {
     onChange((current) => ({ ...current, ...patch }));
   }
@@ -578,12 +644,12 @@ function PromptEditor({ prompt, promptGroups, selectedPromptGroupId, onPromptGro
   return (
     <div className="prompt-editor">
       <div className={dirty ? "draft-banner active" : "draft-banner"}>
-        {dirty ? "当前 Prompt 已修改。开始分析会使用这份草稿；保存后才会更新默认 Prompt。" : "当前使用默认 Prompt 或已保存模板。"}
+        {dirty ? "当前 Prompt 已修改。开始分析会使用这份草稿；保存后才会更新默认 Prompt。" : "当前使用默认 Prompt 或已保存分析 Prompt。"}
       </div>
       <label>
-        <span>Prompt 组</span>
+        <span>选择分析 Prompt</span>
         <select value={selectedPromptGroupId} onChange={(event) => onPromptGroupChange(event.target.value)}>
-          <option value="">手动编辑当前 Prompt</option>
+          <option value="">手动编辑当前分析 Prompt</option>
           {promptGroups.map((group) => (
             <option key={group.id} value={group.id}>{group.category} · {group.name}</option>
           ))}
@@ -592,7 +658,7 @@ function PromptEditor({ prompt, promptGroups, selectedPromptGroupId, onPromptGro
 
       <div className="form-grid compact">
         <label>
-          <span>模板名</span>
+          <span>名称</span>
           <input value={prompt.name} onChange={(event) => updatePrompt({ name: event.target.value })} />
         </label>
         <label>
@@ -610,16 +676,32 @@ function PromptEditor({ prompt, promptGroups, selectedPromptGroupId, onPromptGro
       </div>
 
       <label>
-        <span>逐章 Prompt</span>
-        <textarea value={prompt.chapter_prompt} onChange={(event) => updatePrompt({ chapter_prompt: event.target.value })} />
-      </label>
-      <label>
-        <span>汇总 Prompt</span>
+        <span>分析 Prompt</span>
         <textarea value={prompt.summary_prompt} onChange={(event) => updatePrompt({ summary_prompt: event.target.value })} />
       </label>
 
+      <div className="selector-card prompt-advanced-card">
+        <button
+          type="button"
+          className="selector-summary"
+          onClick={() => onAdvancedExpandedChange((value) => !value)}
+        >
+          <span className="selector-summary-title">
+            {advancedExpanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+            高级逐章 Prompt
+          </span>
+          <span>主要用于全文精读</span>
+        </button>
+        {advancedExpanded ? (
+          <label className="prompt-advanced-field">
+            <span>逐章 Prompt</span>
+            <textarea value={prompt.chapter_prompt} onChange={(event) => updatePrompt({ chapter_prompt: event.target.value })} />
+          </label>
+        ) : null}
+      </div>
+
       <button className="secondary" type="button" onClick={onSave} disabled={busy}>
-        {busy ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
+        {busy ? <Loader2 className="spin" size={16} /> : <Gauge size={16} />}
         保存为默认 Prompt
       </button>
     </div>
@@ -632,7 +714,12 @@ function ResultView({ analysis, analysisBusy, onResume }) {
     return <PartialResultView analysis={analysis} analysisBusy={analysisBusy} onResume={onResume} />;
   }
   if (typeof analysis.finalResult === "string") {
-    return <TextPreview value={analysis.finalResult} />;
+    return (
+      <div className="result-stack">
+        <SourceStats stats={analysis.source_stats} />
+        <TextPreview value={analysis.finalResult} />
+      </div>
+    );
   }
   const columns = resultColumnsFromPrompt(null, analysis.finalResult);
   const rows = Array.isArray(analysis.finalResult.items) ? analysis.finalResult.items : [];
@@ -640,6 +727,7 @@ function ResultView({ analysis, analysisBusy, onResume }) {
   if (rows.length && columns.length) {
     return (
       <div className="result-stack">
+        <SourceStats stats={analysis.source_stats} />
         <div className="result-summary">
           <h3>{analysis.finalResult.title || analysis.name}</h3>
           <p>{analysis.finalResult.summary || ""}</p>
@@ -674,7 +762,31 @@ function ResultView({ analysis, analysisBusy, onResume }) {
     );
   }
 
-  return <JsonPreview value={analysis.finalResult} />;
+  return (
+    <div className="result-stack">
+      <SourceStats stats={analysis.source_stats} />
+      <JsonPreview value={analysis.finalResult} />
+    </div>
+  );
+}
+
+function SourceStats({ stats }) {
+  if (!stats) return null;
+  const modeLabel = {
+    fast_index: "快速探索",
+    balanced: "平衡推荐",
+    precision: "精准复核",
+    full_text: "全文精读"
+  }[stats.analysis_mode] || stats.analysis_mode || "未知模式";
+  return (
+    <div className="source-stats">
+      <span>{modeLabel}</span>
+      <span>召回事实 {Number(stats.recalled_facts || 0)} 条</span>
+      <span>涉及章节 {Number(stats.recalled_chapters || 0)} 章</span>
+      <span>原文复核 {Number(stats.source_review_chapters || 0)}/{Number(stats.source_review_budget || 0)} 章</span>
+      {stats.missing_chapters?.length ? <span>索引缺口 {stats.missing_chapters.length} 章</span> : null}
+    </div>
+  );
 }
 
 function PartialResultView({ analysis, analysisBusy, onResume }) {

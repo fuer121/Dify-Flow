@@ -124,6 +124,7 @@ test("OpenAI request uses Responses API with store false and no background mode"
     assert.equal(capturedBody.store, false);
     assert.equal(Object.hasOwn(capturedBody, "background"), false);
     assert.equal(capturedBody.model, "gpt-5.5");
+    assert.equal(Object.hasOwn(capturedBody, "max_output_tokens"), false);
   } finally {
     global.fetch = previousFetch;
   }
@@ -163,6 +164,7 @@ test("OpenAI text request uses Responses API with store false and no schema form
     assert.equal(capturedBody.store, false);
     assert.equal(Object.hasOwn(capturedBody, "background"), false);
     assert.equal(Object.hasOwn(capturedBody, "text"), false);
+    assert.equal(Object.hasOwn(capturedBody, "max_output_tokens"), false);
   } finally {
     global.fetch = previousFetch;
   }
@@ -434,6 +436,225 @@ test("builds chapter-only L1 indexes, skips fresh indexes, and keeps OpenAI requ
   }
 });
 
+test("stores L2 facts with encrypted fact content and reports coverage", async () => {
+  await db.saveEncryptedChapter({
+    bookId: "book-l2-storage",
+    chapterIndex: 1,
+    title: "第一章",
+    content: "陈平安得到木剑。"
+  });
+  const chapter = db.getChapterMetadata("book-l2-storage", 1);
+  await db.saveL2ChapterFacts({
+    bookId: "book-l2-storage",
+    chapterIndex: 1,
+    status: "completed",
+    sourceHmac: chapter.content_hmac,
+    model: "gpt-5.5",
+    promptHash: "l2-v1-typed-facts",
+    schemaVersion: "l2-facts-v1",
+    facts: [{
+      category: "character",
+      entity: "陈平安",
+      aliases: ["少年"],
+      tags: ["木剑"],
+      related_entities: ["木剑"],
+      fact_type: "item_gain",
+      fact: "陈平安得到木剑。",
+      evidence: ["得到木剑"],
+      importance: 0.8,
+      confidence: 0.9
+    }]
+  });
+
+  const facts = await db.listL2Facts({
+    bookId: "book-l2-storage",
+    startChapter: 1,
+    endChapter: 1,
+    categories: ["character"],
+    entity: "陈平安"
+  });
+  assert.equal(facts.length, 1);
+  assert.equal(facts[0].fact, "陈平安得到木剑。");
+  assert.equal(facts[0].entity, "陈平安");
+  const coverage = db.getL2Coverage({
+    bookId: "book-l2-storage",
+    startChapter: 1,
+    endChapter: 1,
+    model: "gpt-5.5",
+    promptHash: "l2-v1-typed-facts",
+    schemaVersion: "l2-facts-v1"
+  });
+  assert.equal(coverage.chapters.completed, 1);
+  assert.equal(coverage.chapters.facts, 1);
+  const dbBytes = await fs.readFile(db.getDbPath());
+  assert.equal(dbBytes.includes(Buffer.from("陈平安得到木剑。")), false);
+});
+
+test("builds L2 indexes, skips fresh facts, and keeps requests ZDR-shaped", async () => {
+  await db.saveEncryptedChapter({
+    bookId: "book-l2-task",
+    chapterIndex: 1,
+    title: "第一章",
+    content: "陈平安得到木剑。"
+  });
+
+  const previousFetch = global.fetch;
+  let responseCalls = 0;
+  const capturedBodies = [];
+  global.fetch = async (url, request) => {
+    if (String(url).includes("api.openai.com/v1/models")) {
+      return { ok: true, status: 200, json: async () => ({ data: [] }) };
+    }
+    if (!String(url).includes("api.openai.com/v1/responses")) {
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    }
+    responseCalls += 1;
+    const body = JSON.parse(request.body);
+    capturedBodies.push(body);
+    return {
+      ok: true,
+      json: async () => ({
+        id: `resp_l2_${responseCalls}`,
+        output: [{ content: [{ type: "output_text", text: JSON.stringify({ facts: [{
+          category: "character",
+          entity: "陈平安",
+          aliases: [],
+          tags: ["木剑"],
+          related_entities: ["木剑"],
+          fact_type: "item_gain",
+          fact: "陈平安得到木剑。",
+          evidence: ["木剑"],
+          importance: 0.8,
+          confidence: 0.9
+        }] }) }] }]
+      })
+    };
+  };
+
+  try {
+    const task = workflows.startL2IndexTask({
+      book_id: "book-l2-task",
+      start_chapter: 1,
+      end_chapter: 1
+    });
+    await waitForTask(task);
+    assert.equal(task.status, "completed");
+    assert.equal(responseCalls, 1);
+    assert.equal(capturedBodies[0].store, false);
+    assert.equal(Object.hasOwn(capturedBodies[0], "background"), false);
+    assert.equal(capturedBodies[0].text.format.name, "l2_chapter_facts");
+
+    const skipped = workflows.startL2IndexTask({
+      book_id: "book-l2-task",
+      start_chapter: 1,
+      end_chapter: 1
+    });
+    await waitForTask(skipped);
+    assert.equal(skipped.progress.skipped, 1);
+    assert.equal(responseCalls, 1);
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("custom index prompts are saved, used by L1/L2 tasks, and change freshness hash", async () => {
+  const customL1 = "自定义 L1 Prompt：只提炼人物与事件。";
+  const customL2 = "自定义 L2 Prompt：只提炼可检索事实。";
+  const saved = db.saveIndexPromptSettings({
+    l1_index_prompt: customL1,
+    l2_index_prompt: customL2
+  });
+  assert.equal(saved.l1_index_prompt, customL1);
+  assert.equal(saved.l2_index_prompt, customL2);
+  assert.notEqual(saved.l1_index_prompt_hash, "l1-v1-chapter-window-10");
+  assert.notEqual(saved.l2_index_prompt_hash, "l2-v1-typed-facts");
+
+  await db.saveEncryptedChapter({
+    bookId: "book-index-prompt",
+    chapterIndex: 1,
+    title: "第一章",
+    content: "陈平安得到木剑。"
+  });
+
+  const previousFetch = global.fetch;
+  const capturedBodies = [];
+  global.fetch = async (url, request) => {
+    if (String(url).includes("api.openai.com/v1/models")) {
+      return { ok: true, status: 200, json: async () => ({ data: [] }) };
+    }
+    if (!String(url).includes("api.openai.com/v1/responses")) {
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    }
+    const body = JSON.parse(request.body);
+    capturedBodies.push(body);
+    const formatName = body.text?.format?.name;
+    const outputValue = formatName === "l1_chapter_index"
+      ? {
+        summary: "章节摘要",
+        keywords: [],
+        entities: [],
+        key_events: [],
+        items_places_orgs: [],
+        open_questions: [],
+        confidence: 0.8
+      }
+      : {
+        facts: [{
+          category: "item",
+          entity: "木剑",
+          aliases: [],
+          tags: [],
+          related_entities: ["陈平安"],
+          fact_type: "item_gain",
+          fact: "陈平安得到木剑。",
+          evidence: ["木剑"],
+          importance: 0.8,
+          confidence: 0.9
+        }]
+      };
+    return {
+      ok: true,
+      json: async () => ({
+        id: `resp_index_prompt_${capturedBodies.length}`,
+        output: [{ content: [{ type: "output_text", text: JSON.stringify(outputValue) }] }]
+      })
+    };
+  };
+
+  try {
+    const l1Task = workflows.startL1IndexTask({
+      book_id: "book-index-prompt",
+      start_chapter: 1,
+      end_chapter: 1
+    });
+    await waitForTask(l1Task);
+    assert.equal(l1Task.status, "completed");
+    assert.equal(db.getL1ChapterIndex("book-index-prompt", 1).prompt_hash, saved.l1_index_prompt_hash);
+    assert.equal(JSON.stringify(capturedBodies[0].input).includes(customL1), true);
+
+    const l2Task = workflows.startL2IndexTask({
+      book_id: "book-index-prompt",
+      start_chapter: 1,
+      end_chapter: 1
+    });
+    await waitForTask(l2Task);
+    assert.equal(l2Task.status, "completed");
+    assert.equal(db.getL2ChapterStatus("book-index-prompt", 1).prompt_hash, saved.l2_index_prompt_hash);
+    assert.equal(JSON.stringify(capturedBodies[1].input).includes(customL2), true);
+
+    const skippedL2 = workflows.startL2IndexTask({
+      book_id: "book-index-prompt",
+      start_chapter: 1,
+      end_chapter: 1
+    });
+    await waitForTask(skippedL2);
+    assert.equal(skippedL2.progress.skipped, 1);
+    assert.equal(capturedBodies.length, 2);
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
 test("creates, edits, lists, and deletes prompt groups with categories", () => {
   const created = db.createPromptGroup({
     name: "角色定位 Prompt",
@@ -458,6 +679,26 @@ test("creates, edits, lists, and deletes prompt groups with categories", () => {
 
   assert.equal(db.deletePromptGroup(created.id).deleted, true);
   assert.equal(db.getPromptGroup(created.id), undefined);
+});
+
+test("analysis prompt groups can save summary prompt without chapter prompt", () => {
+  const created = db.createPromptGroup({
+    name: "势力关系分析",
+    category: "通用",
+    summary_prompt: "只分析宗门势力关系"
+  });
+
+  assert.equal(created.name, "势力关系分析");
+  assert.equal(created.summary_prompt, "只分析宗门势力关系");
+  assert.equal(created.chapter_prompt, "");
+
+  const updated = db.updatePromptGroup(created.id, {
+    summary_prompt: "改为分析人物关系"
+  });
+  assert.equal(updated.summary_prompt, "改为分析人物关系");
+  assert.equal(updated.chapter_prompt, "");
+
+  assert.equal(db.deletePromptGroup(created.id).deleted, true);
 });
 
 test("imports once, skips stored chapters, and analyzes from encrypted local store", async () => {
@@ -494,10 +735,15 @@ test("imports once, skips stored chapters, and analyzes from encrypted local sto
     if (String(url).includes("api.openai.com/v1/responses")) {
       openaiCalls += 1;
       const body = JSON.parse(request.body);
-      const isSummary = !body.text?.format;
-      const outputValue = isSummary
+      const formatName = body.text?.format?.name || "";
+      const text = body.input[0].content[0].text;
+      const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
+      const outputValue = formatName === "final_analysis"
         ? { title: "汇总", summary: "全书摘要", items: [], failed_chapters: [] }
-        : { chapter_index: openaiCalls, chapter_title: `第${openaiCalls}章`, summary: "章节摘要", key_points: [], evidence_notes: [] };
+        : { chapter_index: chapterIndex, chapter_title: `第${chapterIndex}章`, summary: "章节摘要", key_points: [], evidence_notes: [] };
+      if (formatName !== "final_analysis") {
+        assert.equal(formatName, "chapter_result");
+      }
       return {
         ok: true,
         json: async () => ({
@@ -531,6 +777,7 @@ test("imports once, skips stored chapters, and analyzes from encrypted local sto
     assert.equal(difyCalls, 1);
 
     const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       book_id: "book-e2e",
       start_chapter: 1,
       end_chapter: 3
@@ -581,8 +828,9 @@ test("analyzes selected non-contiguous chapters, preserves prompt snapshot, and 
       throw new Error(`Unexpected fetch URL: ${url}`);
     }
     const body = JSON.parse(request.body);
-    const isSummary = !body.text?.format;
-    if (isSummary) {
+    const formatName = body.text?.format?.name || "";
+    const text = body.input[0].content[0].text;
+    if (formatName === "final_analysis" || (!formatName && !text.includes("章节编号："))) {
       return {
         ok: true,
         json: async () => ({
@@ -592,7 +840,7 @@ test("analyzes selected non-contiguous chapters, preserves prompt snapshot, and 
       };
     }
 
-    const text = body.input[0].content[0].text;
+    assert.equal(formatName, "chapter_result");
     const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
     requestedChapters.push(chapterIndex);
     return {
@@ -624,6 +872,7 @@ test("analyzes selected non-contiguous chapters, preserves prompt snapshot, and 
       schema_fields: [{ name: "name", label: "名称", type: "string", required: true, description: "" }]
     });
     const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       name: "非连续选择",
       book_id: "book-selected",
       start_chapter: 1,
@@ -713,8 +962,8 @@ test("analysis keeps default input without L1 and appends L1 context only when e
     }
     const body = JSON.parse(request.body);
     const text = body.input[0].content[0].text;
-    const isSummary = !body.text?.format;
-    if (isSummary) {
+    const formatName = body.text?.format?.name || "";
+    if (formatName === "final_analysis") {
       summaryPrompts.push(text);
       return {
         ok: true,
@@ -725,6 +974,7 @@ test("analysis keeps default input without L1 and appends L1 context only when e
       };
     }
 
+    assert.equal(formatName, "chapter_result");
     chapterPrompts.push(text);
     return {
       ok: true,
@@ -748,6 +998,7 @@ test("analysis keeps default input without L1 and appends L1 context only when e
 
   try {
     const withoutL1 = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       book_id: "book-l1-analysis",
       start_chapter: 1,
       end_chapter: 1
@@ -757,6 +1008,7 @@ test("analysis keeps default input without L1 and appends L1 context only when e
     assert.equal(summaryPrompts[0].includes("可选 L1 窗口上下文 JSON"), false);
 
     const withL1 = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       book_id: "book-l1-analysis",
       start_chapter: 1,
       end_chapter: 1,
@@ -769,6 +1021,160 @@ test("analysis keeps default input without L1 and appends L1 context only when e
     assert.equal(summaryPrompts[1].includes("L1 窗口摘要"), false);
     const result = await workflows.publicAnalysisRunWithResult(withL1.id);
     assert.equal(result.prompt.use_l1_context, true);
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("fast index analysis uses L2 facts without decrypting chapter text", async () => {
+  await db.saveEncryptedChapter({
+    bookId: "book-fast-index",
+    chapterIndex: 1,
+    title: "第一章",
+    content: "如果读取原文测试应失败"
+  });
+  const chapter = db.getChapterMetadata("book-fast-index", 1);
+  await db.saveL2ChapterFacts({
+    bookId: "book-fast-index",
+    chapterIndex: 1,
+    status: "completed",
+    sourceHmac: chapter.content_hmac,
+    model: "gpt-5.5",
+    promptHash: "l2-v1-typed-facts",
+    schemaVersion: "l2-facts-v1",
+    facts: [{
+      category: "character",
+      entity: "陈平安",
+      fact_type: "identity",
+      fact: "陈平安是关键人物。",
+      evidence: ["关键人物"],
+      importance: 0.8,
+      confidence: 0.9
+    }]
+  });
+
+  const previousFetch = global.fetch;
+  let summaryCalls = 0;
+  global.fetch = async (url, request) => {
+    if (String(url).includes("api.openai.com/v1/models")) {
+      return { ok: true, status: 200, json: async () => ({ data: [] }) };
+    }
+    const body = JSON.parse(request.body);
+    const text = body.input[0].content[0].text;
+    assert.equal(text.includes("章节原文："), false);
+    assert.equal(text.includes("如果读取原文测试应失败"), false);
+    summaryCalls += 1;
+    return {
+      ok: true,
+      json: async () => ({
+        id: "resp_fast_index",
+        output: [{ content: [{ type: "output_text", text: JSON.stringify({ title: "索引汇总", summary: "完成", items: [], failed_chapters: [] }) }] }]
+      })
+    };
+  };
+
+  try {
+    const analysis = workflows.startAnalysisTask({
+      analysis_mode: "fast_index",
+      book_id: "book-fast-index",
+      start_chapter: 1,
+      end_chapter: 1
+    });
+    await waitForTask(analysis);
+    assert.equal(summaryCalls, 1);
+    const result = await workflows.publicAnalysisRunWithResult(analysis.id);
+    assert.equal(result.finalResult.summary, "完成");
+    assert.equal(result.finalResult.source_stats, undefined);
+    assert.equal(result.source_stats.source_review_chapters, 0);
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("balanced index analysis reviews only budgeted high-risk chapters", async () => {
+  for (const chapterIndex of [1, 2, 3]) {
+    await db.saveEncryptedChapter({
+      bookId: "book-balanced-index",
+      chapterIndex,
+      title: `第${chapterIndex}章`,
+      content: `第${chapterIndex}章原文`
+    });
+    const chapter = db.getChapterMetadata("book-balanced-index", chapterIndex);
+    await db.saveL2ChapterFacts({
+      bookId: "book-balanced-index",
+      chapterIndex,
+      status: "completed",
+      sourceHmac: chapter.content_hmac,
+      model: "gpt-5.5",
+      promptHash: "l2-v1-typed-facts",
+      schemaVersion: "l2-facts-v1",
+      facts: [{
+        category: "character",
+        entity: "陈平安",
+        fact_type: "risk",
+        fact: `第${chapterIndex}章事实`,
+        evidence: [`证据${chapterIndex}`],
+        importance: chapterIndex === 2 ? 0.95 : 0.4,
+        confidence: chapterIndex === 2 ? 0.2 : 0.9
+      }]
+    });
+  }
+
+  const previousFetch = global.fetch;
+  const reviewedInputs = [];
+  global.fetch = async (url, request) => {
+    if (String(url).includes("api.openai.com/v1/models")) {
+      return { ok: true, status: 200, json: async () => ({ data: [] }) };
+    }
+    const body = JSON.parse(request.body);
+    const formatName = body.text?.format?.name || "";
+    const text = body.input[0].content[0].text;
+    if (formatName === "l2_source_review") {
+      reviewedInputs.push(text);
+      return {
+        ok: true,
+        json: async () => ({
+          id: "resp_review",
+          output: [{ content: [{ type: "output_text", text: JSON.stringify({ facts: [{
+            category: "character",
+            entity: "陈平安",
+            aliases: [],
+            tags: [],
+            related_entities: [],
+            fact_type: "review",
+            fact: "复核事实",
+            evidence: ["复核"],
+            importance: 0.9,
+            confidence: 0.9
+          }] }) }] }]
+        })
+      };
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        id: "resp_balanced_summary",
+        output: [{ content: [{ type: "output_text", text: JSON.stringify({ title: "平衡汇总", summary: "完成", items: [], failed_chapters: [] }) }] }]
+      })
+    };
+  };
+
+  try {
+    const analysis = workflows.startAnalysisTask({
+      analysis_mode: "balanced",
+      source_review_budget: 1,
+      book_id: "book-balanced-index",
+      start_chapter: 1,
+      end_chapter: 3
+    });
+    await waitForTask(analysis);
+    assert.equal(reviewedInputs.length, 1);
+    assert.equal(reviewedInputs[0].includes("第2章原文"), true);
+    assert.equal(reviewedInputs[0].includes("第1章原文"), false);
+    const result = await workflows.publicAnalysisRunWithResult(analysis.id);
+    assert.equal(result.finalResult.source_stats, undefined);
+    assert.equal(result.source_stats.source_review_chapters, 1);
+    assert.equal(result.source_stats.source_review_budget, 1);
   } finally {
     global.fetch = previousFetch;
   }
@@ -797,7 +1203,8 @@ test("stores plain text final analysis result when summary is not JSON", async (
       throw new Error(`Unexpected fetch URL: ${url}`);
     }
     const body = JSON.parse(request.body);
-    const isSummary = !body.text?.format;
+    const formatName = body.text?.format?.name || "";
+    const isSummary = !formatName;
     const outputValue = isSummary
       ? "这是纯文本最终汇总"
       : JSON.stringify({
@@ -818,6 +1225,7 @@ test("stores plain text final analysis result when summary is not JSON", async (
 
   try {
     const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       name: "纯文本结果",
       book_id: "book-text-result",
       start_chapter: 1,
@@ -862,12 +1270,13 @@ test("exposes partial analysis results and resumes by skipping completed chapter
       throw new Error(`Unexpected fetch URL: ${url}`);
     }
     const body = JSON.parse(request.body);
-    const isSummary = !body.text?.format;
-    if (isSummary) {
+    const formatName = body.text?.format?.name || "";
+    if (formatName === "final_analysis") {
       summaryCalls += 1;
       if (failChapterTwo) {
         throw new Error("summary interrupted");
       }
+      assert.equal(body.max_output_tokens > 0, true);
       return {
         ok: true,
         json: async () => ({
@@ -877,6 +1286,7 @@ test("exposes partial analysis results and resumes by skipping completed chapter
       };
     }
 
+    assert.equal(formatName, "chapter_result");
     const text = body.input[0].content[0].text;
     const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
     requestedChapters.push(chapterIndex);
@@ -911,6 +1321,7 @@ test("exposes partial analysis results and resumes by skipping completed chapter
 
   try {
     const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       name: "断点续跑",
       book_id: "book-resume",
       start_chapter: 1,
@@ -969,11 +1380,12 @@ test("resumes summary failure without rerunning completed chapters", async () =>
       throw new Error(`Unexpected fetch URL: ${url}`);
     }
     const body = JSON.parse(request.body);
-    const isSummary = !body.text?.format;
-    if (isSummary) {
+    const formatName = body.text?.format?.name || "";
+    if (formatName === "final_analysis") {
       if (failSummary) {
         throw new Error("summary network fail");
       }
+      assert.equal(body.max_output_tokens > 0, true);
       return {
         ok: true,
         json: async () => ({
@@ -983,6 +1395,7 @@ test("resumes summary failure without rerunning completed chapters", async () =>
       };
     }
 
+    assert.equal(formatName, "chapter_result");
     const text = body.input[0].content[0].text;
     const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
     requestedChapters.push(chapterIndex);
@@ -1008,6 +1421,7 @@ test("resumes summary failure without rerunning completed chapters", async () =>
 
   try {
     const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       name: "汇总失败续跑",
       book_id: "book-summary-resume",
       start_chapter: 1,
@@ -1043,9 +1457,9 @@ test("compresses large summary inputs before final analysis", async () => {
   }
 
   const previousFetch = global.fetch;
-  let compressionCalls = 0;
   let finalSummaryCalls = 0;
   let largestSummaryInput = 0;
+  let finalSummaryUsedSchema = false;
 
   global.fetch = async (url, request) => {
     if (String(url).includes("api.openai.com/v1/models")) {
@@ -1062,10 +1476,14 @@ test("compresses large summary inputs before final analysis", async () => {
     const body = JSON.parse(request.body);
     const text = body.input[0].content[0].text;
     const formatName = body.text?.format?.name || "";
-    if (!formatName) {
+    if (formatName === "final_analysis") {
+      finalSummaryUsedSchema = true;
       largestSummaryInput = Math.max(largestSummaryInput, text.length);
       if (text.includes("分批压缩摘要 JSON")) {
         finalSummaryCalls += 1;
+        assert.match(text, /"chapter_index":1/);
+        assert.match(text, /"chapter_index":90/);
+        assert.equal(body.max_output_tokens > 0, true);
         return {
           ok: true,
           json: async () => ({
@@ -1077,36 +1495,15 @@ test("compresses large summary inputs before final analysis", async () => {
       throw new Error("Large summary should use compression before final summary");
     }
 
-    if (formatName === "summary_compression") {
-      compressionCalls += 1;
-      assert.match(text, /用户最终汇总 Prompt/);
-      const coveredChapters = extractChapterIndexesFromCompressionInput(text);
-      return {
-        ok: true,
-        json: async () => ({
-          id: `resp_large_compress_${compressionCalls}`,
-          output: [{
-            content: [{
-              type: "output_text",
-              text: JSON.stringify({
-                covered_chapters: coveredChapters,
-                items: [{
-                  topic: `批次${compressionCalls}摘要`,
-                  facts: ["批次保留事实"],
-                  chapter_refs: coveredChapters,
-                  evidence_notes: ["保留章节引用"],
-                  uncertainty: ""
-                }],
-                must_keep: ["关键保留项"],
-                possible_conflicts: [],
-                missing_or_failed_chapters: []
-              })
-            }]
-          }]
-        })
-      };
+    if (!formatName) {
+      throw new Error("JSON summary tasks should use final_analysis schema");
     }
 
+    if (formatName === "summary_compression") {
+      throw new Error("Large summary should use local compaction instead of OpenAI compression");
+    }
+
+    assert.equal(formatName, "chapter_result");
     const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
     return {
       ok: true,
@@ -1130,6 +1527,7 @@ test("compresses large summary inputs before final analysis", async () => {
 
   try {
     const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       name: "大输入汇总",
       book_id: "book-large-summary",
       start_chapter: 1,
@@ -1137,9 +1535,9 @@ test("compresses large summary inputs before final analysis", async () => {
     });
     await waitForTask(analysis);
     assert.equal(analysis.status, "completed");
-    assert.ok(compressionCalls > 1);
     assert.equal(finalSummaryCalls, 1);
-    assert.ok(largestSummaryInput < 90_000);
+    assert.equal(finalSummaryUsedSchema, true);
+    assert.ok(largestSummaryInput < 30_000);
     const result = await workflows.publicAnalysisRunWithResult(analysis.id);
     assert.equal(result.finalResult.summary, "压缩后完成");
   } finally {
@@ -1147,11 +1545,11 @@ test("compresses large summary inputs before final analysis", async () => {
   }
 });
 
-test("rejects compressed summary when chapter coverage is incomplete", async () => {
+test("keeps custom non-JSON summary format when compacting large inputs", async () => {
   const chapterCount = 90;
   for (let chapterIndex = 1; chapterIndex <= chapterCount; chapterIndex += 1) {
     await db.saveEncryptedChapter({
-      bookId: "book-large-summary-missing-coverage",
+      bookId: "book-large-text-summary",
       chapterIndex,
       title: `第${chapterIndex}章`,
       content: `第${chapterIndex}章正文`
@@ -1159,7 +1557,8 @@ test("rejects compressed summary when chapter coverage is incomplete", async () 
   }
 
   const previousFetch = global.fetch;
-  let compressionCalls = 0;
+  let finalSummaryCalls = 0;
+  let largestSummaryInput = 0;
 
   global.fetch = async (url, request) => {
     if (String(url).includes("api.openai.com/v1/models")) {
@@ -1177,45 +1576,30 @@ test("rejects compressed summary when chapter coverage is incomplete", async () 
     const text = body.input[0].content[0].text;
     const formatName = body.text?.format?.name || "";
 
-    if (formatName === "summary_compression") {
-      compressionCalls += 1;
-      const coveredChapters = extractChapterIndexesFromCompressionInput(text);
-      const incompleteCoverage = compressionCalls === 1 ? coveredChapters.slice(1) : coveredChapters;
+    if (!formatName && text.includes("分批压缩摘要 JSON")) {
+      finalSummaryCalls += 1;
+      largestSummaryInput = Math.max(largestSummaryInput, text.length);
+      assert.equal(Object.hasOwn(body, "text"), false);
+      assert.equal(body.max_output_tokens > 0, true);
       return {
         ok: true,
         json: async () => ({
-          id: `resp_large_bad_compress_${compressionCalls}`,
-          output: [{
-            content: [{
-              type: "output_text",
-              text: JSON.stringify({
-                covered_chapters: incompleteCoverage,
-                items: [{
-                  topic: `批次${compressionCalls}摘要`,
-                  facts: ["批次保留事实"],
-                  chapter_refs: incompleteCoverage,
-                  evidence_notes: ["保留章节引用"],
-                  uncertainty: ""
-                }],
-                must_keep: ["关键保留项"],
-                possible_conflicts: [],
-                missing_or_failed_chapters: []
-              })
-            }]
-          }]
+          id: "resp_large_text_final",
+          output: [{ content: [{ type: "output_text", text: "## 角色定位\n- 按用户格式输出" }] }]
         })
       };
     }
 
-    if (!formatName) {
-      throw new Error("Final summary should not run after incomplete compression coverage");
+    if (formatName === "final_analysis" || formatName === "summary_compression") {
+      throw new Error("Custom non-JSON summary should not use final_analysis schema or model compression");
     }
 
+    assert.equal(formatName, "chapter_result");
     const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
     return {
       ok: true,
       json: async () => ({
-        id: `resp_large_missing_chapter_${chapterIndex}`,
+        id: `resp_large_text_chapter_${chapterIndex}`,
         output: [{
           content: [{
             type: "output_text",
@@ -1234,13 +1618,445 @@ test("rejects compressed summary when chapter coverage is incomplete", async () 
 
   try {
     const analysis = workflows.startAnalysisTask({
-      name: "大输入汇总覆盖缺失",
-      book_id: "book-large-summary-missing-coverage",
+      analysis_mode: "full_text",
+      name: "大输入文本汇总",
+      book_id: "book-large-text-summary",
+      start_chapter: 1,
+      end_chapter: chapterCount,
+      prompt: {
+        summary_prompt: "请按照我指定的 Markdown 格式输出，保留标题和列表，不要输出 JSON。"
+      }
+    });
+    await waitForTask(analysis);
+    assert.equal(analysis.status, "completed");
+    assert.equal(finalSummaryCalls, 1);
+    assert.ok(largestSummaryInput < 30_000);
+    const result = await workflows.publicAnalysisRunWithResult(analysis.id);
+    assert.equal(result.finalResult, "## 角色定位\n- 按用户格式输出");
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("keeps custom JSON prompt shape instead of forcing default final schema", async () => {
+  for (let chapterIndex = 1; chapterIndex <= 3; chapterIndex += 1) {
+    await db.saveEncryptedChapter({
+      bookId: "book-custom-json-summary",
+      chapterIndex,
+      title: `第${chapterIndex}章`,
+      content: `第${chapterIndex}章正文`
+    });
+  }
+
+  const previousFetch = global.fetch;
+  let finalSummaryCalls = 0;
+
+  global.fetch = async (url, request) => {
+    if (String(url).includes("api.openai.com/v1/models")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ data: [] })
+      };
+    }
+
+    if (!String(url).includes("api.openai.com/v1/responses")) {
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    }
+    const body = JSON.parse(request.body);
+    const text = body.input[0].content[0].text;
+    const formatName = body.text?.format?.name || "";
+
+    if (formatName === "custom_final_analysis") {
+      finalSummaryCalls += 1;
+      assert.equal(body.max_output_tokens > 0, true);
+      assert.equal(body.text.format.strict, false);
+      assert.equal(body.text.format.schema.properties.roles.type, "array");
+      return {
+        ok: true,
+        json: async () => ({
+          id: "resp_custom_json_final",
+          output: [{ content: [{ type: "output_text", text: JSON.stringify({ roles: [{ name: "陈平安", chapters: [1, 2, 3] }], note: "按自定义 JSON 输出" }) }] }]
+        })
+      };
+    }
+
+    if (formatName === "final_analysis") {
+      throw new Error("Custom JSON prompt should not be forced into final_analysis schema");
+    }
+
+    if (!formatName && !text.includes("章节编号：")) {
+      throw new Error("Custom JSON prompt should use schema derived from prompt template");
+    }
+
+    assert.equal(formatName, "chapter_result");
+    const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
+    return {
+      ok: true,
+      json: async () => ({
+        id: `resp_custom_json_chapter_${chapterIndex}`,
+        output: [{
+          content: [{
+            type: "output_text",
+            text: JSON.stringify({
+              chapter_index: chapterIndex,
+              chapter_title: `第${chapterIndex}章`,
+              summary: `章节${chapterIndex}摘要`,
+              key_points: [],
+              evidence_notes: []
+            })
+          }]
+        }]
+      })
+    };
+  };
+
+  try {
+    const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
+      name: "自定义 JSON 汇总",
+      book_id: "book-custom-json-summary",
+      start_chapter: 1,
+      end_chapter: 3,
+      prompt: {
+        summary_prompt: "请用 JSON 输出，格式为 {\"roles\":[{\"name\":\"\",\"chapters\":[]}],\"note\":\"\"}。不要套用其他字段。"
+      }
+    });
+    await waitForTask(analysis);
+    assert.equal(finalSummaryCalls, 1);
+    const result = await workflows.publicAnalysisRunWithResult(analysis.id);
+    assert.deepEqual(Object.keys(result.finalResult).sort(), ["note", "roles"]);
+    assert.equal(result.finalResult.roles[0].name, "陈平安");
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("derives final schema from large custom JSON prompt template", async () => {
+  const chapterCount = 90;
+  const finalFieldValues = {
+    major_characters: [{ name: "陈平安", chapters: [1, 2, 3] }],
+    world_rules: ["规矩一"],
+    major_relationships: [],
+    major_locations: [],
+    major_forces: [],
+    cultivation_system: [],
+    important_items: [],
+    major_events: [],
+    major_foreshadowing: [],
+    core_themes: [],
+    visual_assets: [],
+    ip_assets: [],
+    tone_and_style: { overall: "克制" },
+    corrected_understanding: []
+  };
+  const finalFieldNames = Object.keys(finalFieldValues);
+  for (let chapterIndex = 1; chapterIndex <= chapterCount; chapterIndex += 1) {
+    await db.saveEncryptedChapter({
+      bookId: "book-large-custom-json-template",
+      chapterIndex,
+      title: `第${chapterIndex}章`,
+      content: `第${chapterIndex}章正文`
+    });
+  }
+
+  const previousFetch = global.fetch;
+  let finalSummaryCalls = 0;
+  let largestSummaryInput = 0;
+  const generatedFields = [];
+
+  global.fetch = async (url, request) => {
+    if (String(url).includes("api.openai.com/v1/models")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ data: [] })
+      };
+    }
+
+    if (!String(url).includes("api.openai.com/v1/responses")) {
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    }
+    const body = JSON.parse(request.body);
+    const text = body.input[0].content[0].text;
+    const formatName = body.text?.format?.name || "";
+
+    if (formatName.startsWith("custom_field_")) {
+      finalSummaryCalls += 1;
+      largestSummaryInput = Math.max(largestSummaryInput, text.length);
+      assert.equal(body.text.format.strict, false);
+      const fieldName = formatName.replace(/^custom_field_/, "");
+      generatedFields.push(fieldName);
+      assert.ok(finalFieldNames.includes(fieldName));
+      assert.match(text, new RegExp(`当前只生成最终 JSON 的一个顶层字段：${fieldName}`));
+      assert.deepEqual(Object.keys(body.text.format.schema.properties), [fieldName]);
+      assert.equal(body.max_output_tokens > 0, true);
+      return {
+        ok: true,
+        json: async () => ({
+          id: `resp_large_custom_template_${fieldName}`,
+          output: [{
+            content: [{
+              type: "output_text",
+              text: JSON.stringify({ [fieldName]: finalFieldValues[fieldName] })
+            }]
+          }]
+        })
+      };
+    }
+
+    if (formatName === "custom_final_analysis" || formatName === "final_analysis" || formatName === "summary_compression") {
+      throw new Error("Large custom JSON template should use per-field derived schema, not one large final schema or model compression");
+    }
+
+    assert.equal(formatName, "chapter_result");
+    const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
+    return {
+      ok: true,
+      json: async () => ({
+        id: `resp_large_custom_template_chapter_${chapterIndex}`,
+        output: [{
+          content: [{
+            type: "output_text",
+            text: JSON.stringify({
+              chapter_index: chapterIndex,
+              chapter_title: `第${chapterIndex}章`,
+              summary: `章节${chapterIndex}摘要${"长摘要".repeat(140)}`,
+              key_points: [`关键点${chapterIndex}${"内容".repeat(120)}`],
+              evidence_notes: [`证据${chapterIndex}${"线索".repeat(120)}`]
+            })
+          }]
+        }]
+      })
+    };
+  };
+
+  try {
+    const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
+      name: "大输入自定义 JSON 模板",
+      book_id: "book-large-custom-json-template",
+      start_chapter: 1,
+      end_chapter: chapterCount,
+      prompt: {
+        summary_prompt: [
+          "请用 JSON 输出，严格使用下面模板字段。",
+          "{",
+          "  \"major_characters\": [],",
+          "  \"world_rules\": [],",
+          "  \"major_relationships\": [],",
+          "  \"major_locations\": [],",
+          "  \"major_forces\": [],",
+          "  \"cultivation_system\": [],",
+          "  \"important_items\": [],",
+          "  \"major_events\": [],",
+          "  \"major_foreshadowing\": [],",
+          "  \"core_themes\": [],",
+          "  \"visual_assets\": [],",
+          "  \"ip_assets\": [],",
+          "  \"tone_and_style\": {},",
+          "  \"corrected_understanding\": []",
+          "}"
+        ].join("\n")
+      }
+    });
+    await waitForTask(analysis);
+    assert.equal(finalSummaryCalls, finalFieldNames.length);
+    assert.deepEqual(generatedFields.sort(), finalFieldNames.sort());
+    assert.ok(largestSummaryInput < 30_000);
+    const result = await workflows.publicAnalysisRunWithResult(analysis.id);
+    assert.deepEqual(Object.keys(result.finalResult).sort(), [
+      "core_themes",
+      "corrected_understanding",
+      "cultivation_system",
+      "important_items",
+      "ip_assets",
+      "major_characters",
+      "major_events",
+      "major_forces",
+      "major_foreshadowing",
+      "major_locations",
+      "major_relationships",
+      "tone_and_style",
+      "visual_assets",
+      "world_rules"
+    ]);
+    assert.equal(result.finalResult.major_characters[0].name, "陈平安");
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("retries transient compacted final summary failures", async () => {
+  const chapterCount = 90;
+  for (let chapterIndex = 1; chapterIndex <= chapterCount; chapterIndex += 1) {
+    await db.saveEncryptedChapter({
+      bookId: "book-large-summary-retry",
+      chapterIndex,
+      title: `第${chapterIndex}章`,
+      content: `第${chapterIndex}章正文`
+    });
+  }
+
+  const previousFetch = global.fetch;
+  let finalSummaryCalls = 0;
+
+  global.fetch = async (url, request) => {
+    if (String(url).includes("api.openai.com/v1/models")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ data: [] })
+      };
+    }
+
+    if (!String(url).includes("api.openai.com/v1/responses")) {
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    }
+    const body = JSON.parse(request.body);
+    const text = body.input[0].content[0].text;
+    const formatName = body.text?.format?.name || "";
+
+    if (formatName === "summary_compression") {
+      throw new Error("Large summary should use local compaction instead of OpenAI compression");
+    }
+
+    if (formatName === "final_analysis") {
+      finalSummaryCalls += 1;
+      assert.equal(body.max_output_tokens > 0, true);
+      if (finalSummaryCalls === 1) {
+        throw new Error("This operation was aborted");
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          id: "resp_large_retry_final",
+          output: [{ content: [{ type: "output_text", text: JSON.stringify({ title: "大汇总", summary: "重试后完成", items: [], failed_chapters: [] }) }] }]
+        })
+      };
+    }
+
+    if (!formatName) {
+      throw new Error("JSON summary tasks should use final_analysis schema");
+    }
+
+    assert.equal(formatName, "chapter_result");
+    const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
+    return {
+      ok: true,
+      json: async () => ({
+        id: `resp_large_retry_chapter_${chapterIndex}`,
+        output: [{
+          content: [{
+            type: "output_text",
+            text: JSON.stringify({
+              chapter_index: chapterIndex,
+              chapter_title: `第${chapterIndex}章`,
+              summary: `章节${chapterIndex}摘要${"长摘要".repeat(140)}`,
+              key_points: [`关键点${chapterIndex}${"内容".repeat(120)}`],
+              evidence_notes: [`证据${chapterIndex}${"线索".repeat(120)}`]
+            })
+          }]
+        }]
+      })
+    };
+  };
+
+  try {
+    const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
+      name: "大输入汇总重试",
+      book_id: "book-large-summary-retry",
       start_chapter: 1,
       end_chapter: chapterCount
     });
-    await assert.rejects(() => waitForTask(analysis), /汇总素材压缩覆盖不完整/);
-    assert.ok(compressionCalls >= 1);
+    await waitForTask(analysis);
+    assert.equal(analysis.status, "completed");
+    assert.equal(finalSummaryCalls, 2);
+    const result = await workflows.publicAnalysisRunWithResult(analysis.id);
+    assert.equal(result.finalResult.summary, "重试后完成");
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("rejects placeholder final summary and keeps run resumable", async () => {
+  for (let chapterIndex = 1; chapterIndex <= 3; chapterIndex += 1) {
+    await db.saveEncryptedChapter({
+      bookId: "book-placeholder-summary",
+      chapterIndex,
+      title: `第${chapterIndex}章`,
+      content: `第${chapterIndex}章正文`
+    });
+  }
+
+  const previousFetch = global.fetch;
+  let finalSummaryCalls = 0;
+
+  global.fetch = async (url, request) => {
+    if (String(url).includes("api.openai.com/v1/models")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ data: [] })
+      };
+    }
+
+    if (!String(url).includes("api.openai.com/v1/responses")) {
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    }
+    const body = JSON.parse(request.body);
+    const text = body.input[0].content[0].text;
+    const formatName = body.text?.format?.name || "";
+
+    if (formatName === "final_analysis") {
+      finalSummaryCalls += 1;
+      return {
+        ok: true,
+        json: async () => ({
+          id: "resp_placeholder_summary",
+          output: [{ content: [{ type: "output_text", text: JSON.stringify({ title: "N/A", summary: "N/A", items: [], failed_chapters: [] }) }] }]
+        })
+      };
+    }
+
+    assert.equal(formatName, "chapter_result");
+    const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
+    return {
+      ok: true,
+      json: async () => ({
+        id: `resp_placeholder_chapter_${chapterIndex}`,
+        output: [{
+          content: [{
+            type: "output_text",
+            text: JSON.stringify({
+              chapter_index: chapterIndex,
+              chapter_title: `第${chapterIndex}章`,
+              summary: `章节${chapterIndex}摘要`,
+              key_points: [],
+              evidence_notes: []
+            })
+          }]
+        }]
+      })
+    };
+  };
+
+  try {
+    const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
+      name: "占位汇总",
+      book_id: "book-placeholder-summary",
+      start_chapter: 1,
+      end_chapter: 3
+    });
+    await assert.rejects(() => waitForTask(analysis), /最终汇总结果疑似占位或为空/);
+    assert.equal(analysis.status, "failed");
+    assert.equal(finalSummaryCalls, 3);
+    const result = await workflows.publicAnalysisRunWithResult(analysis.id);
+    assert.equal(result.finalResult, null);
+    assert.equal(result.chapterResults.length, 3);
+    assert.equal(result.canResume, true);
   } finally {
     global.fetch = previousFetch;
   }
@@ -1249,7 +2065,7 @@ test("rejects compressed summary when chapter coverage is incomplete", async () 
 async function waitForTask(task) {
   const started = Date.now();
   while (!["completed", "failed", "cancelled"].includes(task.status)) {
-    if (Date.now() - started > 3000) {
+    if (Date.now() - started > 10000) {
       throw new Error(`Task timeout: ${task.id}`);
     }
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -1258,10 +2074,4 @@ async function waitForTask(task) {
     throw new Error(task.error || "task failed");
   }
   return task;
-}
-
-function extractChapterIndexesFromCompressionInput(text) {
-  return [...String(text).matchAll(/"chapter_index":(\d+)/g)]
-    .map((match) => Number(match[1]))
-    .filter(Number.isFinite);
 }

@@ -436,6 +436,127 @@ test("builds chapter-only L1 indexes, skips fresh indexes, and keeps OpenAI requ
   }
 });
 
+test("stores L2 facts with encrypted fact content and reports coverage", async () => {
+  await db.saveEncryptedChapter({
+    bookId: "book-l2-storage",
+    chapterIndex: 1,
+    title: "第一章",
+    content: "陈平安得到木剑。"
+  });
+  const chapter = db.getChapterMetadata("book-l2-storage", 1);
+  await db.saveL2ChapterFacts({
+    bookId: "book-l2-storage",
+    chapterIndex: 1,
+    status: "completed",
+    sourceHmac: chapter.content_hmac,
+    model: "gpt-5.5",
+    promptHash: "l2-v1-typed-facts",
+    schemaVersion: "l2-facts-v1",
+    facts: [{
+      category: "character",
+      entity: "陈平安",
+      aliases: ["少年"],
+      tags: ["木剑"],
+      related_entities: ["木剑"],
+      fact_type: "item_gain",
+      fact: "陈平安得到木剑。",
+      evidence: ["得到木剑"],
+      importance: 0.8,
+      confidence: 0.9
+    }]
+  });
+
+  const facts = await db.listL2Facts({
+    bookId: "book-l2-storage",
+    startChapter: 1,
+    endChapter: 1,
+    categories: ["character"],
+    entity: "陈平安"
+  });
+  assert.equal(facts.length, 1);
+  assert.equal(facts[0].fact, "陈平安得到木剑。");
+  assert.equal(facts[0].entity, "陈平安");
+  const coverage = db.getL2Coverage({
+    bookId: "book-l2-storage",
+    startChapter: 1,
+    endChapter: 1,
+    model: "gpt-5.5",
+    promptHash: "l2-v1-typed-facts",
+    schemaVersion: "l2-facts-v1"
+  });
+  assert.equal(coverage.chapters.completed, 1);
+  assert.equal(coverage.chapters.facts, 1);
+  const dbBytes = await fs.readFile(db.getDbPath());
+  assert.equal(dbBytes.includes(Buffer.from("陈平安得到木剑。")), false);
+});
+
+test("builds L2 indexes, skips fresh facts, and keeps requests ZDR-shaped", async () => {
+  await db.saveEncryptedChapter({
+    bookId: "book-l2-task",
+    chapterIndex: 1,
+    title: "第一章",
+    content: "陈平安得到木剑。"
+  });
+
+  const previousFetch = global.fetch;
+  let responseCalls = 0;
+  const capturedBodies = [];
+  global.fetch = async (url, request) => {
+    if (String(url).includes("api.openai.com/v1/models")) {
+      return { ok: true, status: 200, json: async () => ({ data: [] }) };
+    }
+    if (!String(url).includes("api.openai.com/v1/responses")) {
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    }
+    responseCalls += 1;
+    const body = JSON.parse(request.body);
+    capturedBodies.push(body);
+    return {
+      ok: true,
+      json: async () => ({
+        id: `resp_l2_${responseCalls}`,
+        output: [{ content: [{ type: "output_text", text: JSON.stringify({ facts: [{
+          category: "character",
+          entity: "陈平安",
+          aliases: [],
+          tags: ["木剑"],
+          related_entities: ["木剑"],
+          fact_type: "item_gain",
+          fact: "陈平安得到木剑。",
+          evidence: ["木剑"],
+          importance: 0.8,
+          confidence: 0.9
+        }] }) }] }]
+      })
+    };
+  };
+
+  try {
+    const task = workflows.startL2IndexTask({
+      book_id: "book-l2-task",
+      start_chapter: 1,
+      end_chapter: 1
+    });
+    await waitForTask(task);
+    assert.equal(task.status, "completed");
+    assert.equal(responseCalls, 1);
+    assert.equal(capturedBodies[0].store, false);
+    assert.equal(Object.hasOwn(capturedBodies[0], "background"), false);
+    assert.equal(capturedBodies[0].text.format.name, "l2_chapter_facts");
+
+    const skipped = workflows.startL2IndexTask({
+      book_id: "book-l2-task",
+      start_chapter: 1,
+      end_chapter: 1
+    });
+    await waitForTask(skipped);
+    assert.equal(skipped.progress.skipped, 1);
+    assert.equal(responseCalls, 1);
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
 test("creates, edits, lists, and deletes prompt groups with categories", () => {
   const created = db.createPromptGroup({
     name: "角色定位 Prompt",
@@ -538,6 +659,7 @@ test("imports once, skips stored chapters, and analyzes from encrypted local sto
     assert.equal(difyCalls, 1);
 
     const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       book_id: "book-e2e",
       start_chapter: 1,
       end_chapter: 3
@@ -632,6 +754,7 @@ test("analyzes selected non-contiguous chapters, preserves prompt snapshot, and 
       schema_fields: [{ name: "name", label: "名称", type: "string", required: true, description: "" }]
     });
     const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       name: "非连续选择",
       book_id: "book-selected",
       start_chapter: 1,
@@ -757,6 +880,7 @@ test("analysis keeps default input without L1 and appends L1 context only when e
 
   try {
     const withoutL1 = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       book_id: "book-l1-analysis",
       start_chapter: 1,
       end_chapter: 1
@@ -766,6 +890,7 @@ test("analysis keeps default input without L1 and appends L1 context only when e
     assert.equal(summaryPrompts[0].includes("可选 L1 窗口上下文 JSON"), false);
 
     const withL1 = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       book_id: "book-l1-analysis",
       start_chapter: 1,
       end_chapter: 1,
@@ -778,6 +903,160 @@ test("analysis keeps default input without L1 and appends L1 context only when e
     assert.equal(summaryPrompts[1].includes("L1 窗口摘要"), false);
     const result = await workflows.publicAnalysisRunWithResult(withL1.id);
     assert.equal(result.prompt.use_l1_context, true);
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("fast index analysis uses L2 facts without decrypting chapter text", async () => {
+  await db.saveEncryptedChapter({
+    bookId: "book-fast-index",
+    chapterIndex: 1,
+    title: "第一章",
+    content: "如果读取原文测试应失败"
+  });
+  const chapter = db.getChapterMetadata("book-fast-index", 1);
+  await db.saveL2ChapterFacts({
+    bookId: "book-fast-index",
+    chapterIndex: 1,
+    status: "completed",
+    sourceHmac: chapter.content_hmac,
+    model: "gpt-5.5",
+    promptHash: "l2-v1-typed-facts",
+    schemaVersion: "l2-facts-v1",
+    facts: [{
+      category: "character",
+      entity: "陈平安",
+      fact_type: "identity",
+      fact: "陈平安是关键人物。",
+      evidence: ["关键人物"],
+      importance: 0.8,
+      confidence: 0.9
+    }]
+  });
+
+  const previousFetch = global.fetch;
+  let summaryCalls = 0;
+  global.fetch = async (url, request) => {
+    if (String(url).includes("api.openai.com/v1/models")) {
+      return { ok: true, status: 200, json: async () => ({ data: [] }) };
+    }
+    const body = JSON.parse(request.body);
+    const text = body.input[0].content[0].text;
+    assert.equal(text.includes("章节原文："), false);
+    assert.equal(text.includes("如果读取原文测试应失败"), false);
+    summaryCalls += 1;
+    return {
+      ok: true,
+      json: async () => ({
+        id: "resp_fast_index",
+        output: [{ content: [{ type: "output_text", text: JSON.stringify({ title: "索引汇总", summary: "完成", items: [], failed_chapters: [] }) }] }]
+      })
+    };
+  };
+
+  try {
+    const analysis = workflows.startAnalysisTask({
+      analysis_mode: "fast_index",
+      book_id: "book-fast-index",
+      start_chapter: 1,
+      end_chapter: 1
+    });
+    await waitForTask(analysis);
+    assert.equal(summaryCalls, 1);
+    const result = await workflows.publicAnalysisRunWithResult(analysis.id);
+    assert.equal(result.finalResult.summary, "完成");
+    assert.equal(result.finalResult.source_stats, undefined);
+    assert.equal(result.source_stats.source_review_chapters, 0);
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("balanced index analysis reviews only budgeted high-risk chapters", async () => {
+  for (const chapterIndex of [1, 2, 3]) {
+    await db.saveEncryptedChapter({
+      bookId: "book-balanced-index",
+      chapterIndex,
+      title: `第${chapterIndex}章`,
+      content: `第${chapterIndex}章原文`
+    });
+    const chapter = db.getChapterMetadata("book-balanced-index", chapterIndex);
+    await db.saveL2ChapterFacts({
+      bookId: "book-balanced-index",
+      chapterIndex,
+      status: "completed",
+      sourceHmac: chapter.content_hmac,
+      model: "gpt-5.5",
+      promptHash: "l2-v1-typed-facts",
+      schemaVersion: "l2-facts-v1",
+      facts: [{
+        category: "character",
+        entity: "陈平安",
+        fact_type: "risk",
+        fact: `第${chapterIndex}章事实`,
+        evidence: [`证据${chapterIndex}`],
+        importance: chapterIndex === 2 ? 0.95 : 0.4,
+        confidence: chapterIndex === 2 ? 0.2 : 0.9
+      }]
+    });
+  }
+
+  const previousFetch = global.fetch;
+  const reviewedInputs = [];
+  global.fetch = async (url, request) => {
+    if (String(url).includes("api.openai.com/v1/models")) {
+      return { ok: true, status: 200, json: async () => ({ data: [] }) };
+    }
+    const body = JSON.parse(request.body);
+    const formatName = body.text?.format?.name || "";
+    const text = body.input[0].content[0].text;
+    if (formatName === "l2_source_review") {
+      reviewedInputs.push(text);
+      return {
+        ok: true,
+        json: async () => ({
+          id: "resp_review",
+          output: [{ content: [{ type: "output_text", text: JSON.stringify({ facts: [{
+            category: "character",
+            entity: "陈平安",
+            aliases: [],
+            tags: [],
+            related_entities: [],
+            fact_type: "review",
+            fact: "复核事实",
+            evidence: ["复核"],
+            importance: 0.9,
+            confidence: 0.9
+          }] }) }] }]
+        })
+      };
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        id: "resp_balanced_summary",
+        output: [{ content: [{ type: "output_text", text: JSON.stringify({ title: "平衡汇总", summary: "完成", items: [], failed_chapters: [] }) }] }]
+      })
+    };
+  };
+
+  try {
+    const analysis = workflows.startAnalysisTask({
+      analysis_mode: "balanced",
+      source_review_budget: 1,
+      book_id: "book-balanced-index",
+      start_chapter: 1,
+      end_chapter: 3
+    });
+    await waitForTask(analysis);
+    assert.equal(reviewedInputs.length, 1);
+    assert.equal(reviewedInputs[0].includes("第2章原文"), true);
+    assert.equal(reviewedInputs[0].includes("第1章原文"), false);
+    const result = await workflows.publicAnalysisRunWithResult(analysis.id);
+    assert.equal(result.finalResult.source_stats, undefined);
+    assert.equal(result.source_stats.source_review_chapters, 1);
+    assert.equal(result.source_stats.source_review_budget, 1);
   } finally {
     global.fetch = previousFetch;
   }
@@ -828,6 +1107,7 @@ test("stores plain text final analysis result when summary is not JSON", async (
 
   try {
     const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       name: "纯文本结果",
       book_id: "book-text-result",
       start_chapter: 1,
@@ -923,6 +1203,7 @@ test("exposes partial analysis results and resumes by skipping completed chapter
 
   try {
     const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       name: "断点续跑",
       book_id: "book-resume",
       start_chapter: 1,
@@ -1022,6 +1303,7 @@ test("resumes summary failure without rerunning completed chapters", async () =>
 
   try {
     const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       name: "汇总失败续跑",
       book_id: "book-summary-resume",
       start_chapter: 1,
@@ -1127,6 +1409,7 @@ test("compresses large summary inputs before final analysis", async () => {
 
   try {
     const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       name: "大输入汇总",
       book_id: "book-large-summary",
       start_chapter: 1,
@@ -1217,6 +1500,7 @@ test("keeps custom non-JSON summary format when compacting large inputs", async 
 
   try {
     const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       name: "大输入文本汇总",
       book_id: "book-large-text-summary",
       start_chapter: 1,
@@ -1311,6 +1595,7 @@ test("keeps custom JSON prompt shape instead of forcing default final schema", a
 
   try {
     const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       name: "自定义 JSON 汇总",
       book_id: "book-custom-json-summary",
       start_chapter: 1,
@@ -1430,6 +1715,7 @@ test("derives final schema from large custom JSON prompt template", async () => 
 
   try {
     const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       name: "大输入自定义 JSON 模板",
       book_id: "book-large-custom-json-template",
       start_chapter: 1,
@@ -1560,6 +1846,7 @@ test("retries transient compacted final summary failures", async () => {
 
   try {
     const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       name: "大输入汇总重试",
       book_id: "book-large-summary-retry",
       start_chapter: 1,
@@ -1639,6 +1926,7 @@ test("rejects placeholder final summary and keeps run resumable", async () => {
 
   try {
     const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
       name: "占位汇总",
       book_id: "book-placeholder-summary",
       start_chapter: 1,

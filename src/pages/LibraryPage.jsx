@@ -21,6 +21,18 @@ const initialImportForm = {
   force: false
 };
 
+const L2_CATEGORIES = [
+  { value: "character", label: "人物" },
+  { value: "relationship", label: "关系" },
+  { value: "cultivation", label: "境界" },
+  { value: "force", label: "势力" },
+  { value: "item", label: "物品" },
+  { value: "location", label: "地点" },
+  { value: "event", label: "事件" },
+  { value: "foreshadowing", label: "伏笔" },
+  { value: "other", label: "其他" }
+];
+
 export function LibraryPage({
   books,
   config,
@@ -28,14 +40,20 @@ export function LibraryPage({
   importBusy,
   l1Task,
   l1Busy,
+  l2Task,
+  l2Busy,
   onStartImport,
   onStartL1Index,
+  onStartL2Index,
   onImportCancel,
   onImportPause,
   onImportResume,
   onL1Cancel,
   onL1Pause,
   onL1Resume,
+  onL2Cancel,
+  onL2Pause,
+  onL2Resume,
   onBooksChanged,
   setError
 }) {
@@ -44,12 +62,15 @@ export function LibraryPage({
   const [chapters, setChapters] = useState([]);
   const [l1Coverage, setL1Coverage] = useState(null);
   const [l1Chapters, setL1Chapters] = useState([]);
+  const [l2Coverage, setL2Coverage] = useState(null);
+  const [l2Facts, setL2Facts] = useState([]);
   const [importForm, setImportForm] = useState({
     ...initialImportForm,
     book_id: initialBookId,
     auto_l1_index: false
   });
   const [l1Form, setL1Form] = useState({ start_chapter: "1", end_chapter: "100", force: false });
+  const [l2Form, setL2Form] = useState({ start_chapter: "1", end_chapter: "100", force: false, mode: "all", category: "" });
   const [chaptersBusy, setChaptersBusy] = useState(false);
   const [chapterFilter, setChapterFilter] = useState({ query: "", l1: "all" });
 
@@ -68,6 +89,21 @@ export function LibraryPage({
     }
   }, [setError]);
 
+  const loadL2Data = useCallback(async (bookId, startChapter, endChapter, category = "") => {
+    if (!validChapterNumber(startChapter) || !validChapterNumber(endChapter)) return;
+    try {
+      const query = `start_chapter=${encodeURIComponent(startChapter)}&end_chapter=${encodeURIComponent(endChapter)}&category=${encodeURIComponent(category)}&limit=80`;
+      const [coverageData, factsData] = await Promise.all([
+        apiGet(`/api/books/${encodeURIComponent(bookId)}/l2-indexes/coverage?${query}`),
+        apiGet(`/api/books/${encodeURIComponent(bookId)}/l2-facts?${query}`)
+      ]);
+      setL2Coverage(coverageData.coverage);
+      setL2Facts(factsData.facts || []);
+    } catch (error) {
+      setError(error.message);
+    }
+  }, [setError]);
+
   async function loadChapters(bookId) {
     if (!bookId) {
       setChapters([]);
@@ -81,6 +117,7 @@ export function LibraryPage({
       const first = data.chapters?.[0]?.chapter_index || 1;
       const last = data.chapters?.[data.chapters.length - 1]?.chapter_index || 100;
       setL1Form((form) => ({ ...form, start_chapter: String(first), end_chapter: String(last) }));
+      setL2Form((form) => ({ ...form, start_chapter: String(first), end_chapter: String(last) }));
     } catch (error) {
       setError(error.message);
     } finally {
@@ -107,6 +144,12 @@ export function LibraryPage({
     // eslint-disable-next-line react-hooks/set-state-in-effect
     void loadL1Data(selectedBookId, l1Form.start_chapter, l1Form.end_chapter);
   }, [selectedBookId, l1Form.start_chapter, l1Form.end_chapter, l1Task?.id, l1Task?.status, loadL1Data]);
+
+  useEffect(() => {
+    if (!selectedBookId) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadL2Data(selectedBookId, l2Form.start_chapter, l2Form.end_chapter, l2Form.category);
+  }, [selectedBookId, l2Form.start_chapter, l2Form.end_chapter, l2Form.category, l2Task?.id, l2Task?.status, loadL2Data]);
 
   const selectedBook = useMemo(
     () => books.find((book) => book.book_id === selectedBookId) || null,
@@ -161,6 +204,24 @@ export function LibraryPage({
       startChapter: Number(l1Form.start_chapter),
       endChapter: Number(l1Form.end_chapter),
       force: l1Form.force
+    });
+  }
+
+  async function startL2Index(modeOverride) {
+    if (!selectedBookId) {
+      setError("请先选择一本书。");
+      return;
+    }
+    if (!validChapterNumber(l2Form.start_chapter) || !validChapterNumber(l2Form.end_chapter)) {
+      setError("L2 起始章节和结束章节必须填写为大于 0 的整数。");
+      return;
+    }
+    await onStartL2Index({
+      bookId: selectedBookId,
+      startChapter: Number(l2Form.start_chapter),
+      endChapter: Number(l2Form.end_chapter),
+      force: l2Form.force,
+      mode: modeOverride || l2Form.mode
     });
   }
 
@@ -317,6 +378,75 @@ export function LibraryPage({
           />
         </Panel>
 
+        <Panel icon={Database} title="L2 类型化事实">
+          <div className="form-grid compact">
+            <label>
+              <span>起始章节</span>
+              <input
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]*"
+                value={l2Form.start_chapter}
+                onChange={(event) => setL2Form({ ...l2Form, start_chapter: sanitizeChapterInput(event.target.value) })}
+              />
+            </label>
+            <label>
+              <span>结束章节</span>
+              <input
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]*"
+                value={l2Form.end_chapter}
+                onChange={(event) => setL2Form({ ...l2Form, end_chapter: sanitizeChapterInput(event.target.value) })}
+              />
+            </label>
+            <label>
+              <span>分类筛选</span>
+              <select value={l2Form.category} onChange={(event) => setL2Form({ ...l2Form, category: event.target.value })}>
+                <option value="">全部分类</option>
+                {L2_CATEGORIES.map((category) => (
+                  <option key={category.value} value={category.value}>{category.label}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>构建模式</span>
+              <select value={l2Form.mode} onChange={(event) => setL2Form({ ...l2Form, mode: event.target.value })}>
+                <option value="all">构建全部缺失/过期</option>
+                <option value="missing">只补缺失</option>
+                <option value="retry_failed">只重试失败</option>
+              </select>
+            </label>
+            <label className="check-row">
+              <input
+                type="checkbox"
+                checked={l2Form.force}
+                onChange={(event) => setL2Form({ ...l2Form, force: event.target.checked })}
+              />
+              <span>强制重建</span>
+            </label>
+          </div>
+          <L2CoverageSummary coverage={l2Coverage} />
+          <div className="action-row wrap">
+            <button className="primary" type="button" onClick={() => startL2Index()} disabled={l2Busy || !selectedBookId || !config.openaiConfigured}>
+              {l2Busy ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
+              {l2Busy ? "索引中" : "构建 L2"}
+            </button>
+            <button className="secondary" type="button" onClick={() => startL2Index("missing")} disabled={l2Busy || !selectedBookId || !config.openaiConfigured}>
+              补缺失
+            </button>
+            <button className="secondary" type="button" onClick={() => startL2Index("retry_failed")} disabled={l2Busy || !selectedBookId || !config.openaiConfigured}>
+              重试失败
+            </button>
+          </div>
+          <TaskBox
+            task={l2Task}
+            onCancel={onL2Cancel}
+            onPause={onL2Pause}
+            onResume={onL2Resume}
+          />
+        </Panel>
+
         <Panel icon={Database} title="本地书库">
           <BookList books={books} selectedBookId={selectedBookId} onSelect={selectBook} />
           <button className="danger" type="button" onClick={deleteSelectedBook} disabled={!selectedBookId}>
@@ -340,6 +470,7 @@ export function LibraryPage({
           />
           <ChapterTable chapters={filteredChapters} l1ByChapter={l1ByChapter} l1Range={l1DisplayRange} />
           <L1Preview chapters={l1Chapters} />
+          <L2FactPreview facts={l2Facts} />
         </Panel>
       </section>
     </section>
@@ -408,6 +539,34 @@ function CoverageSummary({ coverage, chapters, onFilter }) {
   );
 }
 
+function L2CoverageSummary({ coverage }) {
+  if (!coverage) return <div className="index-summary">暂无 L2 覆盖信息</div>;
+  const total = Math.max(coverage.chapters.total || 0, 1);
+  const completed = coverage.chapters.completed || 0;
+  const finishedRatio = Math.round((completed / total) * 100);
+  return (
+    <div className="coverage-card">
+      <div className="coverage-head">
+        <strong>L2 覆盖 {finishedRatio}%</strong>
+        <span>{completed}/{coverage.chapters.total} 章 · {coverage.chapters.facts || 0} 条事实</span>
+      </div>
+      <div className="coverage-bar" aria-label={`L2 覆盖 ${finishedRatio}%`}>
+        <span style={{ width: `${finishedRatio}%` }} />
+      </div>
+      <div className="index-summary">
+        <span>缺失 {coverage.chapters.missing}</span>
+        <span>失败 {coverage.chapters.failed}</span>
+        <span>过期 {coverage.chapters.outdated}</span>
+      </div>
+      <p className="coverage-note">
+        {coverage.failed_chapters?.length
+          ? `失败章节：${compactChapterList(coverage.failed_chapters.slice(0, 16))}`
+          : "L2 是可复用事实层，汇总任务会优先从这里召回。"}
+      </p>
+    </div>
+  );
+}
+
 function ChapterTableToolbar({ filter, onChange, total, filtered }) {
   return (
     <div className="table-toolbar">
@@ -446,6 +605,33 @@ function L1Preview({ chapters }) {
       </div>
     </div>
   );
+}
+
+function L2FactPreview({ facts }) {
+  if (!facts.length) return null;
+  return (
+    <div className="index-preview">
+      <h3>L2 事实预览</h3>
+      <div className="index-preview-grid">
+        {facts.slice(0, 8).map((fact) => (
+          <article key={fact.id}>
+            <strong>第 {fact.chapter_index} 章 · {categoryLabel(fact.category)} · {fact.entity || "未命名主体"}</strong>
+            <p>{fact.fact || "暂无事实正文"}</p>
+            <small>重要度 {formatScore(fact.importance)} · 置信度 {formatScore(fact.confidence)}</small>
+          </article>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function categoryLabel(value) {
+  return L2_CATEGORIES.find((category) => category.value === value)?.label || value || "其他";
+}
+
+function formatScore(value) {
+  const number = Number(value || 0);
+  return Number.isFinite(number) ? number.toFixed(2) : "0.00";
 }
 
 function SummaryStats({ book, chapters, filteredCount, loading }) {

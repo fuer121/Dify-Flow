@@ -23,10 +23,13 @@ export default function App() {
   const [importBusy, setImportBusy] = useState(false);
   const [l1Task, setL1Task] = useState(null);
   const [l1Busy, setL1Busy] = useState(false);
+  const [l2Task, setL2Task] = useState(null);
+  const [l2Busy, setL2Busy] = useState(false);
   const [analysisTask, setAnalysisTask] = useState(null);
   const [analysisBusy, setAnalysisBusy] = useState(false);
   const importSourceRef = useRef(null);
   const l1SourceRef = useRef(null);
+  const l2SourceRef = useRef(null);
   const analysisSourceRef = useRef(null);
 
   const bindImportTask = useCallback((task, options = {}) => {
@@ -74,6 +77,24 @@ export default function App() {
         l1SourceRef.current = null;
         setL1Busy(false);
         if (finishedTask.status === "failed") setError(finishedTask.error || "L1 索引失败");
+      }
+    );
+  }, []);
+
+  const bindL2Task = useCallback((task) => {
+    if (!task?.id) return;
+    setL2Task(task);
+    setL2Busy(isLiveTask(task));
+    l2SourceRef.current?.close();
+    l2SourceRef.current = null;
+    if (!isLiveTask(task)) return;
+    l2SourceRef.current = followTask(
+      `/api/l2-indexes/${encodeURIComponent(task.id)}/events`,
+      setL2Task,
+      (finishedTask) => {
+        l2SourceRef.current = null;
+        setL2Busy(false);
+        if (finishedTask.status === "failed") setError(finishedTask.error || "L2 索引失败");
       }
     );
   }, []);
@@ -139,9 +160,11 @@ export default function App() {
         const liveTasks = (data.tasks || []).filter(isLiveTask);
         const latestImport = liveTasks.find((task) => task.type === "import");
         const latestL1 = liveTasks.find((task) => task.type === "l1-index");
+        const latestL2 = liveTasks.find((task) => task.type === "l2-index");
         const latestAnalysis = liveTasks.find((task) => task.type === "analysis");
         if (latestImport && !importSourceRef.current && !importTask) bindImportTask(latestImport);
         if (latestL1 && !l1SourceRef.current && !l1Task) bindL1Task(latestL1);
+        if (latestL2 && !l2SourceRef.current && !l2Task) bindL2Task(latestL2);
         if (latestAnalysis && !analysisSourceRef.current && !analysisTask) bindAnalysisTask(latestAnalysis);
       } catch {
         // Older running servers do not have /api/tasks yet. Keep the UI usable.
@@ -151,11 +174,12 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [analysisTask, bindAnalysisTask, bindImportTask, bindL1Task, busy, importTask, l1Task]);
+  }, [analysisTask, bindAnalysisTask, bindImportTask, bindL1Task, bindL2Task, busy, importTask, l1Task, l2Task]);
 
   useEffect(() => () => {
     importSourceRef.current?.close();
     l1SourceRef.current?.close();
+    l2SourceRef.current?.close();
     analysisSourceRef.current?.close();
   }, []);
 
@@ -217,6 +241,29 @@ export default function App() {
     }
   }
 
+  async function startL2Index({ bookId, startChapter, endChapter, force = false, mode = "all" }) {
+    if (l2Busy) return l2Task;
+    setL2Busy(true);
+    setError("");
+    setL2Task(null);
+    l2SourceRef.current?.close();
+    l2SourceRef.current = null;
+    try {
+      const data = await apiPost(`/api/books/${encodeURIComponent(bookId)}/l2-indexes`, {
+        start_chapter: startChapter,
+        end_chapter: endChapter,
+        force,
+        mode
+      });
+      bindL2Task(data.task);
+      return data.task;
+    } catch (startError) {
+      setL2Busy(false);
+      setError(startError.message);
+      return null;
+    }
+  }
+
   async function controlImport(action) {
     if (!importTask?.id) return;
     setError("");
@@ -246,6 +293,23 @@ export default function App() {
         l1SourceRef.current?.close();
         l1SourceRef.current = null;
         setL1Busy(false);
+      }
+    } catch (controlError) {
+      setError(controlError.message);
+    }
+  }
+
+  async function controlL2(action) {
+    if (!l2Task?.id) return;
+    setError("");
+    try {
+      const data = await apiPost(`/api/l2-indexes/${encodeURIComponent(l2Task.id)}/${action}`, {});
+      setL2Task(data.task);
+      setL2Busy(isLiveTask(data.task));
+      if (action === "cancel") {
+        l2SourceRef.current?.close();
+        l2SourceRef.current = null;
+        setL2Busy(false);
       }
     } catch (controlError) {
       setError(controlError.message);
@@ -378,6 +442,12 @@ export default function App() {
               <span>L1 · {l1Task.progress?.current || "索引构建中"}</span>
             </button>
           ) : null}
+          {l2Busy && l2Task ? (
+            <button className="background-task-chip" type="button" title={l2Task.progress?.current || "L2 索引构建中"} onClick={() => navigate("library")}>
+              <StatusPill status={l2Task.status} />
+              <span>L2 · {l2Task.progress?.current || "事实索引中"}</span>
+            </button>
+          ) : null}
           {analysisBusy && analysisTask ? (
             <button className="background-task-chip" type="button" title={analysisStatusText} onClick={() => navigate("analysis")}>
               <StatusPill status={analysisTask.status} />
@@ -402,14 +472,20 @@ export default function App() {
           importBusy={importBusy}
           l1Task={l1Task}
           l1Busy={l1Busy}
+          l2Task={l2Task}
+          l2Busy={l2Busy}
           onStartImport={startImport}
           onStartL1Index={startL1Index}
+          onStartL2Index={startL2Index}
           onImportCancel={() => controlImport("cancel")}
           onImportPause={() => controlImport("pause")}
           onImportResume={() => controlImport("resume")}
           onL1Cancel={() => controlL1("cancel")}
           onL1Pause={() => controlL1("pause")}
           onL1Resume={() => controlL1("resume")}
+          onL2Cancel={() => controlL2("cancel")}
+          onL2Pause={() => controlL2("pause")}
+          onL2Resume={() => controlL2("resume")}
           onBooksChanged={reloadBooks}
           setError={setError}
         />

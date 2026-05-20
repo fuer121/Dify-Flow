@@ -24,8 +24,11 @@ import { sanitizeError } from "./sanitize.js";
 import { testDifyConnection } from "./dify.js";
 import {
   publicAnalysisRunWithResult,
+  getL2IndexCoverageForBook,
+  listL2FactsForBook,
   resumeAnalysisRunTask,
   startL1IndexTask,
+  startL2IndexTask,
   startAnalysisTask,
   startImportTask
 } from "./workflows.js";
@@ -232,6 +235,91 @@ app.get("/api/books/:bookId/l1-indexes/windows", (request, response, next) => {
 
 app.post("/api/books/:bookId/delete", (request, response) => {
   response.json({ ok: true, ...deleteBook(request.params.bookId) });
+});
+
+app.post("/api/books/:bookId/l2-indexes", (request, response, next) => {
+  try {
+    const task = startL2IndexTask({
+      ...(request.body || {}),
+      book_id: request.params.bookId
+    });
+    response.status(202).json({ ok: true, task: publicTask(task) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/l2-indexes/:id", (request, response, next) => {
+  try {
+    response.json({ ok: true, task: publicTask(getTask(request.params.id)) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/l2-indexes/:id/events", (request, response, next) => {
+  try {
+    subscribeTask(request.params.id, response);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/l2-indexes/:id/cancel", (request, response, next) => {
+  try {
+    response.json({ ok: true, task: cancelTask(request.params.id) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/l2-indexes/:id/pause", (request, response, next) => {
+  try {
+    response.json({ ok: true, task: pauseTask(request.params.id) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/l2-indexes/:id/resume", (request, response, next) => {
+  try {
+    response.json({ ok: true, task: resumeTask(request.params.id) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/books/:bookId/l2-indexes/coverage", (request, response, next) => {
+  try {
+    response.json({
+      ok: true,
+      coverage: getL2IndexCoverageForBook({
+        bookId: request.params.bookId,
+        startChapter: request.query.start_chapter || request.query.startChapter || 1,
+        endChapter: request.query.end_chapter || request.query.endChapter || 1
+      })
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/books/:bookId/l2-facts", async (request, response, next) => {
+  try {
+    response.json({
+      ok: true,
+      facts: await listL2FactsForBook({
+        bookId: request.params.bookId,
+        startChapter: request.query.start_chapter || request.query.startChapter || 1,
+        endChapter: request.query.end_chapter || request.query.endChapter || 1,
+        category: request.query.category || "",
+        entity: request.query.entity || "",
+        limit: request.query.limit || 500
+      })
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post("/api/analyses", (request, response, next) => {

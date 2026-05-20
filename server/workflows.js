@@ -11,7 +11,10 @@ import {
   getExistingChapterIndexes,
   getL1ChapterIndex,
   getL1Coverage,
+  getL2ChapterStatus,
+  getL2Coverage,
   getPromptSettings,
+  listL2Facts,
   listAnalysisChapterMetadata,
   listChapterMetadata,
   listL1ChapterIndexes,
@@ -25,6 +28,8 @@ import {
   saveEncryptedChapter,
   saveFinalAnalysisResult,
   saveL1ChapterIndex,
+  saveL2ChapterFacts,
+  saveL2ChapterStatus,
   schemaHash,
   updateAnalysisRun,
   updateBookImportStatus
@@ -34,10 +39,13 @@ import {
   buildChapterInput,
   buildCompressedSummaryInput,
   buildL1ChapterInput,
+  buildL2ChapterInput,
+  buildIndexSummaryInput,
   buildSummaryInput,
   callOpenAIJson,
   callOpenAIText,
   chapterResultSchema,
+  l2ChapterFactsSchema,
   l1ChapterIndexSchema,
   testOpenAIConnection
 } from "./openai.js";
@@ -60,6 +68,7 @@ const SUMMARY_FINAL_MAX_OUTPUT_TOKENS = 4500;
 const CUSTOM_FIELD_SUMMARY_MAX_OUTPUT_TOKENS = 3000;
 const SUMMARY_STAGE_MAX_ATTEMPTS = 3;
 const SUMMARY_STAGE_RETRY_DELAY_MS = 1200;
+const L2_SCHEMA_VERSION = "l2-facts-v1";
 
 export function startImportTask(payload) {
   const bookId = normalizeBookId(payload.book_id ?? payload.bookId);
@@ -95,17 +104,37 @@ export function startL1IndexTask(payload) {
   return task;
 }
 
+export function startL2IndexTask(payload) {
+  const bookId = normalizeBookId(payload.book_id ?? payload.bookId);
+  const range = normalizeRange(payload.start_chapter ?? payload.startChapter, payload.end_chapter ?? payload.endChapter);
+  const force = Boolean(payload.force);
+  const mode = normalizeL2BuildMode(payload.mode || payload.build_mode || payload.buildMode);
+  const task = createTask("l2-index", {
+    bookId,
+    startChapter: range.startChapter,
+    endChapter: range.endChapter,
+    force,
+    mode
+  });
+
+  void runL2IndexTask(task, { bookId, ...range, force, mode });
+  return task;
+}
+
 export function startAnalysisTask(payload) {
   const bookId = normalizeBookId(payload.book_id ?? payload.bookId);
   const range = normalizeRange(payload.start_chapter ?? payload.startChapter, payload.end_chapter ?? payload.endChapter);
   const chapterIndexes = normalizeChapterIndexes(payload.chapter_indexes ?? payload.chapterIndexes);
   const name = String(payload.name || "").trim();
+  const analysisMode = normalizeAnalysisMode(payload.analysis_mode ?? payload.analysisMode);
+  const sourceReviewBudget = normalizeOptionalBudget(payload.source_review_budget ?? payload.sourceReviewBudget);
   const task = createTask("analysis", {
     name,
     bookId,
     startChapter: range.startChapter,
     endChapter: range.endChapter,
-    chapterCount: chapterIndexes.length || range.total
+    chapterCount: chapterIndexes.length || range.total,
+    analysisMode
   });
 
   void runAnalysisTask(task, {
@@ -114,7 +143,9 @@ export function startAnalysisTask(payload) {
     ...range,
     chapterIndexes,
     promptPatch: payload.prompt || {},
-    useL1Context: Boolean(payload.use_l1_context ?? payload.useL1Context)
+    useL1Context: Boolean(payload.use_l1_context ?? payload.useL1Context),
+    analysisMode,
+    sourceReviewBudget
   });
   return task;
 }
@@ -369,6 +400,135 @@ async function runL1IndexTask(task, { bookId, startChapter, endChapter, force })
   }
 }
 
+async function runL2IndexTask(task, { bookId, startChapter, endChapter, force, mode }) {
+  const promptSettings = getPromptSettings();
+  const model = promptSettings.model;
+  const reasoningEffort = promptSettings.reasoning_effort;
+  const indexPromptHash = l2PromptHash();
+  try {
+    const chapters = listChapterMetadata(bookId)
+      .filter((chapter) => chapter.chapter_index >= startChapter && chapter.chapter_index <= endChapter);
+    if (!chapters.length) {
+      const error = new Error("本地章节库没有可构建 L2 索引的章节，请先导入章节原文。");
+      error.status = 422;
+      throw error;
+    }
+
+    await testOpenAIConnection();
+    markTaskRunning(task, {
+      progress: {
+        total: chapters.length,
+        completed: 0,
+        failed: 0,
+        skipped: 0,
+        current: "准备构建 L2 类型化事实索引"
+      }
+    });
+
+    for (const chapter of chapters) {
+      await waitIfPaused(task);
+      const existing = getL2ChapterStatus(bookId, chapter.chapter_index);
+      const fresh = existing?.status === "completed"
+        && existing.source_hmac === chapter.content_hmac
+        && existing.model === model
+        && existing.prompt_hash === indexPromptHash
+        && existing.schema_version === L2_SCHEMA_VERSION;
+      if (!force && mode === "retry_failed" && existing?.status !== "failed") {
+        task.progress.skipped += 1;
+        updateTask(task, {
+          progress: { ...task.progress, current: `跳过章节 ${chapter.chapter_index}` },
+          message: `章节 ${chapter.chapter_index} 不是失败状态，跳过。`
+        });
+        continue;
+      }
+      if (!force && mode === "missing" && existing) {
+        task.progress.skipped += 1;
+        updateTask(task, {
+          progress: { ...task.progress, current: `跳过章节 ${chapter.chapter_index}` },
+          message: `章节 ${chapter.chapter_index} 已有 L2 记录，跳过。`
+        });
+        continue;
+      }
+      if (!force && mode === "all" && fresh) {
+        task.progress.skipped += 1;
+        updateTask(task, {
+          progress: { ...task.progress, current: `跳过章节 ${chapter.chapter_index}` },
+          message: `章节 ${chapter.chapter_index} L2 索引已存在，跳过。`
+        });
+        continue;
+      }
+
+      updateTask(task, {
+        progress: { ...task.progress, current: `L2 事实索引 ${chapter.chapter_index}` },
+        message: `正在构建章节 ${chapter.chapter_index} L2 事实索引`
+      });
+
+      try {
+        assertNotCancelled(task);
+        const content = await decryptChapterContent(bookId, chapter.chapter_index);
+        const l1Index = getL1ChapterIndex(bookId, chapter.chapter_index);
+        const response = await callOpenAIJson({
+          model,
+          reasoningEffort,
+          instructions: "你是小说 L2 类型化事实索引引擎。只输出符合 Schema 的 JSON。",
+          input: buildL2ChapterInput({
+            chapterIndex: chapter.chapter_index,
+            title: chapter.title,
+            content,
+            l1Index
+          }),
+          schema: l2ChapterFactsSchema(),
+          schemaName: "l2_chapter_facts"
+        });
+        await saveL2ChapterFacts({
+          bookId,
+          chapterIndex: chapter.chapter_index,
+          status: "completed",
+          sourceHmac: chapter.content_hmac,
+          model,
+          promptHash: indexPromptHash,
+          schemaVersion: L2_SCHEMA_VERSION,
+          facts: response.value?.facts || []
+        });
+        task.progress.completed += 1;
+        updateTask(task, {
+          progress: { ...task.progress, current: `章节 ${chapter.chapter_index} L2 完成` },
+          message: `章节 ${chapter.chapter_index} L2 索引完成`
+        });
+        assertNotCancelled(task);
+      } catch (error) {
+        if (error?.status === 499) throw error;
+        const safeMessage = sanitizeText(error.message);
+        saveL2ChapterStatus({
+          bookId,
+          chapterIndex: chapter.chapter_index,
+          status: "failed",
+          sourceHmac: chapter.content_hmac,
+          model,
+          promptHash: indexPromptHash,
+          schemaVersion: L2_SCHEMA_VERSION,
+          errorSummary: safeMessage
+        });
+        task.progress.failed += 1;
+        updateTask(task, {
+          progress: { ...task.progress, current: `章节 ${chapter.chapter_index} L2 失败` },
+          message: `章节 ${chapter.chapter_index} L2 失败：${safeMessage}`
+        }, "warning");
+        if (isFatalUpstreamError(safeMessage)) {
+          throw new Error(`L2 构建已停止：${safeMessage}`, { cause: error });
+        }
+      }
+    }
+
+    completeTask(task, {
+      bookId,
+      coverage: getL2Coverage({ bookId, startChapter, endChapter, model, promptHash: indexPromptHash, schemaVersion: L2_SCHEMA_VERSION })
+    });
+  } catch (error) {
+    failTask(task, error);
+  }
+}
+
 async function runAnalysisTask(task, options) {
   const resume = Boolean(options.resume);
   const analysisId = options.analysisId || task.id;
@@ -390,7 +550,7 @@ async function runAnalysisTask(task, options) {
   }
 }
 
-async function prepareNewAnalysis(analysisId, { name, bookId, startChapter, endChapter, chapterIndexes, promptPatch, useL1Context }) {
+async function prepareNewAnalysis(analysisId, { name, bookId, startChapter, endChapter, chapterIndexes, promptPatch, useL1Context, analysisMode, sourceReviewBudget }) {
   const settings = normalizePromptSettings({ ...getPromptSettings(), ...promptPatch });
   const chapters = resolveSelectedChapters({ bookId, startChapter, endChapter, chapterIndexes });
   if (chapters.length === 0) {
@@ -414,7 +574,7 @@ async function prepareNewAnalysis(analysisId, { name, bookId, startChapter, endC
     promptHash: promptHash(settings),
     schemaHash: schemaHash(settings),
     chapterCount: chapters.length,
-    promptSnapshot: { ...settings, use_l1_context: useL1Context }
+    promptSnapshot: { ...settings, use_l1_context: useL1Context, analysis_mode: analysisMode, source_review_budget: sourceReviewBudget }
   });
 
   return {
@@ -425,6 +585,8 @@ async function prepareNewAnalysis(analysisId, { name, bookId, startChapter, endC
     chapters,
     settings,
     useL1Context,
+    analysisMode,
+    sourceReviewBudget,
     chapterPromptHash: promptHash(settings),
     outputSchemaHash: schemaHash(settings),
     resume: false
@@ -464,6 +626,8 @@ async function prepareResumedAnalysis(run) {
     chapters,
     settings: normalizedSettings,
     useL1Context: Boolean(settings.use_l1_context),
+    analysisMode: normalizeAnalysisMode(settings.analysis_mode || "full_text"),
+    sourceReviewBudget: normalizeOptionalBudget(settings.source_review_budget),
     chapterPromptHash: run.prompt_hash || promptHash(normalizedSettings),
     outputSchemaHash: run.schema_hash || schemaHash(normalizedSettings),
     resume: true
@@ -479,6 +643,8 @@ async function executeAnalysisTask(task, prepared) {
     chapters,
     settings,
     useL1Context,
+    analysisMode,
+    sourceReviewBudget,
     chapterPromptHash,
     outputSchemaHash,
     resume
@@ -501,6 +667,22 @@ async function executeAnalysisTask(task, prepared) {
       current: resume ? "准备续跑分析" : "准备逐章分析"
     }
   });
+
+  if (analysisMode !== "full_text") {
+    return executeIndexAnalysisTask(task, {
+      analysisId,
+      bookId,
+      startChapter,
+      endChapter,
+      chapters,
+      settings,
+      model,
+      reasoningEffort,
+      outputSchemaHash,
+      analysisMode,
+      sourceReviewBudget
+    });
+  }
 
   const chapterResults = [];
   const failedChapters = [];
@@ -623,6 +805,144 @@ async function executeAnalysisTask(task, prepared) {
     failedChapters,
     schemaHash: outputSchemaHash
   });
+}
+
+async function executeIndexAnalysisTask(task, { analysisId, bookId, startChapter, endChapter, chapters, settings, model, reasoningEffort, outputSchemaHash, analysisMode, sourceReviewBudget }) {
+  const selectedIndexes = chapters.map((chapter) => chapter.chapter_index);
+  const categories = inferL2CategoriesFromPrompt(settings.summary_prompt);
+  const entityQuery = inferEntityQueryFromPrompt(settings.summary_prompt);
+  await waitIfPaused(task);
+  updateTask(task, {
+    progress: { ...task.progress, current: "L2 召回事实" },
+    message: "正在从本地 L2 索引召回相关事实"
+  });
+
+  const facts = (await listL2Facts({
+    bookId,
+    startChapter,
+    endChapter,
+    categories,
+    entity: entityQuery,
+    limit: 1000,
+    includeContent: true
+  })).filter((fact) => selectedIndexes.includes(fact.chapter_index));
+  const indexedChapters = new Set(facts.map((fact) => fact.chapter_index));
+  const missingChapters = selectedIndexes.filter((index) => !indexedChapters.has(index));
+  const sourceStats = {
+    analysis_mode: analysisMode,
+    recalled_facts: facts.length,
+    recalled_chapters: indexedChapters.size,
+    source_review_chapters: 0,
+    source_review_budget: sourceReviewBudgetForMode(analysisMode, chapters.length, sourceReviewBudget),
+    missing_chapters: missingChapters,
+    categories,
+    entity_query: entityQuery
+  };
+
+  const reviewedChapters = [];
+  const reviewCandidates = analysisMode === "fast_index"
+    ? []
+    : selectSourceReviewCandidates({ facts, chapters, budget: sourceStats.source_review_budget });
+  for (const chapter of reviewCandidates) {
+    await waitIfPaused(task);
+    updateTask(task, {
+      progress: { ...task.progress, current: `原文复核 ${chapter.chapter_index}` },
+      message: `正在按预算复核章节 ${chapter.chapter_index}`
+    });
+    const content = await decryptChapterContent(bookId, chapter.chapter_index);
+    const response = await callOpenAIJson({
+      model,
+      reasoningEffort: "low",
+      instructions: "你是小说事实复核引擎。只针对用户汇总目标补充本章关键事实，输出符合 Schema 的 JSON。",
+      input: buildL2ChapterInput({
+        chapterIndex: chapter.chapter_index,
+        title: chapter.title,
+        content,
+        l1Index: null
+      }),
+      schema: l2ChapterFactsSchema(),
+      schemaName: "l2_source_review"
+    });
+    const reviewFacts = (response.value?.facts || []).map((fact) => ({ ...fact, review_source: "source_review" }));
+    await saveL2ChapterFacts({
+      bookId,
+      chapterIndex: chapter.chapter_index,
+      status: "completed",
+      sourceHmac: chapter.content_hmac,
+      model,
+      promptHash: l2PromptHash(),
+      schemaVersion: L2_SCHEMA_VERSION,
+      facts: reviewFacts
+    });
+    reviewedChapters.push({
+      chapter_index: chapter.chapter_index,
+      title: chapter.title,
+      facts: reviewFacts
+    });
+    sourceStats.source_review_chapters += 1;
+  }
+
+  await waitIfPaused(task);
+  updateTask(task, {
+    progress: { ...task.progress, current: "GPT 索引汇总结果" },
+    message: "正在基于 L2 召回事实生成最终汇总"
+  });
+  const finalSchema = deriveFinalSummarySchema({
+    userPrompt: settings.summary_prompt,
+    configuredSchema: parseOutputSchemaOrNull(settings.output_schema)
+  });
+  const summary = await runFinalSummaryCall({
+    task,
+    stageLabel: "GPT 索引汇总结果",
+    model,
+    reasoningEffort,
+    input: buildIndexSummaryInput({
+      facts,
+      reviewedChapters,
+      missingChapters,
+      userPrompt: settings.summary_prompt,
+      sourceStats
+    }),
+    schema: finalSchema,
+    sourceChapterCount: Math.max(facts.length, reviewedChapters.length, 1)
+  });
+
+  assertNotCancelled(task);
+  const finalResult = parseJsonOrText(summary.value);
+  assertFinalSummaryUseful(finalResult, Math.max(facts.length, reviewedChapters.length, 1));
+  await saveFinalAnalysisResult(analysisId, finalResult);
+  task.progress.completed = task.progress.total;
+  const run = updateAnalysisRun(analysisId, {
+    status: "completed",
+    source_stats: JSON.stringify(sourceStats),
+    error_summary: sourceStats.missing_chapters.length ? `L2 索引缺口章节：${sourceStats.missing_chapters.slice(0, 30).join(", ")}` : ""
+  });
+  completeTask(task, {
+    analysisId,
+    run: publicAnalysisRun(run),
+    finalResult,
+    failedChapters: [],
+    schemaHash: outputSchemaHash,
+    sourceStats
+  });
+}
+
+function selectSourceReviewCandidates({ facts, chapters, budget }) {
+  if (!budget) return [];
+  const byIndex = new Map(chapters.map((chapter) => [chapter.chapter_index, chapter]));
+  const scores = new Map();
+  for (const fact of facts) {
+    const confidence = Number(fact.confidence || 0);
+    const importance = Number(fact.importance || 0);
+    if (importance < 0.65 && confidence >= 0.55) continue;
+    const score = (importance * 2) + (1 - confidence);
+    scores.set(fact.chapter_index, Math.max(scores.get(fact.chapter_index) || 0, score));
+  }
+  return [...scores.entries()]
+    .sort((left, right) => right[1] - left[1])
+    .map(([chapterIndex]) => byIndex.get(chapterIndex))
+    .filter(Boolean)
+    .slice(0, budget);
 }
 
 async function reusableAnalysisChapter({ analysisId, chapter, promptHash }) {
@@ -1086,6 +1406,17 @@ function parseJsonOrText(value) {
   }
 }
 
+function parseJsonObject(value) {
+  if (!value) return null;
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  try {
+    const parsed = JSON.parse(String(value));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 function assertFinalSummaryUseful(finalResult, sourceChapterCount) {
   if (sourceChapterCount < 3) return;
 
@@ -1215,9 +1546,34 @@ export function publicAnalysisRun(run) {
     status: run.status,
     chapter_count: run.chapter_count,
     error_summary: run.error_summary,
+    source_stats: parseJsonObject(run.source_stats),
     created_at: run.created_at,
     updated_at: run.updated_at
   };
+}
+
+export function getL2IndexCoverageForBook({ bookId, startChapter, endChapter }) {
+  const settings = getPromptSettings();
+  return getL2Coverage({
+    bookId,
+    startChapter,
+    endChapter,
+    model: settings.model,
+    promptHash: l2PromptHash(),
+    schemaVersion: L2_SCHEMA_VERSION
+  });
+}
+
+export async function listL2FactsForBook({ bookId, startChapter, endChapter, category, entity, limit }) {
+  return listL2Facts({
+    bookId,
+    startChapter,
+    endChapter,
+    categories: category ? String(category).split(",") : [],
+    entity,
+    limit,
+    includeContent: true
+  });
 }
 
 function rangeIndexes(start, end) {
@@ -1231,6 +1587,10 @@ function l1PromptHash() {
   return "l1-v1-chapter-window-10";
 }
 
+function l2PromptHash() {
+  return "l2-v1-typed-facts";
+}
+
 function isFatalUpstreamError(message) {
   return /成本保护|rate limit|quota|insufficient_quota|billing|429/i.test(String(message || ""));
 }
@@ -1239,6 +1599,51 @@ function normalizeChapterIndexes(value) {
   if (!Array.isArray(value)) return [];
   const indexes = value.map((entry) => normalizeChapterIndex(entry));
   return [...new Set(indexes)].sort((left, right) => left - right);
+}
+
+function normalizeAnalysisMode(value) {
+  return ["fast_index", "balanced", "precision", "full_text"].includes(value) ? value : "balanced";
+}
+
+function normalizeL2BuildMode(value) {
+  return ["all", "missing", "retry_failed"].includes(value) ? value : "all";
+}
+
+function normalizeOptionalBudget(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const number = Number.parseInt(value, 10);
+  if (!Number.isFinite(number) || number < 0) return null;
+  return Math.min(100, number);
+}
+
+function sourceReviewBudgetForMode(mode, chapterCount, override) {
+  if (Number.isInteger(override)) return override;
+  if (mode === "fast_index") return 0;
+  if (mode === "precision") return Math.min(30, Math.max(5, Math.ceil(chapterCount * 0.03)));
+  if (mode === "balanced") return Math.min(10, Math.max(3, Math.ceil(chapterCount * 0.01)));
+  return 0;
+}
+
+function inferL2CategoriesFromPrompt(prompt) {
+  const text = String(prompt || "").toLowerCase();
+  const categories = new Set();
+  if (/人物|角色|主角|配角|身份|character|role/.test(text)) categories.add("character");
+  if (/关系|羁绊|师徒|敌友|relationship/.test(text)) categories.add("relationship");
+  if (/境界|修炼|功法|体系|cultivation/.test(text)) categories.add("cultivation");
+  if (/宗门|势力|门派|组织|force|faction|sect/.test(text)) categories.add("force");
+  if (/武器|法宝|物品|道具|item|weapon/.test(text)) categories.add("item");
+  if (/地点|地图|空间|location|place/.test(text)) categories.add("location");
+  if (/事件|剧情|时间线|event|timeline/.test(text)) categories.add("event");
+  if (/伏笔|线索|foreshadow/.test(text)) categories.add("foreshadowing");
+  return categories.size ? [...categories] : [];
+}
+
+function inferEntityQueryFromPrompt(prompt) {
+  const text = String(prompt || "");
+  const matches = [...text.matchAll(/[《“「『]([^》”」』]{1,24})[》”」』]/g)]
+    .map((match) => match[1])
+    .filter((value) => !/json|schema|markdown/i.test(value));
+  return matches[0] || "";
 }
 
 function resolveSelectedChapters({ bookId, startChapter, endChapter, chapterIndexes }) {

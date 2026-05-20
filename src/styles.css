@@ -882,6 +882,17 @@ textarea:focus {
   font-size: 12px;
 }
 
+.index-route-note {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .table-wrap {
   max-height: 360px;
   overflow: auto;
@@ -1194,6 +1205,22 @@ code {
 .result-stack {
   display: grid;
   gap: 12px;
+}
+
+.source-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.source-stats span {
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 760;
 }
 
 .result-summary {

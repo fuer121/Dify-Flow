@@ -1265,10 +1265,11 @@ test("keeps custom JSON prompt shape instead of forcing default final schema", a
     const text = body.input[0].content[0].text;
     const formatName = body.text?.format?.name || "";
 
-    if (!formatName && !text.includes("章节编号：")) {
+    if (formatName === "custom_final_analysis") {
       finalSummaryCalls += 1;
-      assert.equal(Object.hasOwn(body, "text"), false);
       assert.equal(body.max_output_tokens > 0, true);
+      assert.equal(body.text.format.strict, false);
+      assert.equal(body.text.format.schema.properties.roles.type, "array");
       return {
         ok: true,
         json: async () => ({
@@ -1280,6 +1281,10 @@ test("keeps custom JSON prompt shape instead of forcing default final schema", a
 
     if (formatName === "final_analysis") {
       throw new Error("Custom JSON prompt should not be forced into final_analysis schema");
+    }
+
+    if (!formatName && !text.includes("章节编号：")) {
+      throw new Error("Custom JSON prompt should use schema derived from prompt template");
     }
 
     assert.equal(formatName, "chapter_result");
@@ -1319,6 +1324,153 @@ test("keeps custom JSON prompt shape instead of forcing default final schema", a
     const result = await workflows.publicAnalysisRunWithResult(analysis.id);
     assert.deepEqual(Object.keys(result.finalResult).sort(), ["note", "roles"]);
     assert.equal(result.finalResult.roles[0].name, "陈平安");
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("derives final schema from large custom JSON prompt template", async () => {
+  const chapterCount = 90;
+  for (let chapterIndex = 1; chapterIndex <= chapterCount; chapterIndex += 1) {
+    await db.saveEncryptedChapter({
+      bookId: "book-large-custom-json-template",
+      chapterIndex,
+      title: `第${chapterIndex}章`,
+      content: `第${chapterIndex}章正文`
+    });
+  }
+
+  const previousFetch = global.fetch;
+  let finalSummaryCalls = 0;
+  let largestSummaryInput = 0;
+
+  global.fetch = async (url, request) => {
+    if (String(url).includes("api.openai.com/v1/models")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ data: [] })
+      };
+    }
+
+    if (!String(url).includes("api.openai.com/v1/responses")) {
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    }
+    const body = JSON.parse(request.body);
+    const text = body.input[0].content[0].text;
+    const formatName = body.text?.format?.name || "";
+
+    if (formatName === "custom_final_analysis") {
+      finalSummaryCalls += 1;
+      largestSummaryInput = Math.max(largestSummaryInput, text.length);
+      assert.equal(body.text.format.strict, false);
+      assert.equal(body.text.format.schema.properties.major_characters.type, "array");
+      assert.equal(body.text.format.schema.properties.tone_and_style.type, "object");
+      assert.equal(body.max_output_tokens > 0, true);
+      return {
+        ok: true,
+        json: async () => ({
+          id: "resp_large_custom_template_final",
+          output: [{
+            content: [{
+              type: "output_text",
+              text: JSON.stringify({
+                major_characters: [{ name: "陈平安", chapters: [1, 2, 3] }],
+                world_rules: ["规矩一"],
+                major_relationships: [],
+                major_locations: [],
+                major_forces: [],
+                cultivation_system: [],
+                important_items: [],
+                major_events: [],
+                major_foreshadowing: [],
+                core_themes: [],
+                visual_assets: [],
+                ip_assets: [],
+                tone_and_style: { overall: "克制" },
+                corrected_understanding: []
+              })
+            }]
+          }]
+        })
+      };
+    }
+
+    if (formatName === "final_analysis" || formatName === "summary_compression") {
+      throw new Error("Large custom JSON template should use derived schema, not default schema or model compression");
+    }
+
+    assert.equal(formatName, "chapter_result");
+    const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
+    return {
+      ok: true,
+      json: async () => ({
+        id: `resp_large_custom_template_chapter_${chapterIndex}`,
+        output: [{
+          content: [{
+            type: "output_text",
+            text: JSON.stringify({
+              chapter_index: chapterIndex,
+              chapter_title: `第${chapterIndex}章`,
+              summary: `章节${chapterIndex}摘要${"长摘要".repeat(140)}`,
+              key_points: [`关键点${chapterIndex}${"内容".repeat(120)}`],
+              evidence_notes: [`证据${chapterIndex}${"线索".repeat(120)}`]
+            })
+          }]
+        }]
+      })
+    };
+  };
+
+  try {
+    const analysis = workflows.startAnalysisTask({
+      name: "大输入自定义 JSON 模板",
+      book_id: "book-large-custom-json-template",
+      start_chapter: 1,
+      end_chapter: chapterCount,
+      prompt: {
+        summary_prompt: [
+          "请用 JSON 输出，严格使用下面模板字段。",
+          "{",
+          "  \"major_characters\": [],",
+          "  \"world_rules\": [],",
+          "  \"major_relationships\": [],",
+          "  \"major_locations\": [],",
+          "  \"major_forces\": [],",
+          "  \"cultivation_system\": [],",
+          "  \"important_items\": [],",
+          "  \"major_events\": [],",
+          "  \"major_foreshadowing\": [],",
+          "  \"core_themes\": [],",
+          "  \"visual_assets\": [],",
+          "  \"ip_assets\": [],",
+          "  \"tone_and_style\": {},",
+          "  \"corrected_understanding\": []",
+          "}"
+        ].join("\n")
+      }
+    });
+    await waitForTask(analysis);
+    assert.equal(finalSummaryCalls, 1);
+    assert.ok(largestSummaryInput < 30_000);
+    const result = await workflows.publicAnalysisRunWithResult(analysis.id);
+    assert.deepEqual(Object.keys(result.finalResult).sort(), [
+      "core_themes",
+      "corrected_understanding",
+      "cultivation_system",
+      "important_items",
+      "ip_assets",
+      "major_characters",
+      "major_events",
+      "major_forces",
+      "major_foreshadowing",
+      "major_locations",
+      "major_relationships",
+      "tone_and_style",
+      "visual_assets",
+      "world_rules"
+    ]);
+    assert.equal(result.finalResult.major_characters[0].name, "陈平安");
   } finally {
     global.fetch = previousFetch;
   }

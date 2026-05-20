@@ -4,7 +4,7 @@ import tls from "node:tls";
 import { config, requireOpenAIConfig } from "./config.js";
 import { sanitizeDetails, sanitizeText } from "./sanitize.js";
 
-export async function callOpenAIJson({ model, reasoningEffort, instructions, input, schema, schemaName = "result", maxOutputTokens }) {
+export async function callOpenAIJson({ model, reasoningEffort, instructions, input, schema, schemaName = "result", maxOutputTokens, strict = true }) {
   requireOpenAIConfig();
   const body = {
     model: model || config.openai.model,
@@ -19,7 +19,7 @@ export async function callOpenAIJson({ model, reasoningEffort, instructions, inp
         type: "json_schema",
         name: schemaName,
         schema,
-        strict: true
+        strict: Boolean(strict)
       }
     }
   };

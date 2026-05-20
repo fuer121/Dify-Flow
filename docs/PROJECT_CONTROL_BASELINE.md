@@ -355,8 +355,9 @@ Prompt：
 - 当前不再调用模型做中间压缩，因为真实任务已证明压缩素材请求本身也会在当前网关上稳定 180 秒 abort。
 - 最终汇总阶段对 abort、网络失败、5xx、429、返回空 JSON 等瞬时错误最多重试 3 次。
 - 正式环境已把 `OPENAI_REQUEST_TIMEOUT_MS` 提高到 `600000`，用于给本地瘦身后的最终汇总更长等待窗口。
-- 最终汇总只在汇总 Prompt 明确要求匹配“给定 JSON Schema”时走 `final_analysis` JSON Schema，并设置 `max_output_tokens=4500`。
-- 如果汇总 Prompt 自己定义 JSON 结构，但没有要求匹配系统给定 Schema，则按 Prompt 原格式走文本输出；后端会尝试解析 JSON 保存，但不会改写成默认 `title/summary/items/failed_chapters` 结构。
+- 最终汇总只在汇总 Prompt 明确要求匹配“给定 JSON Schema”时走默认 `final_analysis` JSON Schema，并设置 `max_output_tokens=4500`。
+- 如果汇总 Prompt 自己定义 JSON 模板，后端会尝试从最后一个合法 JSON 对象模板推导 `custom_final_analysis` Schema，用结构化输出稳定生成，同时保留用户自定义字段结构。
+- 如果无法从 Prompt 提取合法 JSON 模板，则按 Prompt 原格式走文本输出；后端会尝试解析 JSON 保存，但不会改写成默认 `title/summary/items/failed_chapters` 结构。
 - 本地瘦身目标已从约 2.8 万字符降到约 1.8 万字符，优先保障 100 章级任务能续跑完成；代价是最终汇总素材更摘要化。
 - 最终汇总保存前会做基础质量闸门：当 3 章以上任务返回 `N/A`、空摘要、空 `items` 且没有其他有效自定义字段时，任务标记失败并保留断点续跑，不把占位结果写成完成态。
 
@@ -566,6 +567,11 @@ npm run preview:local
   - 修正最终汇总格式策略：`Prompt 要 JSON` 不再自动等于 `使用系统 final_analysis Schema`。
   - 只有明确要求“匹配给定 JSON Schema”的任务才强制 Schema；自定义 JSON、Markdown、表格或纯文本格式按汇总 Prompt 原格式输出。
   - 保留本地瘦身、`max_output_tokens`、重试和占位结果质量闸门。
+
+- 2026-05-20：
+  - 为自定义 JSON 汇总 Prompt 新增模板推导：当 Prompt 末尾存在合法 JSON 对象模板时，后端自动生成 `custom_final_analysis` Schema。
+  - 该路径既避免默认 `title/summary/items/failed_chapters` 结构污染，也比纯文本 JSON 长生成更稳定。
+  - 空数组模板字段使用宽松 JSON 值数组，避免把 `major_characters: []` 锁死成只能输出空数组或字符串数组。
 
 - 2026-05-19：
   - 修复分析任务最终汇总阶段大输入超时问题。

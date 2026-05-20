@@ -635,7 +635,10 @@ async function reusableAnalysisChapter({ analysisId, chapter, promptHash }) {
 
 async function summarizeAnalysisResults({ task, model, reasoningEffort, chapterResults, failedChapters, userPrompt, outputSchema, sourceChapterCount }) {
   const directInput = buildSummaryInput({ chapterResults, failedChapters, userPrompt });
-  const finalSchema = parseOutputSchemaOrNull(outputSchema);
+  const finalSchema = deriveFinalSummarySchema({
+    userPrompt,
+    configuredSchema: parseOutputSchemaOrNull(outputSchema)
+  });
   if (inputTextLength(directInput) <= DIRECT_SUMMARY_MAX_CHARS) {
     return runFinalSummaryCall({ task, stageLabel: "GPT 汇总分析结果", model, reasoningEffort, userPrompt, input: directInput, schema: finalSchema, sourceChapterCount });
   }
@@ -672,17 +675,18 @@ async function summarizeAnalysisResults({ task, model, reasoningEffort, chapterR
   });
 }
 
-async function runFinalSummaryCall({ task, stageLabel, model, reasoningEffort, userPrompt, input, schema, sourceChapterCount }) {
-  if (schema && shouldUseJsonFinalSummary(userPrompt)) {
+async function runFinalSummaryCall({ task, stageLabel, model, reasoningEffort, input, schema, sourceChapterCount }) {
+  if (schema?.schema) {
     return runSummaryStageWithRetry(task, stageLabel, async () => {
       const response = await callOpenAIJson({
         model,
         reasoningEffort,
         instructions: "你是严谨的小说多章节汇总引擎。按用户汇总 Prompt 输出最终结果；如果用户要求 JSON，则只输出合法 JSON，否则直接输出文本，不要添加无关解释。",
         input,
-        schema,
-        schemaName: "final_analysis",
-        maxOutputTokens: SUMMARY_FINAL_MAX_OUTPUT_TOKENS
+        schema: schema.schema,
+        schemaName: schema.schemaName,
+        maxOutputTokens: SUMMARY_FINAL_MAX_OUTPUT_TOKENS,
+        strict: schema.strict
       });
       assertFinalSummaryUseful(parseJsonOrText(response.value), sourceChapterCount);
       return response;
@@ -752,6 +756,27 @@ function parseOutputSchemaOrNull(value) {
   }
 }
 
+function deriveFinalSummarySchema({ userPrompt, configuredSchema }) {
+  if (configuredSchema && shouldUseJsonFinalSummary(userPrompt)) {
+    return {
+      schema: configuredSchema,
+      schemaName: "final_analysis",
+      strict: true
+    };
+  }
+
+  const promptSchema = schemaFromPromptJsonTemplate(userPrompt);
+  if (promptSchema) {
+    return {
+      schema: promptSchema,
+      schemaName: "custom_final_analysis",
+      strict: false
+    };
+  }
+
+  return null;
+}
+
 function shouldUseJsonFinalSummary(userPrompt) {
   const prompt = String(userPrompt || "");
   const lower = prompt.toLowerCase();
@@ -775,6 +800,92 @@ function shouldUseJsonFinalSummary(userPrompt) {
     || /符合[^。；\n]*(?:json\s*)?schema/i.test(prompt)
     || /按[^。；\n]*(?:json\s*)?schema/i.test(prompt)
     || /最终输出必须匹配给定\s*json\s*schema/i.test(prompt);
+}
+
+function schemaFromPromptJsonTemplate(userPrompt) {
+  const template = extractLastJsonObjectTemplate(userPrompt);
+  if (!template || Array.isArray(template)) return null;
+  return schemaFromJsonTemplate(template);
+}
+
+function extractLastJsonObjectTemplate(value) {
+  const text = String(value || "");
+  for (let end = text.length - 1; end >= 0; end -= 1) {
+    if (text[end] !== "}") continue;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let start = end; start >= 0; start -= 1) {
+      const char = text[start];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === "\\") {
+          escaped = true;
+        } else if (char === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+      if (char === "\"") {
+        inString = true;
+        continue;
+      }
+      if (char === "}") depth += 1;
+      if (char === "{") {
+        depth -= 1;
+        if (depth === 0) {
+          try {
+            const parsed = JSON.parse(text.slice(start, end + 1));
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+          } catch {
+            break;
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function schemaFromJsonTemplate(value) {
+  if (Array.isArray(value)) {
+    return {
+      type: "array",
+      items: value.length ? schemaFromJsonTemplate(value[0]) : looseJsonValueSchema()
+    };
+  }
+  if (value && typeof value === "object") {
+    const properties = {};
+    const required = [];
+    for (const [key, entry] of Object.entries(value)) {
+      properties[key] = schemaFromJsonTemplate(entry);
+      required.push(key);
+    }
+    return {
+      type: "object",
+      additionalProperties: true,
+      properties,
+      required
+    };
+  }
+  if (typeof value === "number") return { type: Number.isInteger(value) ? "integer" : "number" };
+  if (typeof value === "boolean") return { type: "boolean" };
+  if (value === null) return looseJsonValueSchema();
+  return { type: "string" };
+}
+
+function looseJsonValueSchema() {
+  return {
+    anyOf: [
+      { type: "string" },
+      { type: "number" },
+      { type: "integer" },
+      { type: "boolean" },
+      { type: "object", additionalProperties: true },
+      { type: "array", items: { anyOf: [{ type: "string" }, { type: "number" }, { type: "integer" }, { type: "boolean" }, { type: "object", additionalProperties: true } ] } }
+    ]
+  };
 }
 
 function inputTextLength(input) {

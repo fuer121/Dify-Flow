@@ -33,7 +33,7 @@ export function AnalysisPage({
   books,
   config,
   prompts,
-  promptGroups = [],
+  onLoadPromptGroups,
   l1Task,
   analysisTask,
   analysisBusy,
@@ -53,6 +53,7 @@ export function AnalysisPage({
   });
   const [promptDraft, setPromptDraft] = useState(() => normalizePrompt(prompts));
   const defaultPrompt = useMemo(() => normalizePrompt(prompts), [prompts]);
+  const [bookPromptGroups, setBookPromptGroups] = useState([]);
   const [selectedPromptGroupId, setSelectedPromptGroupId] = useState("");
   const [selectedIndexes, setSelectedIndexes] = useState([]);
   const [useL1Context, setUseL1Context] = useState(false);
@@ -78,6 +79,7 @@ export function AnalysisPage({
 
   useEffect(() => {
     void loadChapters(analysisForm.book_id);
+    void loadBookPromptGroups(analysisForm.book_id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [analysisForm.book_id]);
 
@@ -159,6 +161,28 @@ export function AnalysisPage({
     }
   }
 
+  async function loadBookPromptGroups(bookId) {
+    if (!bookId) {
+      setBookPromptGroups([]);
+      setSelectedPromptGroupId("");
+      setPromptDraft(defaultPrompt);
+      return;
+    }
+    setError("");
+    try {
+      const groups = await onLoadPromptGroups(bookId);
+      setBookPromptGroups(groups);
+      if (selectionOverrideRef.current) return;
+      const first = groups[0] || null;
+      setSelectedPromptGroupId(first?.id || "");
+      setPromptDraft(first
+        ? { ...defaultPrompt, name: first.name, summary_prompt: first.summary_prompt }
+        : defaultPrompt);
+    } catch (error) {
+      setError(error.message);
+    }
+  }
+
   async function loadL1Coverage() {
     if (!analysisForm.book_id || !validChapterNumber(analysisForm.start_chapter) || !validChapterNumber(analysisForm.end_chapter)) {
       return;
@@ -184,6 +208,10 @@ export function AnalysisPage({
     const chapterIndexes = [...new Set(selectedIndexes)].sort((left, right) => left - right);
     if (!chapterIndexes.length) {
       setError("请至少选择一个已导入章节。");
+      return;
+    }
+    if (!selectedPromptGroupId) {
+      setError("当前书籍还没有分析 Prompt，请先到 Prompt 管理中创建。");
       return;
     }
 
@@ -281,11 +309,11 @@ export function AnalysisPage({
 
   function applyPromptGroup(groupId) {
     setSelectedPromptGroupId(groupId);
-    const group = promptGroups.find((entry) => entry.id === groupId);
+    const group = bookPromptGroups.find((entry) => entry.id === groupId);
     setPromptDraft((current) => (
       group
         ? { ...current, name: group.name, summary_prompt: group.summary_prompt }
-        : defaultPrompt
+        : current
     ));
   }
 
@@ -408,12 +436,12 @@ export function AnalysisPage({
             <label>
               <span>分析 Prompt</span>
               <select value={selectedPromptGroupId} onChange={(event) => applyPromptGroup(event.target.value)}>
-                <option value="">默认分析 Prompt</option>
+                <option value="">选择当前书籍分析 Prompt</option>
                 {selectedPromptGroupId === "__snapshot__" ? (
                   <option value="__snapshot__">历史任务 Prompt 快照</option>
                 ) : null}
-                {promptGroups.map((group) => (
-                  <option key={group.id} value={group.id}>{group.category} · {group.name}</option>
+                {bookPromptGroups.map((group) => (
+                  <option key={group.id} value={group.id}>{group.name}</option>
                 ))}
               </select>
             </label>
@@ -423,7 +451,7 @@ export function AnalysisPage({
               ? `当前任务将使用历史任务快照：${promptDraft.name || "未命名分析 Prompt"}。如需修改，请到 Prompt 库维护后重新选择。`
               : selectedPromptGroupId
               ? `当前任务将使用：${promptDraft.name || "未命名分析 Prompt"}。Prompt 内容请在 Prompt 库维护。`
-              : "当前任务将使用默认分析 Prompt。Prompt 内容请在 Prompt 库维护。"}
+              : "当前书籍还没有分析 Prompt。请先到 Prompt 管理中创建。"}
           </div>
 
           <div className="selector-card">
@@ -481,7 +509,7 @@ export function AnalysisPage({
               className="primary"
               type="button"
               onClick={startAnalysis}
-              disabled={analysisBusy || !config.openaiConfigured || !config.retentionConfirmed || !analysisForm.book_id || !selectedIndexes.length}
+              disabled={analysisBusy || !config.openaiConfigured || !config.retentionConfirmed || !analysisForm.book_id || !selectedIndexes.length || !selectedPromptGroupId}
             >
               {analysisBusy ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
               {analysisBusy ? "分析中" : "开始分析"}

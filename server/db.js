@@ -76,12 +76,22 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS prompt_groups (
     id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL DEFAULT '',
     name TEXT NOT NULL,
     category TEXT NOT NULL DEFAULT '未分类',
     chapter_prompt TEXT NOT NULL,
     summary_prompt TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS book_index_prompts (
+    book_id TEXT PRIMARY KEY,
+    l1_index_prompt TEXT NOT NULL DEFAULT '',
+    l2_index_prompt TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (book_id) REFERENCES books(book_id) ON DELETE CASCADE
   );
 
   CREATE TABLE IF NOT EXISTS analysis_runs (
@@ -247,6 +257,7 @@ export function ensureBook(bookId, bookName = "") {
     }
     db.prepare("UPDATE books SET book_name = ?, updated_at = ? WHERE book_id = ?")
       .run(existing.book_name || name, now, id);
+    ensureBookIndexPrompts(id);
     return getBook(id);
   }
 
@@ -254,6 +265,7 @@ export function ensureBook(bookId, bookName = "") {
     INSERT INTO books (book_id, book_name, created_at, updated_at)
     VALUES (?, ?, ?, ?)
   `).run(id, name, now, now);
+  ensureBookIndexPrompts(id);
   return getBook(id);
 }
 
@@ -446,10 +458,76 @@ export function saveIndexPromptSettings(settings = {}) {
   return getIndexPromptSettings();
 }
 
-export function listPromptGroups(category) {
+export function ensureBookIndexPrompts(bookId, prompts = {}) {
+  const id = normalizeBookId(bookId);
+  const defaults = getPromptSettings();
+  const now = nowIso();
+  const current = db.prepare("SELECT * FROM book_index_prompts WHERE book_id = ?").get(id);
+  if (current) return publicBookIndexPrompts(current);
+  db.prepare(`
+    INSERT INTO book_index_prompts (book_id, l1_index_prompt, l2_index_prompt, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(
+    id,
+    normalizeIndexPrompt(prompts.l1_index_prompt, defaults.l1_index_prompt),
+    normalizeIndexPrompt(prompts.l2_index_prompt, defaults.l2_index_prompt),
+    now,
+    now
+  );
+  return getBookIndexPrompts(id);
+}
+
+export function getBookIndexPrompts(bookId) {
+  const id = normalizeBookId(bookId);
+  const row = db.prepare("SELECT * FROM book_index_prompts WHERE book_id = ?").get(id);
+  if (row) return publicBookIndexPrompts(row);
+  return ensureBookIndexPrompts(id);
+}
+
+export function updateBookIndexPrompts(bookId, payload = {}) {
+  const current = getBookIndexPrompts(bookId);
+  const next = {
+    l1_index_prompt: Object.hasOwn(payload, "l1_index_prompt")
+      ? normalizeIndexPrompt(payload.l1_index_prompt, current.l1_index_prompt)
+      : current.l1_index_prompt,
+    l2_index_prompt: Object.hasOwn(payload, "l2_index_prompt")
+      ? normalizeIndexPrompt(payload.l2_index_prompt, current.l2_index_prompt)
+      : current.l2_index_prompt
+  };
+  db.prepare(`
+    UPDATE book_index_prompts
+    SET l1_index_prompt = ?, l2_index_prompt = ?, updated_at = ?
+    WHERE book_id = ?
+  `).run(next.l1_index_prompt, next.l2_index_prompt, nowIso(), normalizeBookId(bookId));
+  return getBookIndexPrompts(bookId);
+}
+
+export function listPromptGroups(filters = {}) {
+  const category = typeof filters === "string" ? filters : filters.category;
+  const hasBookFilter = typeof filters === "object" && Object.hasOwn(filters, "bookId");
+  const bookId = hasBookFilter ? String(filters.bookId ?? filters.book_id ?? "") : undefined;
+
+  if (hasBookFilter && category) {
+    return db.prepare(`
+      SELECT id, book_id, name, category, chapter_prompt, summary_prompt, created_at, updated_at
+      FROM prompt_groups
+      WHERE book_id = ? AND category = ?
+      ORDER BY updated_at DESC
+    `).all(bookId ? normalizeBookId(bookId) : "", normalizePromptCategory(category));
+  }
+
+  if (hasBookFilter) {
+    return db.prepare(`
+      SELECT id, book_id, name, category, chapter_prompt, summary_prompt, created_at, updated_at
+      FROM prompt_groups
+      WHERE book_id = ?
+      ORDER BY updated_at DESC
+    `).all(bookId ? normalizeBookId(bookId) : "");
+  }
+
   if (category) {
     return db.prepare(`
-      SELECT id, name, category, chapter_prompt, summary_prompt, created_at, updated_at
+      SELECT id, book_id, name, category, chapter_prompt, summary_prompt, created_at, updated_at
       FROM prompt_groups
       WHERE category = ?
       ORDER BY category ASC, updated_at DESC
@@ -457,7 +535,7 @@ export function listPromptGroups(category) {
   }
 
   return db.prepare(`
-    SELECT id, name, category, chapter_prompt, summary_prompt, created_at, updated_at
+    SELECT id, book_id, name, category, chapter_prompt, summary_prompt, created_at, updated_at
     FROM prompt_groups
     ORDER BY category ASC, updated_at DESC
   `).all();
@@ -465,7 +543,7 @@ export function listPromptGroups(category) {
 
 export function getPromptGroup(id) {
   return db.prepare(`
-    SELECT id, name, category, chapter_prompt, summary_prompt, created_at, updated_at
+    SELECT id, book_id, name, category, chapter_prompt, summary_prompt, created_at, updated_at
     FROM prompt_groups
     WHERE id = ?
   `).get(String(id || ""));
@@ -476,9 +554,9 @@ export function createPromptGroup(payload = {}) {
   const id = crypto.randomUUID();
   const now = nowIso();
   db.prepare(`
-    INSERT INTO prompt_groups (id, name, category, chapter_prompt, summary_prompt, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(id, group.name, group.category, group.chapter_prompt, group.summary_prompt, now, now);
+    INSERT INTO prompt_groups (id, book_id, name, category, chapter_prompt, summary_prompt, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, group.book_id, group.name, group.category, group.chapter_prompt, group.summary_prompt, now, now);
   return getPromptGroup(id);
 }
 
@@ -492,9 +570,9 @@ export function updatePromptGroup(id, payload = {}) {
   const next = normalizePromptGroup({ ...current, ...payload });
   db.prepare(`
     UPDATE prompt_groups
-    SET name = ?, category = ?, chapter_prompt = ?, summary_prompt = ?, updated_at = ?
+    SET book_id = ?, name = ?, category = ?, chapter_prompt = ?, summary_prompt = ?, updated_at = ?
     WHERE id = ?
-  `).run(next.name, next.category, next.chapter_prompt, next.summary_prompt, nowIso(), current.id);
+  `).run(next.book_id, next.name, next.category, next.chapter_prompt, next.summary_prompt, nowIso(), current.id);
   return getPromptGroup(current.id);
 }
 
@@ -1257,6 +1335,18 @@ export function l2IndexPromptHash(settings = getPromptSettings()) {
     : sha256(`l2-index-v2\n${settings.l2_index_prompt}`);
 }
 
+export function bookL1IndexPromptHash(bookPrompts = getPromptSettings()) {
+  return isDefaultL1IndexPrompt(bookPrompts.l1_index_prompt)
+    ? DEFAULT_L1_INDEX_PROMPT_HASH
+    : sha256(`book-l1-index-v1\n${bookPrompts.l1_index_prompt}`);
+}
+
+export function bookL2IndexPromptHash(bookPrompts = getPromptSettings()) {
+  return isDefaultL2IndexPrompt(bookPrompts.l2_index_prompt)
+    ? DEFAULT_L2_INDEX_PROMPT_HASH
+    : sha256(`book-l2-index-v1\n${bookPrompts.l2_index_prompt}`);
+}
+
 export function normalizePromptSettings(settings = {}) {
   const schemaMode = normalizeSchemaMode(settings.schema_mode);
   const schemaFields = normalizeSchemaFields(settings.schema_fields);
@@ -1296,6 +1386,7 @@ function isDefaultL2IndexPrompt(value) {
 
 function migrateSchema() {
   ensureColumn("books", "book_name", "book_name TEXT NOT NULL DEFAULT ''");
+  ensureColumn("prompt_groups", "book_id", "book_id TEXT NOT NULL DEFAULT ''");
   ensureColumn("prompt_settings", "schema_mode", "schema_mode TEXT NOT NULL DEFAULT 'fields'");
   ensureColumn("prompt_settings", "schema_fields", "schema_fields TEXT NOT NULL DEFAULT '[]'");
   ensureColumn("prompt_settings", "l1_index_prompt", "l1_index_prompt TEXT NOT NULL DEFAULT ''");
@@ -1307,6 +1398,8 @@ function migrateSchema() {
   ensureColumn("analysis_runs", "prompt_iv", "prompt_iv TEXT");
   ensureColumn("analysis_runs", "prompt_tag", "prompt_tag TEXT");
   ensureColumn("analysis_runs", "prompt_algorithm", "prompt_algorithm TEXT NOT NULL DEFAULT 'aes-256-gcm'");
+  migrateBookIndexPrompts();
+  migratePromptGroupsToBooks();
 }
 
 function ensureColumn(table, column, definition) {
@@ -1335,11 +1428,27 @@ function seedDefaultPromptGroups() {
 
 function normalizePromptGroup(payload = {}) {
   const summaryPrompt = String(payload.summary_prompt || "").trim();
+  const rawBookId = String(payload.book_id ?? payload.bookId ?? "").trim();
   return {
+    book_id: rawBookId ? normalizeBookId(rawBookId) : "",
     name: String(payload.name || "未命名分析 Prompt").trim().slice(0, 120) || "未命名分析 Prompt",
     category: normalizePromptCategory(payload.category),
     chapter_prompt: String(payload.chapter_prompt || "").trim(),
     summary_prompt: summaryPrompt || defaultSummaryPrompt()
+  };
+}
+
+function publicBookIndexPrompts(row) {
+  if (!row) return null;
+  const prompts = {
+    ...row,
+    l1_index_prompt: normalizeIndexPrompt(row.l1_index_prompt, DEFAULT_L1_INDEX_PROMPT),
+    l2_index_prompt: normalizeIndexPrompt(row.l2_index_prompt, DEFAULT_L2_INDEX_PROMPT)
+  };
+  return {
+    ...prompts,
+    l1_index_prompt_hash: bookL1IndexPromptHash(prompts),
+    l2_index_prompt_hash: bookL2IndexPromptHash(prompts)
   };
 }
 
@@ -1357,6 +1466,39 @@ function publicPromptSettings(row) {
     l1_index_prompt_hash: l1IndexPromptHash(settings),
     l2_index_prompt_hash: l2IndexPromptHash(settings)
   };
+}
+
+function migrateBookIndexPrompts() {
+  const settings = getPromptSettings();
+  const books = db.prepare("SELECT book_id FROM books").all();
+  const now = nowIso();
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO book_index_prompts (book_id, l1_index_prompt, l2_index_prompt, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  for (const book of books) {
+    insert.run(
+      book.book_id,
+      normalizeIndexPrompt(settings.l1_index_prompt, DEFAULT_L1_INDEX_PROMPT),
+      normalizeIndexPrompt(settings.l2_index_prompt, DEFAULT_L2_INDEX_PROMPT),
+      now,
+      now
+    );
+  }
+}
+
+function migratePromptGroupsToBooks() {
+  const books = db.prepare("SELECT book_id, book_name FROM books").all();
+  if (!books.length) return;
+  const groups = db.prepare("SELECT id, category, book_id FROM prompt_groups WHERE book_id = '' OR book_id IS NULL").all();
+  const update = db.prepare("UPDATE prompt_groups SET book_id = ?, updated_at = ? WHERE id = ?");
+  const now = nowIso();
+  for (const group of groups) {
+    const category = normalizePromptCategory(group.category);
+    const matched = books.find((book) => book.book_name && normalizePromptCategory(book.book_name) === category)
+      || books.find((book) => normalizePromptCategory(book.book_id) === category);
+    if (matched) update.run(matched.book_id, now, group.id);
+  }
 }
 
 function normalizeAnalysisName(name, bookId, startChapter, endChapter) {

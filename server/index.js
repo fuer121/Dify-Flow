@@ -3,21 +3,24 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { config, publicRuntimeConfig } from "./config.js";
 import {
+  bookL1IndexPromptHash,
   deleteBook,
   deleteAnalysisRun,
   createPromptGroup,
   deletePromptGroup,
+  ensureBook,
+  getBookIndexPrompts,
   getPromptGroup,
   getPromptSettings,
   getIndexPromptSettings,
   getL1Coverage,
-  l1IndexPromptHash,
   listL1ChapterIndexes,
   listL1WindowIndexes,
   listAnalysisRuns,
   listBooks,
   listChapterMetadata,
   listPromptGroups,
+  updateBookIndexPrompts,
   updatePromptGroup,
   saveIndexPromptSettings,
   savePromptSettings
@@ -75,6 +78,17 @@ app.get("/api/tasks", (request, response) => {
 
 app.get("/api/books", (_request, response) => {
   response.json({ ok: true, books: listBooks() });
+});
+
+app.post("/api/books", (request, response, next) => {
+  try {
+    response.status(201).json({
+      ok: true,
+      book: ensureBook(request.body?.book_id ?? request.body?.bookId, request.body?.book_name ?? request.body?.bookName)
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post("/api/books/imports", (request, response, next) => {
@@ -189,6 +203,7 @@ app.get("/api/books/:bookId/chapters", (request, response) => {
 app.get("/api/books/:bookId/l1-indexes/coverage", (request, response, next) => {
   try {
     const settings = getPromptSettings();
+    const bookPrompts = getBookIndexPrompts(request.params.bookId);
     response.json({
       ok: true,
       coverage: getL1Coverage({
@@ -196,7 +211,7 @@ app.get("/api/books/:bookId/l1-indexes/coverage", (request, response, next) => {
         startChapter: request.query.start_chapter || request.query.startChapter || 1,
         endChapter: request.query.end_chapter || request.query.endChapter || 1,
         model: settings.model,
-        promptHash: l1IndexPromptHash(settings),
+        promptHash: bookL1IndexPromptHash(bookPrompts),
         windowSize: 10,
         includeWindows: false
       })
@@ -325,6 +340,48 @@ app.get("/api/books/:bookId/l2-facts", async (request, response, next) => {
   }
 });
 
+app.get("/api/books/:bookId/index-prompts", (request, response, next) => {
+  try {
+    const bookPrompts = getBookIndexPrompts(request.params.bookId);
+    const settings = getPromptSettings();
+    const chapters = listChapterMetadata(request.params.bookId);
+    const startChapter = chapters[0]?.chapter_index || 1;
+    const endChapter = chapters.at(-1)?.chapter_index || 1;
+    response.json({
+      ok: true,
+      indexPrompts: bookPrompts,
+      coverage: {
+        l1: getL1Coverage({
+          bookId: request.params.bookId,
+          startChapter,
+          endChapter,
+          model: settings.model,
+          promptHash: bookPrompts.l1_index_prompt_hash,
+          includeWindows: false
+        }),
+        l2: getL2IndexCoverageForBook({
+          bookId: request.params.bookId,
+          startChapter,
+          endChapter
+        })
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/books/:bookId/index-prompts", (request, response, next) => {
+  try {
+    response.json({
+      ok: true,
+      indexPrompts: updateBookIndexPrompts(request.params.bookId, request.body || {})
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/analyses", (request, response, next) => {
   try {
     const task = startAnalysisTask(request.body || {});
@@ -420,7 +477,13 @@ app.put("/api/index-prompts", (request, response, next) => {
 });
 
 app.get("/api/prompt-groups", (request, response) => {
-  response.json({ ok: true, promptGroups: listPromptGroups(request.query.category) });
+  const hasBookFilter = Object.hasOwn(request.query, "book_id") || Object.hasOwn(request.query, "bookId");
+  response.json({
+    ok: true,
+    promptGroups: listPromptGroups(hasBookFilter
+      ? { bookId: request.query.book_id ?? request.query.bookId ?? "", category: request.query.category }
+      : request.query.category)
+  });
 });
 
 app.post("/api/prompt-groups", (request, response, next) => {

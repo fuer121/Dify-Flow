@@ -16,8 +16,6 @@ export default function App() {
   const [config, setConfig] = useState(null);
   const [books, setBooks] = useState([]);
   const [prompts, setPrompts] = useState(null);
-  const [indexPrompts, setIndexPrompts] = useState(null);
-  const [promptGroups, setPromptGroups] = useState([]);
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState("");
   const [importTask, setImportTask] = useState(null);
@@ -129,18 +127,14 @@ export default function App() {
     setBusy(true);
     setError("");
     try {
-      const [configData, booksData, promptsData, indexPromptsData, promptGroupsData] = await Promise.all([
+      const [configData, booksData, promptsData] = await Promise.all([
         apiGet("/api/config"),
         apiGet("/api/books"),
-        apiGet("/api/prompts"),
-        apiGet("/api/index-prompts"),
-        apiGet("/api/prompt-groups")
+        apiGet("/api/prompts")
       ]);
       setConfig(configData.runtime);
       setBooks(booksData.books || []);
       setPrompts(promptsData.prompts);
-      setIndexPrompts(indexPromptsData.indexPrompts);
-      setPromptGroups(promptGroupsData.promptGroups || []);
     } catch (loadError) {
       setError(loadError.message);
     } finally {
@@ -194,13 +188,28 @@ export default function App() {
 
   async function reloadPromptGroups() {
     const data = await apiGet("/api/prompt-groups");
-    setPromptGroups(data.promptGroups || []);
     return data.promptGroups || [];
   }
 
-  async function saveIndexPrompts(payload) {
-    const data = await apiPut("/api/index-prompts", payload);
-    setIndexPrompts(data.indexPrompts);
+  async function loadPromptGroupsForBook(bookId) {
+    const query = bookId ? `?book_id=${encodeURIComponent(bookId)}` : "?book_id=";
+    const data = await apiGet(`/api/prompt-groups${query}`);
+    return data.promptGroups || [];
+  }
+
+  async function createBook(payload) {
+    const data = await apiPost("/api/books", payload);
+    await reloadBooks();
+    return data.book;
+  }
+
+  async function loadBookIndexPrompts(bookId) {
+    const data = await apiGet(`/api/books/${encodeURIComponent(bookId)}/index-prompts`);
+    return data;
+  }
+
+  async function saveBookIndexPrompts(bookId, payload) {
+    const data = await apiPut(`/api/books/${encodeURIComponent(bookId)}/index-prompts`, payload);
     return data.indexPrompts;
   }
 
@@ -393,7 +402,7 @@ export default function App() {
     ? `${(analysisProgress.completed || 0) + (analysisProgress.failed || 0) + (analysisProgress.skipped || 0)}/${analysisProgress.total} · ${analysisProgress.current || "后台分析中"}`
     : analysisProgress.current || "后台分析中";
 
-  if (busy || !config || !prompts || !indexPrompts) {
+  if (busy || !config || !prompts) {
     return <LoadingScreen />;
   }
 
@@ -477,7 +486,6 @@ export default function App() {
         <LibraryPage
           books={books}
           config={config}
-          indexPrompts={indexPrompts}
           importTask={importTask}
           importBusy={importBusy}
           l1Task={l1Task}
@@ -497,13 +505,29 @@ export default function App() {
           onL2Pause={() => controlL2("pause")}
           onL2Resume={() => controlL2("resume")}
           onBooksChanged={reloadBooks}
-          onIndexPromptsSave={saveIndexPrompts}
           setError={setError}
         />
       ) : route === "prompts" ? (
         <PromptLibraryPage
           books={books}
-          promptGroups={promptGroups}
+          config={config}
+          l1Task={l1Task}
+          l1Busy={l1Busy}
+          l2Task={l2Task}
+          l2Busy={l2Busy}
+          onCreateBook={createBook}
+          onBooksChanged={reloadBooks}
+          onLoadBookIndexPrompts={loadBookIndexPrompts}
+          onSaveBookIndexPrompts={saveBookIndexPrompts}
+          onStartL1Index={startL1Index}
+          onStartL2Index={startL2Index}
+          onL1Cancel={() => controlL1("cancel")}
+          onL1Pause={() => controlL1("pause")}
+          onL1Resume={() => controlL1("resume")}
+          onL2Cancel={() => controlL2("cancel")}
+          onL2Pause={() => controlL2("pause")}
+          onL2Resume={() => controlL2("resume")}
+          onLoadPromptGroups={loadPromptGroupsForBook}
           onPromptGroupsChanged={reloadPromptGroups}
           setError={setError}
         />
@@ -512,7 +536,7 @@ export default function App() {
           books={books}
           config={config}
           prompts={prompts}
-          promptGroups={promptGroups}
+          onLoadPromptGroups={loadPromptGroupsForBook}
           l1Task={l1Task}
           analysisTask={analysisTask}
           analysisBusy={analysisBusy}

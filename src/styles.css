@@ -459,6 +459,11 @@ h1 {
   gap: 14px;
 }
 
+.run-section {
+  display: grid;
+  grid-template-columns: minmax(320px, 0.52fr);
+}
+
 .panel {
   padding: 16px;
   border: 1px solid var(--line);
@@ -1222,8 +1227,12 @@ code {
   color: var(--warn);
 }
 
+.compact-banner {
+  margin-top: 12px;
+}
+
 .analysis-form-grid {
-  grid-template-columns: minmax(190px, 1.1fr) minmax(180px, 1fr) 0.54fr 0.54fr;
+  grid-template-columns: minmax(190px, 1.1fr) minmax(180px, 1fr) 0.54fr 0.54fr minmax(180px, 0.8fr);
 }
 
 .import-form-grid {
@@ -1539,6 +1548,7 @@ code {
   .layout,
   .library-layout,
   .analysis-layout,
+  .run-section,
   .prompt-library-layout,
   .split {
     grid-template-columns: 1fr;

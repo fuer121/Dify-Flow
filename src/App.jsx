@@ -521,7 +521,6 @@ export default function App() {
           onAnalysisCancel={() => controlAnalysis("cancel")}
           onAnalysisPause={() => controlAnalysis("pause")}
           onAnalysisResume={() => controlAnalysis("resume")}
-          onPromptsChanged={setPrompts}
           setError={setError}
         />
       )}

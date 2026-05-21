@@ -6,6 +6,7 @@ import {
   decryptChapterContent,
   decryptFinalAnalysisResult,
   ensureBook,
+  getBookIndexPrompts,
   getAnalysisChapterMetadata,
   getAnalysisRun,
   getExistingChapterIndexes,
@@ -14,8 +15,8 @@ import {
   getL2ChapterStatus,
   getL2Coverage,
   getPromptSettings,
-  l1IndexPromptHash,
-  l2IndexPromptHash,
+  bookL1IndexPromptHash,
+  bookL2IndexPromptHash,
   listL2Facts,
   listAnalysisChapterMetadata,
   listChapterMetadata,
@@ -299,9 +300,10 @@ async function runImportTask(task, { bookId, bookName, startChapter, endChapter,
 
 async function runL1IndexTask(task, { bookId, startChapter, endChapter, force }) {
   const promptSettings = getPromptSettings();
+  const bookPrompts = getBookIndexPrompts(bookId);
   const model = promptSettings.model;
   const reasoningEffort = promptSettings.reasoning_effort;
-  const indexPromptHash = l1IndexPromptHash(promptSettings);
+  const indexPromptHash = bookL1IndexPromptHash(bookPrompts);
   try {
     const chapters = listChapterMetadata(bookId)
       .filter((chapter) => chapter.chapter_index >= startChapter && chapter.chapter_index <= endChapter);
@@ -350,7 +352,7 @@ async function runL1IndexTask(task, { bookId, startChapter, endChapter, force })
             chapterIndex: chapter.chapter_index,
             title: chapter.title,
             content,
-            indexPrompt: promptSettings.l1_index_prompt
+            indexPrompt: bookPrompts.l1_index_prompt
           }),
           schema: l1ChapterIndexSchema(),
           schemaName: "l1_chapter_index"
@@ -405,9 +407,10 @@ async function runL1IndexTask(task, { bookId, startChapter, endChapter, force })
 
 async function runL2IndexTask(task, { bookId, startChapter, endChapter, force, mode }) {
   const promptSettings = getPromptSettings();
+  const bookPrompts = getBookIndexPrompts(bookId);
   const model = promptSettings.model;
   const reasoningEffort = promptSettings.reasoning_effort;
-  const indexPromptHash = l2IndexPromptHash(promptSettings);
+  const indexPromptHash = bookL2IndexPromptHash(bookPrompts);
   try {
     const chapters = listChapterMetadata(bookId)
       .filter((chapter) => chapter.chapter_index >= startChapter && chapter.chapter_index <= endChapter);
@@ -479,7 +482,7 @@ async function runL2IndexTask(task, { bookId, startChapter, endChapter, force, m
             title: chapter.title,
             content,
             l1Index,
-            indexPrompt: promptSettings.l2_index_prompt
+            indexPrompt: bookPrompts.l2_index_prompt
           }),
           schema: l2ChapterFactsSchema(),
           schemaName: "l2_chapter_facts"
@@ -815,7 +818,8 @@ async function executeIndexAnalysisTask(task, { analysisId, bookId, startChapter
   const selectedIndexes = chapters.map((chapter) => chapter.chapter_index);
   const categories = inferL2CategoriesFromPrompt(settings.summary_prompt);
   const entityQuery = inferEntityQueryFromPrompt(settings.summary_prompt);
-  const indexPromptHash = l2IndexPromptHash(settings);
+  const bookPrompts = getBookIndexPrompts(bookId);
+  const indexPromptHash = bookL2IndexPromptHash(bookPrompts);
   await waitIfPaused(task);
   updateTask(task, {
     progress: { ...task.progress, current: "L2 召回事实" },
@@ -864,7 +868,7 @@ async function executeIndexAnalysisTask(task, { analysisId, bookId, startChapter
         title: chapter.title,
         content,
         l1Index: null,
-        indexPrompt: settings.l2_index_prompt
+        indexPrompt: bookPrompts.l2_index_prompt
       }),
       schema: l2ChapterFactsSchema(),
       schemaName: "l2_source_review"
@@ -1560,12 +1564,13 @@ export function publicAnalysisRun(run) {
 
 export function getL2IndexCoverageForBook({ bookId, startChapter, endChapter }) {
   const settings = getPromptSettings();
+  const bookPrompts = getBookIndexPrompts(bookId);
   return getL2Coverage({
     bookId,
     startChapter,
     endChapter,
     model: settings.model,
-    promptHash: l2IndexPromptHash(settings),
+    promptHash: bookL2IndexPromptHash(bookPrompts),
     schemaVersion: L2_SCHEMA_VERSION
   });
 }

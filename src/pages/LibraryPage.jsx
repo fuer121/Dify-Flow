@@ -3,8 +3,6 @@ import {
   BookOpen,
   Database,
   Layers,
-  Lock,
-  LockOpen,
   Loader2,
   Play,
   RefreshCcw,
@@ -36,7 +34,6 @@ const L2_CATEGORIES = [
 export function LibraryPage({
   books,
   config,
-  indexPrompts,
   importTask,
   importBusy,
   l1Task,
@@ -56,7 +53,6 @@ export function LibraryPage({
   onL2Pause,
   onL2Resume,
   onBooksChanged,
-  onIndexPromptsSave,
   setError
 }) {
   const initialBookId = importTask?.payload?.bookId || books[0]?.book_id || "";
@@ -65,7 +61,6 @@ export function LibraryPage({
   const [l1Chapters, setL1Chapters] = useState([]);
   const [l2Coverage, setL2Coverage] = useState(null);
   const [l2Facts, setL2Facts] = useState([]);
-  const [promptSaving, setPromptSaving] = useState({ l1: false, l2: false });
   const [importForm, setImportForm] = useState({
     ...initialImportForm,
     book_id: initialBookId,
@@ -187,22 +182,6 @@ export function LibraryPage({
     });
   }
 
-  async function saveIndexPrompt(type, prompt) {
-    setPromptSaving((state) => ({ ...state, [type]: true }));
-    setError("");
-    try {
-      const payload = type === "l1"
-        ? { l1_index_prompt: prompt }
-        : { l2_index_prompt: prompt };
-      await onIndexPromptsSave(payload);
-    } catch (error) {
-      setError(error.message);
-      throw error;
-    } finally {
-      setPromptSaving((state) => ({ ...state, [type]: false }));
-    }
-  }
-
   async function startL2Index(modeOverride) {
     if (!selectedBookId) {
       setError("请先选择一本书。");
@@ -249,6 +228,12 @@ export function LibraryPage({
       book_id: bookId,
       book_name: book?.book_name || ""
     });
+  }
+
+  function openPromptManager(section = "index") {
+    if (!selectedBookId) return;
+    window.history.pushState({}, "", `/prompts?book_id=${encodeURIComponent(selectedBookId)}&section=${encodeURIComponent(section)}`);
+    window.dispatchEvent(new PopStateEvent("popstate"));
   }
 
   return (
@@ -375,13 +360,11 @@ export function LibraryPage({
             coverage={l1Coverage}
             chapters={l1Chapters}
           />
-          <IndexPromptEditor
-            key={`l1-${indexPrompts.l1_index_prompt_hash}`}
-            title="L1 构建 Prompt"
-            value={indexPrompts.l1_index_prompt}
-            hash={indexPrompts.l1_index_prompt_hash}
-            saving={promptSaving.l1}
-            onSave={(prompt) => saveIndexPrompt("l1", prompt)}
+          <IndexPromptStatus
+            title="L1 Prompt 状态"
+            purpose="逐章建立摘要、关键词、实体、关键事件和伏笔线索。"
+            coverage={l1Coverage}
+            onManage={() => openPromptManager("index")}
           />
           <button className="primary" type="button" onClick={startL1Index} disabled={l1Busy || !selectedBookId || !config.openaiConfigured}>
             {l1Busy ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
@@ -445,13 +428,11 @@ export function LibraryPage({
             </label>
           </div>
           <L2CoverageSummary coverage={l2Coverage} />
-          <IndexPromptEditor
-            key={`l2-${indexPrompts.l2_index_prompt_hash}`}
-            title="L2 构建 Prompt"
-            value={indexPrompts.l2_index_prompt}
-            hash={indexPrompts.l2_index_prompt_hash}
-            saving={promptSaving.l2}
-            onSave={(prompt) => saveIndexPrompt("l2", prompt)}
+          <IndexPromptStatus
+            title="L2 Prompt 状态"
+            purpose="建立可检索、可复用的类型化事实层，供分析任务二次提炼。"
+            coverage={l2Coverage}
+            onManage={() => openPromptManager("index")}
           />
           <div className="action-row wrap">
             <button className="primary" type="button" onClick={() => startL2Index()} disabled={l2Busy || !selectedBookId || !config.openaiConfigured}>
@@ -636,53 +617,25 @@ function L2FactPreview({ facts }) {
   );
 }
 
-function IndexPromptEditor({ title, value, hash, saving, onSave }) {
-  const [locked, setLocked] = useState(true);
-  const [draft, setDraft] = useState(value);
-  const shortHash = String(hash || "").slice(0, 10);
-
-  async function handleSave() {
-    try {
-      await onSave(draft);
-      setLocked(true);
-    } catch {
-      // The parent already shows the user-facing error.
-    }
-  }
-
+function IndexPromptStatus({ title, purpose, coverage, onManage }) {
+  const chapters = coverage?.chapters;
+  const ratio = chapters?.total ? Math.round((Number(chapters.completed || 0) / Number(chapters.total || 1)) * 100) : 0;
+  const stale = Number(chapters?.outdated || 0);
   return (
-    <div className="index-prompt-card">
+    <div className="index-prompt-card index-prompt-status-card">
       <div className="index-prompt-head">
         <div>
           <h3>{title}</h3>
-          <small>Hash {shortHash || "-"}</small>
+          <small>{stale ? `可能过期 ${stale} 章` : "当前范围未检测到过期索引"}</small>
         </div>
-        <button
-          className="secondary inline"
-          type="button"
-          onClick={() => {
-            if (!locked) setDraft(value);
-            setLocked((state) => !state);
-          }}
-        >
-          {locked ? <Lock size={15} /> : <LockOpen size={15} />}
-          {locked ? "解锁编辑" : "锁定"}
+        <button className="secondary inline" type="button" onClick={onManage}>
+          管理索引 Prompt
         </button>
       </div>
-      <textarea
-        value={draft}
-        readOnly={locked}
-        onChange={(event) => setDraft(event.target.value)}
-        aria-label={title}
-      />
-      {!locked ? (
-        <div className="action-row wrap">
-          <button className="primary inline" type="button" onClick={handleSave} disabled={saving}>
-            {saving ? <Loader2 className="spin" size={15} /> : null}
-            保存 Prompt
-          </button>
-        </div>
-      ) : null}
+      <p className="index-prompt-description">{purpose}</p>
+      <div className={stale ? "inline-warning" : "muted-line"}>
+        {chapters ? `覆盖已导入章节 ${chapters.completed}/${chapters.total} · ${ratio}%` : "覆盖率读取中"}
+      </div>
     </div>
   );
 }

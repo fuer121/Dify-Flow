@@ -72,6 +72,7 @@ test("encrypts chapter content and stores only metadata in plain SQLite rows", a
 test("binds one book name to each novel id", () => {
   const first = db.ensureBook("named-book", "第一本书");
   assert.equal(first.book_name, "第一本书");
+  assert.equal(db.getBookIndexPrompts("named-book").book_id, "named-book");
 
   const same = db.ensureBook("named-book", "第一本书");
   assert.equal(same.book_name, "第一本书");
@@ -557,10 +558,17 @@ test("builds L2 indexes, skips fresh facts, and keeps requests ZDR-shaped", asyn
   }
 });
 
-test("custom index prompts are saved, used by L1/L2 tasks, and change freshness hash", async () => {
+test("book index prompts are saved, used by L1/L2 tasks, and change freshness hash", async () => {
   const customL1 = "自定义 L1 Prompt：只提炼人物与事件。";
   const customL2 = "自定义 L2 Prompt：只提炼可检索事实。";
-  const saved = db.saveIndexPromptSettings({
+  await db.saveEncryptedChapter({
+    bookId: "book-index-prompt",
+    chapterIndex: 1,
+    title: "第一章",
+    content: "陈平安得到木剑。"
+  });
+
+  const saved = db.updateBookIndexPrompts("book-index-prompt", {
     l1_index_prompt: customL1,
     l2_index_prompt: customL2
   });
@@ -568,13 +576,6 @@ test("custom index prompts are saved, used by L1/L2 tasks, and change freshness 
   assert.equal(saved.l2_index_prompt, customL2);
   assert.notEqual(saved.l1_index_prompt_hash, "l1-v1-chapter-window-10");
   assert.notEqual(saved.l2_index_prompt_hash, "l2-v1-typed-facts");
-
-  await db.saveEncryptedChapter({
-    bookId: "book-index-prompt",
-    chapterIndex: 1,
-    title: "第一章",
-    content: "陈平安得到木剑。"
-  });
 
   const previousFetch = global.fetch;
   const capturedBodies = [];
@@ -656,7 +657,10 @@ test("custom index prompts are saved, used by L1/L2 tasks, and change freshness 
 });
 
 test("creates, edits, lists, and deletes prompt groups with categories", () => {
+  db.ensureBook("prompt-book", "测试书籍");
+  db.ensureBook("other-prompt-book", "另一书籍");
   const created = db.createPromptGroup({
+    book_id: "prompt-book",
     name: "角色定位 Prompt",
     category: "测试书籍",
     chapter_prompt: "逐章提取角色身份",
@@ -664,16 +668,20 @@ test("creates, edits, lists, and deletes prompt groups with categories", () => {
   });
 
   assert.equal(created.name, "角色定位 Prompt");
+  assert.equal(created.book_id, "prompt-book");
   assert.equal(created.category, "测试书籍");
-  assert.equal(db.listPromptGroups("测试书籍").some((group) => group.id === created.id), true);
+  assert.equal(db.listPromptGroups({ bookId: "prompt-book" }).some((group) => group.id === created.id), true);
+  assert.equal(db.listPromptGroups({ bookId: "other-prompt-book" }).some((group) => group.id === created.id), false);
 
   const updated = db.updatePromptGroup(created.id, {
     name: "角色定位 Prompt v2",
-    category: "通用",
+    book_id: "prompt-book",
+    category: "测试书籍",
     summary_prompt: "重新汇总角色身份"
   });
   assert.equal(updated.name, "角色定位 Prompt v2");
-  assert.equal(updated.category, "通用");
+  assert.equal(updated.book_id, "prompt-book");
+  assert.equal(updated.category, "测试书籍");
   assert.equal(updated.chapter_prompt, "逐章提取角色身份");
   assert.equal(updated.summary_prompt, "重新汇总角色身份");
 
@@ -682,13 +690,16 @@ test("creates, edits, lists, and deletes prompt groups with categories", () => {
 });
 
 test("analysis prompt groups can save summary prompt without chapter prompt", () => {
+  db.ensureBook("analysis-prompt-book", "分析书籍");
   const created = db.createPromptGroup({
+    book_id: "analysis-prompt-book",
     name: "势力关系分析",
-    category: "通用",
+    category: "分析书籍",
     summary_prompt: "只分析宗门势力关系"
   });
 
   assert.equal(created.name, "势力关系分析");
+  assert.equal(created.book_id, "analysis-prompt-book");
   assert.equal(created.summary_prompt, "只分析宗门势力关系");
   assert.equal(created.chapter_prompt, "");
 

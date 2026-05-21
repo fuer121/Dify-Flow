@@ -4,17 +4,15 @@ import {
   ChevronRight,
   Copy,
   FileText,
-  Gauge,
   Layers,
   Loader2,
   Plus,
   Play,
   RefreshCcw,
-  Settings2,
   Table2,
   Trash2
 } from "lucide-react";
-import { apiDelete, apiGet, apiPut, formatTime } from "../api.js";
+import { apiDelete, apiGet, formatTime } from "../api.js";
 import { ChapterTable, IconButton, Panel, ResultActions, StatusPill, TaskBox } from "../ui.jsx";
 import {
   normalizePrompt,
@@ -44,7 +42,6 @@ export function AnalysisPage({
   onAnalysisCancel,
   onAnalysisPause,
   onAnalysisResume,
-  onPromptsChanged,
   setError
 }) {
   const [analyses, setAnalyses] = useState([]);
@@ -65,8 +62,7 @@ export function AnalysisPage({
   const [selectionOverrideToken, setSelectionOverrideToken] = useState(0);
   const [chaptersExpanded, setChaptersExpanded] = useState(false);
   const [selectedAnalysis, setSelectedAnalysis] = useState(null);
-  const [busy, setBusy] = useState({ analysis: false, prompts: false, chapters: false, list: false });
-  const [advancedPromptExpanded, setAdvancedPromptExpanded] = useState(false);
+  const [busy, setBusy] = useState({ analysis: false, chapters: false, list: false });
 
   useEffect(() => {
     if (analysisTask?.result?.analysisId && selectedAnalysis?.id === analysisTask.result.analysisId) {
@@ -123,11 +119,6 @@ export function AnalysisPage({
     () => summarizeSelection(selectedIndexes, chaptersInRange.length, l1Coverage),
     [selectedIndexes, chaptersInRange.length, l1Coverage]
   );
-  const promptDirty = useMemo(
-    () => isPromptDirty(promptDraft, defaultPrompt),
-    [promptDraft, defaultPrompt]
-  );
-
   useEffect(() => {
     if (!analysisForm.book_id || !validChapterNumber(analysisForm.start_chapter) || !validChapterNumber(analysisForm.end_chapter)) {
       return;
@@ -270,43 +261,32 @@ export function AnalysisPage({
   async function copyAnalysis(id) {
     const analysis = await loadAnalysisResult(id);
     if (!analysis) return;
+    const analysisPrompt = normalizePrompt(analysis.prompt || prompts);
     setAnalysisForm({
+      ...initialAnalysisForm,
       name: `${analysis.name || "分析任务"} 复制`,
       book_id: analysis.book_id,
       start_chapter: String(analysis.start_chapter),
-      end_chapter: String(analysis.end_chapter)
+      end_chapter: String(analysis.end_chapter),
+      analysis_mode: analysisPrompt.analysis_mode || analysis.source_stats?.analysis_mode || initialAnalysisForm.analysis_mode,
+      source_review_budget: analysisPrompt.source_review_budget === undefined || analysisPrompt.source_review_budget === null
+        ? ""
+        : String(analysisPrompt.source_review_budget)
     });
     selectionOverrideRef.current = analysis.chapter_indexes || [];
     setSelectionOverrideToken((value) => value + 1);
-    if (analysis.prompt) setPromptDraft(normalizePrompt(analysis.prompt));
-  }
-
-  async function savePrompts() {
-    setBusy((state) => ({ ...state, prompts: true }));
-    setError("");
-    try {
-      const data = await apiPut("/api/prompts", {
-        ...promptDraft,
-        output_schema: outputSchemaForPrompt(promptDraft)
-      });
-      onPromptsChanged(data.prompts);
-      setPromptDraft(normalizePrompt(data.prompts));
-    } catch (error) {
-      setError(error.message);
-    } finally {
-      setBusy((state) => ({ ...state, prompts: false }));
-    }
+    setSelectedPromptGroupId("__snapshot__");
+    setPromptDraft(analysisPrompt);
   }
 
   function applyPromptGroup(groupId) {
     setSelectedPromptGroupId(groupId);
     const group = promptGroups.find((entry) => entry.id === groupId);
-    if (!group) return;
-    setPromptDraft((current) => ({
-      ...current,
-      name: group.name,
-      summary_prompt: group.summary_prompt
-    }));
+    setPromptDraft((current) => (
+      group
+        ? { ...current, name: group.name, summary_prompt: group.summary_prompt }
+        : defaultPrompt
+    ));
   }
 
   function updateAnalysisForm(patch) {
@@ -425,6 +405,25 @@ export function AnalysisPage({
                 disabled={analysisForm.analysis_mode === "fast_index" || analysisForm.analysis_mode === "full_text"}
               />
             </label>
+            <label>
+              <span>分析 Prompt</span>
+              <select value={selectedPromptGroupId} onChange={(event) => applyPromptGroup(event.target.value)}>
+                <option value="">默认分析 Prompt</option>
+                {selectedPromptGroupId === "__snapshot__" ? (
+                  <option value="__snapshot__">历史任务 Prompt 快照</option>
+                ) : null}
+                {promptGroups.map((group) => (
+                  <option key={group.id} value={group.id}>{group.category} · {group.name}</option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <div className="draft-banner compact-banner">
+            {selectedPromptGroupId === "__snapshot__"
+              ? `当前任务将使用历史任务快照：${promptDraft.name || "未命名分析 Prompt"}。如需修改，请到 Prompt 库维护后重新选择。`
+              : selectedPromptGroupId
+              ? `当前任务将使用：${promptDraft.name || "未命名分析 Prompt"}。Prompt 内容请在 Prompt 库维护。`
+              : "当前任务将使用默认分析 Prompt。Prompt 内容请在 Prompt 库维护。"}
           </div>
 
           <div className="selector-card">
@@ -476,22 +475,7 @@ export function AnalysisPage({
           </div>
         </Panel>
 
-        <div className="split">
-          <Panel icon={Settings2} title="分析 Prompt">
-            <PromptEditor
-              prompt={promptDraft}
-              promptGroups={promptGroups}
-              selectedPromptGroupId={selectedPromptGroupId}
-              onPromptGroupChange={applyPromptGroup}
-              onChange={setPromptDraft}
-              onSave={savePrompts}
-              busy={busy.prompts}
-              dirty={promptDirty}
-              advancedExpanded={advancedPromptExpanded}
-              onAdvancedExpandedChange={setAdvancedPromptExpanded}
-            />
-          </Panel>
-
+        <div className="run-section">
           <Panel icon={Play} title="运行">
             <button
               className="primary"
@@ -582,22 +566,6 @@ function summarizeSelection(selectedIndexes, totalInRange, coverage) {
   return `${selectedText} · ${suffix}`;
 }
 
-function isPromptDirty(left, right) {
-  return JSON.stringify({
-    name: left.name,
-    model: left.model,
-    reasoning_effort: left.reasoning_effort,
-    chapter_prompt: left.chapter_prompt,
-    summary_prompt: left.summary_prompt
-  }) !== JSON.stringify({
-    name: right.name,
-    model: right.model,
-    reasoning_effort: right.reasoning_effort,
-    chapter_prompt: right.chapter_prompt,
-    summary_prompt: right.summary_prompt
-  });
-}
-
 function AnalysisHistory({ analyses, books, selectedId, onSelect, onCopy, onDelete }) {
   if (!analyses.length) return <div className="history-empty">暂无分析任务</div>;
   const bookNames = new Map(books.map((book) => [book.book_id, book.book_name || book.book_id]));
@@ -621,89 +589,6 @@ function AnalysisHistory({ analyses, books, selectedId, onSelect, onCopy, onDele
           </div>
         </div>
       ))}
-    </div>
-  );
-}
-
-function PromptEditor({
-  prompt,
-  promptGroups,
-  selectedPromptGroupId,
-  onPromptGroupChange,
-  onChange,
-  onSave,
-  busy,
-  dirty,
-  advancedExpanded,
-  onAdvancedExpandedChange
-}) {
-  function updatePrompt(patch) {
-    onChange((current) => ({ ...current, ...patch }));
-  }
-
-  return (
-    <div className="prompt-editor">
-      <div className={dirty ? "draft-banner active" : "draft-banner"}>
-        {dirty ? "当前 Prompt 已修改。开始分析会使用这份草稿；保存后才会更新默认 Prompt。" : "当前使用默认 Prompt 或已保存分析 Prompt。"}
-      </div>
-      <label>
-        <span>选择分析 Prompt</span>
-        <select value={selectedPromptGroupId} onChange={(event) => onPromptGroupChange(event.target.value)}>
-          <option value="">手动编辑当前分析 Prompt</option>
-          {promptGroups.map((group) => (
-            <option key={group.id} value={group.id}>{group.category} · {group.name}</option>
-          ))}
-        </select>
-      </label>
-
-      <div className="form-grid compact">
-        <label>
-          <span>名称</span>
-          <input value={prompt.name} onChange={(event) => updatePrompt({ name: event.target.value })} />
-        </label>
-        <label>
-          <span>模型</span>
-          <input value={prompt.model} onChange={(event) => updatePrompt({ model: event.target.value })} />
-        </label>
-        <label>
-          <span>推理强度</span>
-          <select value={prompt.reasoning_effort} onChange={(event) => updatePrompt({ reasoning_effort: event.target.value })}>
-            {["none", "low", "medium", "high", "xhigh"].map((value) => (
-              <option key={value} value={value}>{value}</option>
-            ))}
-          </select>
-        </label>
-      </div>
-
-      <label>
-        <span>分析 Prompt</span>
-        <textarea value={prompt.summary_prompt} onChange={(event) => updatePrompt({ summary_prompt: event.target.value })} />
-      </label>
-
-      <div className="selector-card prompt-advanced-card">
-        <button
-          type="button"
-          className="selector-summary"
-          onClick={() => onAdvancedExpandedChange((value) => !value)}
-        >
-          <span className="selector-summary-title">
-            {advancedExpanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-            高级逐章 Prompt
-          </span>
-          <span>主要用于全文精读</span>
-        </button>
-        {advancedExpanded ? (
-          <label className="prompt-advanced-field">
-            <span>逐章 Prompt</span>
-            <textarea value={prompt.chapter_prompt} onChange={(event) => updatePrompt({ chapter_prompt: event.target.value })} />
-          </label>
-        ) : null}
-      </div>
-
-      <button className="secondary" type="button" onClick={onSave} disabled={busy}>
-        {busy ? <Loader2 className="spin" size={16} /> : <Gauge size={16} />}
-        保存为默认 Prompt
-      </button>
     </div>
   );
 }

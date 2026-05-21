@@ -165,7 +165,7 @@ SQLite 数据目录：`data/`
   - 支持任务级 Prompt/Schema 快照
   - 支持可选 L1 逐章上下文
   - 章节选择收起态会显示已选章节数、L1 缺失数和 L1 失败数
-  - Prompt 编辑区会提示当前草稿是否未保存
+  - 创建任务时只选择分析 Prompt；Prompt 正文统一在 `/prompts` 维护
   - 最终结果如果 `finalResult.items` 可表格化，则表格展示，否则回退到 JSON/文本展示
 
 - `/library`：书籍章节库
@@ -281,8 +281,9 @@ Prompt：
 ### 分析任务
 
 - 默认分析路径已改为 `analysis_mode=balanced`：先从 L2 类型化事实索引召回，再按预算复核少量高风险原文章节。
-- 分析页的 Prompt 配置以分析 Prompt 为主；选择 `/prompts` 中的条目时，只覆盖最终分析/汇总用的 `summary_prompt`，不覆盖逐章 Prompt。
-- 逐章 Prompt 保留为高级兼容项，默认收起，主要服务 `full_text` 或明确需要逐章精读的场景。
+- 分析页创建任务时只选择分析 Prompt，不直接编辑 Prompt 正文；Prompt 正文统一在 `/prompts` 管理。
+- 选择 `/prompts` 中的条目时，只覆盖最终分析/汇总用的 `summary_prompt`，不覆盖逐章 Prompt。
+- 逐章 Prompt 保留为后端兼容字段，主要服务旧任务快照和 `full_text` 路径；当前创建任务页面不再提供主界面编辑入口。
 - 分析模式、复核预算、输出格式仍属于创建分析任务模块，不进入分析 Prompt 库。
 - 主体关键词、分析维度和筛选目标由用户写进分析 Prompt，不做单独下拉字段。
 - `use_l1_context=false` 是默认值。
@@ -571,6 +572,11 @@ npm run preview:local
 - 预览服务可以随时重启，不影响线上 `5184` 正在运行的任务。
 
 ## 15. 变更记录
+
+- 2026-05-20：
+  - 分析任务创建页移除独立“分析 Prompt”编辑面板。
+  - “分析 Prompt”选择移动到创建任务表单内；创建任务只选择已在 Prompt 库维护好的分析 Prompt。
+  - Prompt 正文继续统一在 `/prompts` 维护，任务运行时保存所选 Prompt 快照。
 
 - 2026-05-20：
   - Checkpoint 当前项目基线：正式服务运行在 `0cb303c Refocus prompt library on analysis prompts`。

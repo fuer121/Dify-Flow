@@ -718,6 +718,14 @@ test("imports once, skips stored chapters, and analyzes from encrypted local sto
   let openaiCalls = 0;
 
   global.fetch = async (url, request) => {
+    if (String(url).includes("/parameters")) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ user_input_form: [] })
+      };
+    }
+
     if (String(url).includes("/workflows/run")) {
       difyCalls += 1;
       const body = JSON.parse(request.body);
@@ -798,6 +806,40 @@ test("imports once, skips stored chapters, and analyzes from encrypted local sto
     assert.equal(openaiCalls, 4);
     const result = await workflows.publicAnalysisRunWithResult(analysis.id);
     assert.equal(result.finalResult.summary, "全书摘要");
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("import preflights Dify token before running chapter batches", async () => {
+  const previousFetch = global.fetch;
+  let workflowCalls = 0;
+
+  global.fetch = async (url) => {
+    if (String(url).includes("/parameters")) {
+      return {
+        ok: false,
+        status: 401,
+        text: async () => JSON.stringify({ code: "unauthorized", message: "Access token is invalid" })
+      };
+    }
+    if (String(url).includes("/workflows/run")) {
+      workflowCalls += 1;
+    }
+    throw new Error(`Unexpected fetch URL: ${url}`);
+  };
+
+  try {
+    const task = workflows.startImportTask({
+      book_id: "book-dify-token",
+      start_chapter: 1,
+      end_chapter: 3
+    });
+    await waitForTerminalTask(task);
+    assert.equal(task.status, "failed");
+    assert.equal(workflowCalls, 0);
+    assert.match(task.error, /Dify .*鉴权失败/);
+    assert.match(task.error, /DIFY_CHAPTER_WORKFLOW_API_KEY/);
   } finally {
     global.fetch = previousFetch;
   }
@@ -2074,15 +2116,20 @@ test("rejects placeholder final summary and keeps run resumable", async () => {
 });
 
 async function waitForTask(task) {
+  await waitForTerminalTask(task);
+  if (task.status === "failed") {
+    throw new Error(task.error || "task failed");
+  }
+  return task;
+}
+
+async function waitForTerminalTask(task) {
   const started = Date.now();
   while (!["completed", "failed", "cancelled"].includes(task.status)) {
     if (Date.now() - started > 10000) {
       throw new Error(`Task timeout: ${task.id}`);
     }
     await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  if (task.status === "failed") {
-    throw new Error(task.error || "task failed");
   }
   return task;
 }

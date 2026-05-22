@@ -37,7 +37,7 @@ import {
   updateAnalysisRun,
   updateBookImportStatus
 } from "./db.js";
-import { buildChapterBatches, fetchChapterBatch } from "./dify.js";
+import { buildChapterBatches, fetchChapterBatch, testDifyConnection } from "./dify.js";
 import {
   buildChapterInput,
   buildCompressedSummaryInput,
@@ -206,6 +206,11 @@ async function runImportTask(task, { bookId, bookName, startChapter, endChapter,
         current: "准备导入"
       }
     });
+    updateTask(task, {
+      progress: { ...task.progress, current: "检查 Dify 配置" },
+      message: "正在检查 Dify 工作流 API Key"
+    });
+    await testDifyConnection();
 
     const existing = force ? new Set() : getExistingChapterIndexes(bookId, startChapter, endChapter);
     const batches = buildChapterBatches(startChapter, endChapter);

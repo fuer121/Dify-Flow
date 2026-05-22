@@ -40,7 +40,7 @@ export async function fetchChapterBatch({ bookId, startChapter, endChapter }) {
 
   const { data, text } = await readDifyResponse(response);
   if (!response.ok) {
-    const error = new Error(sanitizeText(data?.message || data?.error || text || `Dify 调用失败：HTTP ${response.status}`));
+    const error = new Error(difyErrorMessage(response.status, data?.message || data?.error || text || `Dify 调用失败：HTTP ${response.status}`, "workflow"));
     error.status = response.status;
     error.details = sanitizeDetails(data || { status: response.status, message: text });
     throw error;
@@ -68,7 +68,7 @@ export async function testDifyConnection() {
 
   const { data, text } = await readDifyResponse(response);
   if (!response.ok) {
-    const error = new Error(sanitizeText(data?.message || data?.error || text || `Dify 连通性测试失败：HTTP ${response.status}`));
+    const error = new Error(difyErrorMessage(response.status, data?.message || data?.error || text || `Dify 连通性测试失败：HTTP ${response.status}`, "parameters"));
     error.status = response.status;
     error.details = sanitizeDetails(data || { status: response.status, message: text });
     throw error;
@@ -136,6 +136,15 @@ function parseJsonText(text) {
   } catch {
     return null;
   }
+}
+
+function difyErrorMessage(status, message, phase) {
+  const safeMessage = sanitizeText(message);
+  if (status === 401 || status === 403) {
+    const action = phase === "parameters" ? "连通性测试" : "工作流调用";
+    return `Dify ${action}鉴权失败：当前 DIFY_CHAPTER_WORKFLOW_API_KEY 无效或不属于当前 DIFY_API_BASE。请在自托管 Dify 的目标工作流中重新复制 API Key，并确认 DIFY_API_BASE 指向同一个 Dify 服务。底层错误：${safeMessage}`;
+  }
+  return safeMessage;
 }
 
 function extractChapters(value) {

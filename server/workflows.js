@@ -1,13 +1,18 @@
+import crypto from "node:crypto";
+
 import {
   createAnalysisRun,
   decryptAnalysisChapterResult,
+  decryptAnalysisSummaryPartResult,
   decryptCompletedAnalysisChapterResults,
   decryptAnalysisPromptSnapshot,
   decryptChapterContent,
   decryptFinalAnalysisResult,
   ensureBook,
+  getBook,
   getBookIndexPrompts,
   getAnalysisChapterMetadata,
+  getAnalysisSummaryPartMetadata,
   getAnalysisRun,
   getExistingChapterIndexes,
   getL1ChapterIndex,
@@ -19,6 +24,7 @@ import {
   bookL2IndexPromptHash,
   listL2Facts,
   listAnalysisChapterMetadata,
+  listAnalysisSummaryPartMetadata,
   listChapterMetadata,
   listL1ChapterIndexes,
   normalizeBookId,
@@ -28,6 +34,7 @@ import {
   normalizeRange,
   promptHash,
   saveAnalysisChapter,
+  saveAnalysisSummaryPart,
   saveEncryptedChapter,
   saveFinalAnalysisResult,
   saveL1ChapterIndex,
@@ -40,11 +47,8 @@ import {
 import { buildChapterBatches, fetchChapterBatch, testDifyConnection } from "./dify.js";
 import {
   buildChapterInput,
-  buildCompressedSummaryInput,
   buildL1ChapterInput,
   buildL2ChapterInput,
-  buildIndexSummaryInput,
-  buildSummaryInput,
   callOpenAIJson,
   callOpenAIText,
   chapterResultSchema,
@@ -65,8 +69,10 @@ import {
 } from "./tasks.js";
 import { sanitizeText } from "./sanitize.js";
 
-const DIRECT_SUMMARY_MAX_CHARS = 80_000;
 const SUMMARY_COMPACT_TARGET_CHARS = 18_000;
+const SUMMARY_PART_INPUT_MAX_CHARS = 18_000;
+const EVIDENCE_PACKET_CONTENT_CHARS = 260;
+const EVIDENCE_PACKET_EVIDENCE_CHARS = 120;
 const SUMMARY_FINAL_MAX_OUTPUT_TOKENS = 4500;
 const CUSTOM_FIELD_SUMMARY_MAX_OUTPUT_TOKENS = 3000;
 const SUMMARY_STAGE_MAX_ATTEMPTS = 3;
@@ -444,7 +450,7 @@ async function runL2IndexTask(task, { bookId, startChapter, endChapter, force, m
         && existing.model === model
         && existing.prompt_hash === indexPromptHash
         && existing.schema_version === L2_SCHEMA_VERSION;
-      if (!force && mode === "retry_failed" && existing?.status !== "failed") {
+      if (mode === "retry_failed" && existing?.status !== "failed") {
         task.progress.skipped += 1;
         updateTask(task, {
           progress: { ...task.progress, current: `跳过章节 ${chapter.chapter_index}` },
@@ -452,7 +458,7 @@ async function runL2IndexTask(task, { bookId, startChapter, endChapter, force, m
         });
         continue;
       }
-      if (!force && mode === "missing" && existing) {
+      if (mode === "missing" && existing) {
         task.progress.skipped += 1;
         updateTask(task, {
           progress: { ...task.progress, current: `跳过章节 ${chapter.chapter_index}` },
@@ -564,6 +570,11 @@ async function runAnalysisTask(task, options) {
 
 async function prepareNewAnalysis(analysisId, { name, bookId, startChapter, endChapter, chapterIndexes, promptPatch, useL1Context, analysisMode, sourceReviewBudget }) {
   const settings = normalizePromptSettings({ ...getPromptSettings(), ...promptPatch });
+  validateAnalysisPromptBeforeRun({
+    settings,
+    bookId,
+    taskName: name || settings.name || ""
+  });
   const chapters = resolveSelectedChapters({ bookId, startChapter, endChapter, chapterIndexes });
   if (chapters.length === 0) {
     const error = new Error("本地章节库没有可分析的章节，请先导入章节原文。");
@@ -623,6 +634,11 @@ async function prepareResumedAnalysis(run) {
     throw error;
   }
   const normalizedSettings = normalizePromptSettings(settings);
+  validateAnalysisPromptBeforeRun({
+    settings: normalizedSettings,
+    bookId: run.book_id,
+    taskName: run.name || normalizedSettings.name || ""
+  });
   const selection = parseChapterSelection(run);
   const chapters = resolveSelectedChapters({
     bookId: run.book_id,
@@ -644,6 +660,27 @@ async function prepareResumedAnalysis(run) {
     outputSchemaHash: run.schema_hash || schemaHash(normalizedSettings),
     resume: true
   };
+}
+
+function validateAnalysisPromptBeforeRun({ settings, bookId, taskName }) {
+  const finalSchema = deriveFinalSummarySchema({
+    userPrompt: settings.summary_prompt,
+    configuredSchema: parseOutputSchemaOrNull(settings.output_schema)
+  });
+  if (!shouldSplitCustomFinalSummary(finalSchema)) return;
+  const properties = finalSchema.schema?.properties || {};
+  const analysisContext = {
+    bookId,
+    bookName: getBook(bookId)?.book_name || "",
+    taskName
+  };
+  for (const [fieldName, fieldSchema] of Object.entries(properties)) {
+    if (!isAnalysisParameterField(fieldName, fieldSchema)) continue;
+    deterministicFinalFieldValue(fieldName, analysisContext, {
+      userPrompt: settings.summary_prompt,
+      fieldSchema
+    });
+  }
 }
 
 async function executeAnalysisTask(task, prepared) {
@@ -791,7 +828,9 @@ async function executeAnalysisTask(task, prepared) {
   });
 
   const summary = await summarizeAnalysisResults({
+    analysisId,
     task,
+    analysisContext: { bookId, bookName: getBook(bookId)?.book_name || "", taskName: task.payload?.name || settings.name || "" },
     model,
     reasoningEffort,
     chapterResults,
@@ -822,35 +861,103 @@ async function executeAnalysisTask(task, prepared) {
 async function executeIndexAnalysisTask(task, { analysisId, bookId, startChapter, endChapter, chapters, settings, model, reasoningEffort, outputSchemaHash, analysisMode, sourceReviewBudget }) {
   const selectedIndexes = chapters.map((chapter) => chapter.chapter_index);
   const categories = inferL2CategoriesFromPrompt(settings.summary_prompt);
-  const entityQuery = inferEntityQueryFromPrompt(settings.summary_prompt);
+  const entityQueries = inferEntityQueriesFromPrompt(settings.summary_prompt, bookId);
+  const primaryEntityQuery = entityQueries[0] || "";
   const bookPrompts = getBookIndexPrompts(bookId);
+  const l1PromptHash = bookL1IndexPromptHash(bookPrompts);
   const indexPromptHash = bookL2IndexPromptHash(bookPrompts);
   await waitIfPaused(task);
   updateTask(task, {
-    progress: { ...task.progress, current: "L2 召回事实" },
-    message: "正在从本地 L2 索引召回相关事实"
+    progress: { ...task.progress, current: "L1 路标扫描" },
+    message: "正在按 L1 路标筛选相关章节"
   });
 
-  const facts = (await listL2Facts({
+  const l1Indexes = listL1ChapterIndexes(bookId, startChapter, endChapter)
+    .filter((index) => selectedIndexes.includes(index.chapter_index));
+  const l1FreshChapterSet = new Set(l1Indexes
+    .filter((index) => {
+      const chapter = chapters.find((entry) => entry.chapter_index === index.chapter_index);
+      return index.status === "completed"
+        && chapter
+        && index.source_hmac === chapter.content_hmac
+        && index.model === model
+        && index.prompt_hash === l1PromptHash;
+    })
+    .map((index) => index.chapter_index));
+  const l1MatchedIndexes = selectChaptersByL1Route({
+    l1Indexes: l1Indexes.filter((index) => l1FreshChapterSet.has(index.chapter_index)),
+    selectedIndexes,
+    categories,
+    entityQueries
+  });
+  const useL1Route = Boolean(l1MatchedIndexes.length);
+  await waitIfPaused(task);
+  updateTask(task, {
+    progress: { ...task.progress, current: "L2 召回事实" },
+    message: useL1Route
+      ? `正在按 L1 命中章节召回 L2 事实（${l1MatchedIndexes.length} 章）`
+      : "L1 未命中相关章节，正在从本地 L2 索引兜底召回事实"
+  });
+  const initialFacts = await listL2Facts({
     bookId,
     startChapter,
     endChapter,
+    chapterIndexes: l1MatchedIndexes,
     categories,
-    entity: entityQuery,
+    entities: useL1Route ? [] : entityQueries,
     limit: 1000,
     includeContent: true
-  })).filter((fact) => selectedIndexes.includes(fact.chapter_index));
+  });
+  const fallbackFacts = shouldFallbackL2Recall(initialFacts, entityQueries, useL1Route)
+    ? await listL2Facts({
+      bookId,
+      startChapter,
+      endChapter,
+      categories,
+      limit: 500,
+      includeContent: true
+    })
+    : [];
+  const facts = mergeFacts([...initialFacts, ...fallbackFacts], { chronological: useL1Route })
+    .filter((fact) => selectedIndexes.includes(fact.chapter_index));
   const indexedChapters = new Set(facts.map((fact) => fact.chapter_index));
-  const missingChapters = selectedIndexes.filter((index) => !indexedChapters.has(index));
+  const unrecalledChapters = selectedIndexes.filter((index) => !indexedChapters.has(index));
+  const l2Coverage = getL2Coverage({
+    bookId,
+    startChapter,
+    endChapter,
+    model,
+    promptHash: indexPromptHash,
+    schemaVersion: L2_SCHEMA_VERSION
+  });
+  const l2MissingChapters = selectedIndexes.filter((index) => {
+    const chapter = chapters.find((entry) => entry.chapter_index === index);
+    if (!chapter) return true;
+    const status = getL2ChapterStatus(bookId, index);
+    return !status
+      || status.status !== "completed"
+      || status.source_hmac !== chapter.content_hmac
+      || status.model !== model
+      || status.prompt_hash !== indexPromptHash
+      || status.schema_version !== L2_SCHEMA_VERSION;
+  });
   const sourceStats = {
     analysis_mode: analysisMode,
     recalled_facts: facts.length,
     recalled_chapters: indexedChapters.size,
+    l1_route_enabled: useL1Route,
+    l1_matched_chapters: l1MatchedIndexes,
+    l1_fresh_chapters: l1FreshChapterSet.size,
     source_review_chapters: 0,
     source_review_budget: sourceReviewBudgetForMode(analysisMode, chapters.length, sourceReviewBudget),
-    missing_chapters: missingChapters,
+    missing_chapters: unrecalledChapters,
+    unrecalled_chapters: unrecalledChapters,
+    l2_missing_chapters: l2MissingChapters,
+    l2_coverage: l2Coverage.chapters,
     categories,
-    entity_query: entityQuery
+    entity_query: primaryEntityQuery,
+    entity_queries: entityQueries,
+    recall_fallback_used: Boolean(fallbackFacts.length)
   };
 
   const reviewedChapters = [];
@@ -906,21 +1013,59 @@ async function executeIndexAnalysisTask(task, { analysisId, bookId, startChapter
     userPrompt: settings.summary_prompt,
     configuredSchema: parseOutputSchemaOrNull(settings.output_schema)
   });
-  const summary = await runFinalSummaryCall({
-    task,
-    stageLabel: "GPT 索引汇总结果",
-    model,
-    reasoningEffort,
-    input: buildIndexSummaryInput({
-      facts,
-      reviewedChapters,
-      missingChapters,
+  const indexSummaryPayload = {
+    facts,
+    reviewedChapters,
+    missingChapters: unrecalledChapters,
+    userPrompt: settings.summary_prompt,
+    sourceStats
+  };
+  const finalPrepared = shouldSplitCustomFinalSummary(finalSchema)
+    ? null
+    : prepareEvidenceSourceMaterial({
+      sourceMaterial: indexSummaryPayload,
+      fieldName: "final",
+      fieldSchema: finalSchema?.schema || null,
       userPrompt: settings.summary_prompt,
-      sourceStats
-    }),
-    schema: finalSchema,
-    sourceChapterCount: Math.max(facts.length, reviewedChapters.length, 1)
-  });
+      materialLabel: "索引召回素材",
+      budget: SUMMARY_PART_INPUT_MAX_CHARS
+    });
+  const summary = shouldSplitCustomFinalSummary(finalSchema)
+    ? await runCustomFieldSummaryCalls({
+      analysisId,
+      task,
+      analysisContext: { bookId, bookName: getBook(bookId)?.book_name || "", taskName: task.payload?.name || settings.name || "" },
+      model,
+      reasoningEffort: "low",
+      userPrompt: settings.summary_prompt,
+      sourceMaterial: indexSummaryPayload,
+      materialLabel: "索引召回素材",
+      schema: finalSchema,
+      sourceChapterCount: Math.max(facts.length, reviewedChapters.length, 1)
+    })
+    : await runFinalSummaryCall({
+      analysisId,
+      task,
+      partKey: "json.final.merge",
+      stageLabel: "GPT 索引汇总结果",
+      model,
+      reasoningEffort,
+      userPrompt: settings.summary_prompt,
+      input: buildEvidenceSummaryInput({
+        userPrompt: settings.summary_prompt,
+        sourceMaterial: finalPrepared.material,
+        materialLabel: "索引召回素材",
+        contextLabel: "最终汇总"
+      }),
+      schema: finalSchema,
+      sourceChapterCount: Math.max(facts.length, reviewedChapters.length, 1),
+      traceSummary: sourceTraceFromMaterial({
+        partKey: "json.final.merge",
+        stage: "json_final_merge",
+        fieldName: "final",
+        material: finalPrepared.material
+      })
+    });
 
   assertNotCancelled(task);
   const finalResult = parseJsonOrText(summary.value);
@@ -930,7 +1075,11 @@ async function executeIndexAnalysisTask(task, { analysisId, bookId, startChapter
   const run = updateAnalysisRun(analysisId, {
     status: "completed",
     source_stats: JSON.stringify(sourceStats),
-    error_summary: sourceStats.missing_chapters.length ? `L2 索引缺口章节：${sourceStats.missing_chapters.slice(0, 30).join(", ")}` : ""
+    error_summary: sourceStats.l2_missing_chapters.length
+      ? `L2 覆盖缺口章节：${sourceStats.l2_missing_chapters.slice(0, 30).join(", ")}`
+      : sourceStats.unrecalled_chapters.length
+        ? `L2 未召回章节：${sourceStats.unrecalled_chapters.slice(0, 30).join(", ")}`
+        : ""
   });
   completeTask(task, {
     analysisId,
@@ -960,6 +1109,83 @@ function selectSourceReviewCandidates({ facts, chapters, budget }) {
     .slice(0, budget);
 }
 
+function selectChaptersByL1Route({ l1Indexes, selectedIndexes, categories, entityQueries }) {
+  const selectedSet = new Set(selectedIndexes);
+  const queries = entityQueries.map(normalizeRouteToken).filter(Boolean);
+  const categorySet = new Set(categories || []);
+  if (!queries.length && !categorySet.size) return [];
+  return l1Indexes
+    .filter((index) => selectedSet.has(index.chapter_index))
+    .filter((index) => index.status === "completed")
+    .filter((index) => {
+      const routeText = l1RouteText(index);
+      return queries.some((query) => routeText.includes(query)) || l1MatchesCategories(index, categorySet);
+    })
+    .map((index) => index.chapter_index)
+    .sort((left, right) => left - right);
+}
+
+function l1MatchesCategories(index, categories) {
+  if (!categories.size) return false;
+  if (categories.has("character") && Array.isArray(index.entities) && index.entities.length) return true;
+  if (categories.has("relationship") && /关系|师徒|亲缘|恩怨|承诺|交易|敌对|隐瞒/.test(l1RouteText(index))) return true;
+  if (categories.has("cultivation") && /境界|修炼|剑道|武学|术法|文脉|儒|释|道|兵法/.test(l1RouteText(index))) return true;
+  if (categories.has("item") && /剑|本命物|法宝|武器|物品/.test(l1RouteText(index))) return true;
+  if (categories.has("force") && /宗门|势力|组织|门派|家族/.test(l1RouteText(index))) return true;
+  if (categories.has("location") && /地点|空间|秘境|城|山|洲|地图/.test(l1RouteText(index))) return true;
+  if (categories.has("event") && Array.isArray(index.key_events) && index.key_events.length) return true;
+  if (categories.has("foreshadowing") && Array.isArray(index.open_questions) && index.open_questions.length) return true;
+  return false;
+}
+
+function l1RouteText(index) {
+  return [
+    index.summary,
+    ...(index.keywords || []),
+    ...(index.entities || []),
+    ...(index.key_events || []),
+    ...(index.items_places_orgs || []),
+    ...(index.open_questions || [])
+  ].map(normalizeRouteToken).join(" ");
+}
+
+function normalizeRouteToken(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function mergeFacts(facts, { chronological = false } = {}) {
+  const seen = new Set();
+  const merged = [];
+  for (const fact of facts) {
+    const key = fact?.id || [
+      fact?.book_id,
+      fact?.chapter_index,
+      fact?.category,
+      fact?.entity,
+      fact?.fact_type,
+      fact?.fact
+    ].join("|");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(fact);
+  }
+  const sorted = chronological
+    ? merged.sort((left, right) => Number(left.chapter_index || 0) - Number(right.chapter_index || 0)
+      || (Number(right.importance || 0) + Number(right.confidence || 0)) - (Number(left.importance || 0) + Number(left.confidence || 0)))
+    : merged.sort((left, right) => {
+      const leftScore = Number(left.importance || 0) * 2 + Number(left.confidence || 0);
+      const rightScore = Number(right.importance || 0) * 2 + Number(right.confidence || 0);
+      return rightScore - leftScore || Number(left.chapter_index || 0) - Number(right.chapter_index || 0);
+    });
+  return sorted.slice(0, 1200);
+}
+
+function shouldFallbackL2Recall(facts, entityQueries, usedL1Route = false) {
+  if (usedL1Route) return false;
+  if (!entityQueries.length) return false;
+  return facts.length < 30 || new Set(facts.map((fact) => fact.chapter_index)).size < 8;
+}
+
 async function reusableAnalysisChapter({ analysisId, chapter, promptHash }) {
   const existing = getAnalysisChapterMetadata(analysisId, chapter.chapter_index);
   if (!existing || existing.status !== "completed") return null;
@@ -969,14 +1195,77 @@ async function reusableAnalysisChapter({ analysisId, chapter, promptHash }) {
   return decryptAnalysisChapterResult(analysisId, chapter.chapter_index);
 }
 
-async function summarizeAnalysisResults({ task, model, reasoningEffort, chapterResults, failedChapters, userPrompt, outputSchema, sourceChapterCount }) {
-  const directInput = buildSummaryInput({ chapterResults, failedChapters, userPrompt });
+async function summarizeAnalysisResults({ analysisId, task, analysisContext = {}, model, reasoningEffort, chapterResults, failedChapters, userPrompt, outputSchema, sourceChapterCount }) {
   const finalSchema = deriveFinalSummarySchema({
     userPrompt,
     configuredSchema: parseOutputSchemaOrNull(outputSchema)
   });
-  if (inputTextLength(directInput) <= DIRECT_SUMMARY_MAX_CHARS) {
-    return runFinalSummaryCall({ task, stageLabel: "GPT 汇总分析结果", model, reasoningEffort, userPrompt, input: directInput, schema: finalSchema, sourceChapterCount });
+  const rawSummaryLength = summaryRawMaterialLength({ chapterResults, failedChapters, userPrompt });
+  const directTargetChars = finalSchema?.schema ? 12_000 : SUMMARY_COMPACT_TARGET_CHARS;
+  const compactDirectResults = compactChapterResultsForSummary({
+    chapterResults,
+    failedChapters,
+    userPrompt,
+    targetChars: directTargetChars
+  });
+  if (shouldSplitCustomFinalSummary(finalSchema) && rawSummaryLength > SUMMARY_PART_INPUT_MAX_CHARS) {
+    await waitIfPaused(task);
+    updateTask(task, {
+      progress: { ...task.progress, current: "GPT 分字段汇总" },
+      message: "正在按字段拆分最终汇总"
+    });
+    return runCustomFieldSummaryCalls({
+      analysisId,
+      task,
+      analysisContext,
+      model,
+      reasoningEffort: "low",
+      userPrompt,
+      sourceMaterial: {
+        compressedResults: compactDirectResults,
+        failedChapters
+      },
+      materialLabel: "逐章理解素材",
+      schema: finalSchema,
+      sourceChapterCount
+    });
+  }
+  const directPrepared = prepareEvidenceSourceMaterial({
+    sourceMaterial: {
+      compressedResults: compactDirectResults,
+      failedChapters
+    },
+    fieldName: "final",
+    fieldSchema: finalSchema?.schema || null,
+    userPrompt,
+    materialLabel: "逐章理解素材",
+    budget: SUMMARY_PART_INPUT_MAX_CHARS
+  });
+  const directInput = buildEvidenceSummaryInput({
+    userPrompt,
+    sourceMaterial: directPrepared.material,
+    materialLabel: "逐章理解素材",
+    contextLabel: "最终汇总"
+  });
+  if (inputTextLength(directInput) <= SUMMARY_PART_INPUT_MAX_CHARS) {
+    return runFinalSummaryCall({
+      analysisId,
+      task,
+      partKey: finalSchema?.schema ? "json.final.merge" : "text.final.merge",
+      stageLabel: "GPT 汇总分析结果",
+      model,
+      reasoningEffort,
+      userPrompt,
+      input: directInput,
+      schema: finalSchema,
+      sourceChapterCount,
+      traceSummary: sourceTraceFromMaterial({
+        partKey: finalSchema?.schema ? "json.final.merge" : "text.final.merge",
+        stage: finalSchema?.schema ? "json_final_merge" : "text_final_merge",
+        fieldName: "final",
+        material: directPrepared.material
+      })
+    });
   }
 
   await waitIfPaused(task);
@@ -987,7 +1276,8 @@ async function summarizeAnalysisResults({ task, model, reasoningEffort, chapterR
   const compressedResults = compactChapterResultsForSummary({
     chapterResults,
     failedChapters,
-    userPrompt
+    userPrompt,
+    targetChars: finalSchema?.schema ? 12_000 : SUMMARY_COMPACT_TARGET_CHARS
   });
 
   await waitIfPaused(task);
@@ -995,38 +1285,84 @@ async function summarizeAnalysisResults({ task, model, reasoningEffort, chapterR
     progress: { ...task.progress, current: "GPT 汇总压缩结果" },
     message: "正在基于压缩素材生成最终汇总"
   });
-  const compressedInput = buildCompressedSummaryInput({
-    compressedResults,
-    failedChapters,
-    userPrompt
-  });
   if (shouldSplitCustomFinalSummary(finalSchema)) {
     return runCustomFieldSummaryCalls({
+      analysisId,
       task,
+      analysisContext,
       model,
       reasoningEffort: "low",
       userPrompt,
-      compressedResults,
-      failedChapters,
+      sourceMaterial: {
+        compressedResults,
+        failedChapters
+      },
+      materialLabel: "压缩摘要素材",
       schema: finalSchema,
       sourceChapterCount
     });
   }
+  const compressedPrepared = prepareEvidenceSourceMaterial({
+    sourceMaterial: {
+      compressedResults,
+      failedChapters
+    },
+    fieldName: "final",
+    fieldSchema: finalSchema?.schema || null,
+    userPrompt,
+    materialLabel: "压缩摘要素材",
+    budget: SUMMARY_PART_INPUT_MAX_CHARS
+  });
+  const compressedInput = buildEvidenceSummaryInput({
+    userPrompt,
+    sourceMaterial: compressedPrepared.material,
+    materialLabel: "压缩摘要素材",
+    contextLabel: "最终汇总"
+  });
   return runFinalSummaryCall({
+    analysisId,
     task,
+    partKey: finalSchema?.schema ? "json.final.merge" : "text.final.merge",
     stageLabel: "GPT 汇总压缩结果",
     model,
     reasoningEffort: "low",
     userPrompt,
     input: compressedInput,
     schema: finalSchema,
-    sourceChapterCount
+    sourceChapterCount,
+    traceSummary: sourceTraceFromMaterial({
+      partKey: finalSchema?.schema ? "json.final.merge" : "text.final.merge",
+      stage: finalSchema?.schema ? "json_final_merge" : "text_final_merge",
+      fieldName: "final",
+      material: compressedPrepared.material
+    })
   });
 }
 
-async function runFinalSummaryCall({ task, stageLabel, model, reasoningEffort, input, schema, sourceChapterCount }) {
+function summaryRawMaterialLength({ chapterResults, failedChapters, userPrompt }) {
+  return String(userPrompt || "").length
+    + JSON.stringify(chapterResults || []).length
+    + JSON.stringify(failedChapters || []).length;
+}
+
+async function runFinalSummaryCall({ analysisId, task, partKey, stageLabel, model, reasoningEffort, userPrompt = "", input, schema, sourceChapterCount, traceSummary = null }) {
+  assertSummaryInputWithinBudget(input, stageLabel);
+  const contentHash = summaryContentHash({ input, schema: schema?.schema || null, userPrompt });
+  const basePart = {
+    analysisId,
+    partKey: partKey || (schema?.schema ? "json.final.merge" : "text.final.merge"),
+    parentKey: "",
+    stage: schema?.schema ? "json_final_merge" : "text_final_merge",
+    contentHash,
+    promptHash: shaString(userPrompt || ""),
+    schemaHash: shaString(schema?.schema ? JSON.stringify(schema.schema) : ""),
+    model,
+    reasoningEffort,
+    inputSummary: `${stageLabel} · 输入 ${inputTextLength(input)} 字`,
+    traceSummary
+  };
   if (schema?.schema) {
-    return runSummaryStageWithRetry(task, stageLabel, async () => {
+    return runPersistedSummaryNode(task, basePart, async () => {
       const response = await callOpenAIJson({
         model,
         reasoningEffort,
@@ -1041,7 +1377,7 @@ async function runFinalSummaryCall({ task, stageLabel, model, reasoningEffort, i
       return response;
     });
   }
-  return runSummaryStageWithRetry(task, stageLabel, async () => {
+  return runPersistedSummaryNode(task, basePart, async () => {
     const response = await callOpenAIText({
       model,
       reasoningEffort,
@@ -1061,13 +1397,34 @@ function shouldSplitCustomFinalSummary(schema) {
   return Object.keys(properties).length >= 2;
 }
 
-async function runCustomFieldSummaryCalls({ task, model, reasoningEffort, userPrompt, compressedResults, failedChapters, schema, sourceChapterCount }) {
+async function runCustomFieldSummaryCalls({ analysisId, task, analysisContext = {}, model, reasoningEffort, userPrompt, sourceMaterial, materialLabel, schema, sourceChapterCount }) {
   const properties = schema.schema.properties || {};
   const finalValue = {};
   const responseIds = [];
   const fieldNames = Object.keys(properties);
 
   for (const fieldName of fieldNames) {
+    const deterministicValue = deterministicFinalFieldValue(fieldName, analysisContext, {
+      userPrompt,
+      fieldSchema: properties[fieldName]
+    });
+    if (deterministicValue !== undefined) {
+      await saveAnalysisSummaryPart({
+        analysisId,
+        partKey: `meta.${fieldName}`,
+        stage: "meta",
+        status: "completed",
+        contentHash: summaryContentHash({ fieldName, value: deterministicValue }),
+        promptHash: shaString(userPrompt || ""),
+        schemaHash: shaString(JSON.stringify(properties[fieldName] || {})),
+        model,
+        reasoningEffort,
+        inputSummary: `元信息字段 ${fieldName}`,
+        result: { [fieldName]: deterministicValue }
+      });
+      finalValue[fieldName] = deterministicValue;
+      continue;
+    }
     await waitIfPaused(task);
     updateTask(task, {
       progress: { ...task.progress, current: `GPT 分字段汇总 ${fieldName}` },
@@ -1078,40 +1435,177 @@ async function runCustomFieldSummaryCalls({ task, model, reasoningEffort, userPr
       fieldName,
       fieldSchema: properties[fieldName]
     });
-    const response = await runSummaryStageWithRetry(task, `GPT 分字段汇总 ${fieldName}`, async () => {
-      const result = await callOpenAIJson({
-        model,
-        reasoningEffort,
-        instructions: "你是严谨的小说多章节汇总引擎。当前只生成用户最终 JSON 模板中的一个顶层字段；只输出合法 JSON，不要添加无关解释。",
-        input: buildCustomFieldSummaryInput({
-          userPrompt,
-          compressedResults,
-          failedChapters,
-          fieldName,
-          fieldSchema: properties[fieldName]
-        }),
-        schema: fieldSchema,
-        schemaName: safeSchemaName(`custom_field_${fieldName}`),
-        maxOutputTokens: CUSTOM_FIELD_SUMMARY_MAX_OUTPUT_TOKENS,
-        strict: false
-      });
-      if (!result.value || typeof result.value !== "object" || Array.isArray(result.value) || !Object.hasOwn(result.value, fieldName)) {
-        const error = new Error(`分字段汇总缺少字段：${fieldName}`);
-        error.status = 502;
-        throw error;
-      }
-      return result;
+    const fieldResult = await runJsonFieldSummaryParts({
+      analysisId,
+      task,
+      model,
+      reasoningEffort,
+      userPrompt,
+      sourceMaterial: scopedSourceMaterialForField({ sourceMaterial, fieldName, userPrompt }),
+      materialLabel,
+      fieldName,
+      fieldSchema: properties[fieldName],
+      wrapperSchema: fieldSchema,
+      sourceChapterCount
     });
 
-    finalValue[fieldName] = response.value[fieldName];
-    if (response.responseId) responseIds.push(response.responseId);
+    finalValue[fieldName] = fieldResult.value;
+    if (fieldResult.responseId) responseIds.push(fieldResult.responseId);
   }
 
   assertFinalSummaryUseful(finalValue, sourceChapterCount);
+  await saveAnalysisSummaryPart({
+    analysisId,
+    partKey: "json.final.merge",
+    stage: "json_final_merge",
+    status: "completed",
+    contentHash: summaryContentHash(finalValue),
+    promptHash: shaString(userPrompt || ""),
+    schemaHash: shaString(JSON.stringify(schema.schema || {})),
+    model,
+    reasoningEffort,
+    inputSummary: `最终 JSON 合并 · ${fieldNames.length} 字段`,
+    traceSummary: mergeSourceTraces(listAnalysisSummaryPartMetadata(analysisId)
+      .filter((part) => part.stage === "json_field_batch")
+      .map((part) => part.trace_summary), {
+      partKey: "json.final.merge",
+      stage: "json_final_merge",
+      fieldName: "final"
+    }),
+    result: finalValue
+  });
   return {
     value: finalValue,
     responseId: responseIds.join(",") || null
   };
+}
+
+function deterministicFinalFieldValue(fieldName, analysisContext = {}, options = {}) {
+  if (fieldName === "book_id") return analysisContext.bookId || "";
+  if (fieldName === "book_name") return analysisContext.bookName || "";
+  if (fieldName === "task") return analysisContext.taskName || "";
+  const promptTemplateValue = promptJsonTemplateFieldValue(options.userPrompt, fieldName);
+  if (promptTemplateValue !== undefined && isDeterministicTemplateField(fieldName, options.fieldSchema, promptTemplateValue)) {
+    if (isTemplatePlaceholderText(promptTemplateValue) && isAnalysisParameterField(fieldName, options.fieldSchema)) {
+      const inferred = inferAnalysisParameterValue(fieldName, options.userPrompt, analysisContext);
+      assertAnalysisParameterReady(fieldName, inferred);
+      return inferred;
+    }
+    assertTemplateFieldReady(fieldName, promptTemplateValue);
+    return promptTemplateValue;
+  }
+  if (isAnalysisParameterField(fieldName, options.fieldSchema)) {
+    const inferred = inferAnalysisParameterValue(fieldName, options.userPrompt, analysisContext);
+    assertAnalysisParameterReady(fieldName, inferred);
+    return inferred;
+  }
+  return undefined;
+}
+
+function promptJsonTemplateFieldValue(userPrompt, fieldName) {
+  const template = extractLastJsonObjectTemplate(userPrompt);
+  if (!template || !Object.hasOwn(template, fieldName)) return undefined;
+  return template[fieldName];
+}
+
+function isDeterministicTemplateField(fieldName, fieldSchema, templateValue) {
+  if (!isScalarFieldSchema(fieldSchema)) return false;
+  if (typeof templateValue !== "string") return true;
+  const trimmed = templateValue.trim();
+  if (!trimmed) return true;
+  if (isAnalysisParameterField(fieldName, fieldSchema)) return true;
+  if (isTemplatePlaceholderText(trimmed)) return false;
+  return isMetadataLikeFieldName(fieldName);
+}
+
+function isAnalysisParameterField(fieldName, fieldSchema) {
+  if (!isScalarFieldSchema(fieldSchema)) return false;
+  return /^(target|target_subject|subject|analysis_subject|analysis_goal|task_goal|scope|range|dimension|dimensions|目标主体|分析主体|分析目标|任务目标|范围|维度)$/i.test(String(fieldName || ""));
+}
+
+function isMetadataLikeFieldName(fieldName) {
+  return /^(version|schema_version|language|locale|format|output_format|analysis_mode|mode|source|source_type)$/i.test(String(fieldName || ""));
+}
+
+function isScalarFieldSchema(schema) {
+  if (!schema) return true;
+  if (schema.type === "array" || schema.type === "object") return false;
+  if (schema.anyOf) return schema.anyOf.every(isScalarFieldSchema);
+  return true;
+}
+
+function inferAnalysisParameterValue(fieldName, userPrompt, analysisContext = {}) {
+  const fromTemplate = promptJsonTemplateFieldValue(userPrompt, fieldName);
+  if (fromTemplate !== undefined && !isTemplatePlaceholderText(fromTemplate)) return fromTemplate;
+  const prompt = String(userPrompt || "");
+  const field = String(fieldName || "").toLowerCase();
+  if (/target|subject|主体/.test(field)) return inferAnalysisTargetFromPrompt(prompt);
+  const taskGoal = prompt.match(/(?:任务目标|分析目标)[：:]\s*([^\n。；]{2,80})/);
+  if (/goal|目标/.test(field) && taskGoal) return taskGoal[1].trim();
+  const scope = prompt.match(/(?:筛选范围|分析范围|范围)[：:]\s*([^\n。；]{2,80})/);
+  if (/scope|range|范围/.test(field) && scope) return scope[1].trim();
+  if (/task|goal|目标/.test(field)) return analysisContext.taskName || "";
+  return "";
+}
+
+function inferAnalysisTargetFromPrompt(prompt) {
+  const text = stripLastJsonObjectTemplate(prompt);
+  const patterns = [
+    /(?:目标主体|分析主体|指定主体|分析对象|分析目标|目标范围|目标类别|目标角色|核心角色)[^。；\n]{0,40}?[“"「『]([^”"」』]{1,60})[”"」』]/,
+    /[“"「『]([^”"」』]{1,60})[”"」』][^。；\n]{0,24}?(?:为目标主体|为分析主体|作为目标主体|作为分析对象|作为分析目标|作为目标范围)/,
+    /(?:目标主体|分析主体|指定主体|分析对象|分析目标|目标范围|目标类别|目标角色)[：:]\s*([^\n。；]{1,80})/,
+    /(?:任务目标|分析目标)[：:]\s*(?:分析|梳理|整理|提炼|归纳)([^\n。；]{1,80})/,
+    /(?:分析|梳理|整理|提炼|归纳)(?:小说中|全书中|本书中|这本书中|《[^》]+》中)?(?:的)?([^\n。；]{2,80})/
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    const value = normalizeAnalysisTargetCandidate(match?.[1]);
+    if (value && !isTemplatePlaceholderText(value) && !isReservedTemplateToken(value)) return value;
+  }
+  return "";
+}
+
+function normalizeAnalysisTargetCandidate(value) {
+  let text = String(value || "").trim();
+  if (!text) return "";
+  text = text
+    .replace(/^(?:分析|梳理|整理|提炼|归纳|研究)\s*/, "")
+    .replace(/^(?:小说中|全书中|本书中|这本书中|《[^》]+》中)?(?:的)?/, "")
+    .replace(/(?:相关内容|相关资料|相关事实|资料|内容|信息|情况)$/g, "")
+    .replace(/[，,、]\s*(?:并|以及|同时).+$/g, "")
+    .trim();
+  return text.slice(0, 80);
+}
+
+function stripLastJsonObjectTemplate(value) {
+  const text = String(value || "");
+  const range = lastJsonObjectTemplateRange(text);
+  if (!range) return text;
+  return `${text.slice(0, range.start)}\n${text.slice(range.end + 1)}`;
+}
+
+function isReservedTemplateToken(value) {
+  return /^(book_id|book_name|task|target_subject|summary|items|title|version|schema|json)$/i.test(String(value || "").trim());
+}
+
+function assertTemplateFieldReady(fieldName, value) {
+  if (!isTemplatePlaceholderText(value)) return;
+  const error = new Error(`分析 Prompt 的字段 ${fieldName} 仍是占位内容，请在 Prompt 管理中填写具体分析对象/目标范围，或删除该字段。`);
+  error.status = 422;
+  throw error;
+}
+
+function assertAnalysisParameterReady(fieldName, value) {
+  if (String(value || "").trim() && !isTemplatePlaceholderText(value)) return;
+  const error = new Error(`分析 Prompt 的字段 ${fieldName} 缺少具体分析对象/目标范围，请在 Prompt 管理中填写具体值或删除该字段。`);
+  error.status = 422;
+  throw error;
+}
+
+function isTemplatePlaceholderText(value) {
+  const text = String(value || "").trim();
+  if (!text) return false;
+  return /用户指定|指定主体|目标主体|待填写|请填写|请输入|占位|placeholder|todo/i.test(text);
 }
 
 function buildSingleFieldSummarySchema({ fieldName, fieldSchema }) {
@@ -1125,7 +1619,1336 @@ function buildSingleFieldSummarySchema({ fieldName, fieldSchema }) {
   };
 }
 
-function buildCustomFieldSummaryInput({ userPrompt, compressedResults, failedChapters, fieldName, fieldSchema }) {
+async function runJsonFieldSummaryParts({
+  analysisId,
+  task,
+  model,
+  reasoningEffort,
+  userPrompt,
+  sourceMaterial,
+  materialLabel,
+  fieldName,
+  fieldSchema,
+  wrapperSchema,
+  sourceChapterCount
+}) {
+  const chunks = splitSourceMaterialForField({
+    sourceMaterial,
+    fieldName,
+    fieldSchema,
+    userPrompt,
+    materialLabel
+  });
+  const batchValues = [];
+  const responseIds = [];
+  for (let index = 0; index < chunks.length; index += 1) {
+    const chunk = chunks[index];
+    const batchNumber = String(index + 1).padStart(3, "0");
+    const partKey = chunks.length > 1
+      ? `json.${fieldName}.batch.${batchNumber}`
+      : `json.${fieldName}.merge`;
+    const traceSummary = sourceTraceFromMaterial({
+      partKey,
+      parentKey: chunks.length > 1 ? `json.${fieldName}.merge` : "",
+      stage: "json_field_batch",
+      fieldName,
+      material: chunk.material
+    });
+    updateTask(task, {
+      progress: {
+        ...task.progress,
+        current: chunks.length > 1 ? `GPT 分字段汇总 ${fieldName} ${batchNumber}/${chunks.length}` : `GPT 分字段汇总 ${fieldName}`,
+        summary_parts: await summaryProgressForAnalysis(analysisId)
+      },
+      message: chunks.length > 1
+        ? `正在生成最终 JSON 字段：${fieldName}（${index + 1}/${chunks.length}）`
+        : `正在生成最终 JSON 字段：${fieldName}`
+    });
+    const response = await runPersistedSummaryNode(task, {
+      analysisId,
+      partKey,
+      parentKey: chunks.length > 1 ? `json.${fieldName}.merge` : "",
+      stage: "json_field_batch",
+      contentHash: summaryContentHash({ fieldName, chunk, fieldSchema }),
+      promptHash: shaString(userPrompt || ""),
+      schemaHash: shaString(JSON.stringify(wrapperSchema || {})),
+      model,
+      reasoningEffort,
+      inputSummary: `${fieldName} · ${chunk.label} · ${JSON.stringify(chunk.material).length} 字`,
+      traceSummary
+    }, async () => {
+      const input = buildCustomFieldSummaryInput({
+        userPrompt,
+        sourceMaterial: chunk.material,
+        materialLabel,
+        fieldName,
+        fieldSchema
+      });
+      assertSummaryInputWithinBudget(input, `${fieldName} · ${chunk.label}`);
+      const result = await callOpenAIJson({
+        model,
+        reasoningEffort,
+        instructions: "你是严谨的小说多章节汇总引擎。当前只生成用户最终 JSON 模板中的一个顶层字段；只输出合法 JSON，不要添加无关解释。",
+        input,
+        schema: wrapperSchema,
+        schemaName: safeSchemaName(`custom_field_${fieldName}`),
+        maxOutputTokens: outputTokensForFieldSchema(fieldSchema),
+        strict: false
+      });
+      assertFieldResponse(fieldName, fieldSchema, result.value);
+      return result;
+    });
+    batchValues.push(response.value[fieldName]);
+    if (response.responseId) responseIds.push(response.responseId);
+  }
+
+  if (chunks.length === 1) {
+    const value = mergeFieldBatchValues(batchValues, fieldSchema, { fieldName, userPrompt });
+    assertFieldValueUseful(fieldName, fieldSchema, value, sourceChapterCount);
+    return {
+      value,
+      responseId: responseIds.join(",") || null
+    };
+  }
+
+  const mergedValue = mergeFieldBatchValues(batchValues, fieldSchema, { fieldName, userPrompt });
+  assertFieldValueUseful(fieldName, fieldSchema, mergedValue, sourceChapterCount);
+  await saveAnalysisSummaryPart({
+    analysisId,
+    partKey: `json.${fieldName}.merge`,
+    stage: "json_field_merge",
+    status: "completed",
+    contentHash: summaryContentHash({ fieldName, mergedValue }),
+    promptHash: shaString(userPrompt || ""),
+    schemaHash: shaString(JSON.stringify(fieldSchema || {})),
+    model,
+    reasoningEffort,
+    inputSummary: `${fieldName} · 合并 ${chunks.length} 个分块`,
+    traceSummary: mergeSourceTraces(chunks.map((chunk, index) => sourceTraceFromMaterial({
+      partKey: `json.${fieldName}.batch.${String(index + 1).padStart(3, "0")}`,
+      parentKey: `json.${fieldName}.merge`,
+      stage: "json_field_batch",
+      fieldName,
+      material: chunk.material
+    })), {
+      partKey: `json.${fieldName}.merge`,
+      stage: "json_field_merge",
+      fieldName
+    }),
+    result: { [fieldName]: mergedValue }
+  });
+  return {
+    value: mergedValue,
+    responseId: responseIds.join(",") || null
+  };
+}
+
+function splitSourceMaterialForField({ sourceMaterial, fieldName, fieldSchema, userPrompt, materialLabel }) {
+  const base = sourceMaterial && typeof sourceMaterial === "object" ? sourceMaterial : {};
+  const prepared = prepareEvidenceSourceMaterial({
+    sourceMaterial: base,
+    fieldName,
+    fieldSchema,
+    userPrompt,
+    materialLabel,
+    budget: SUMMARY_PART_INPUT_MAX_CHARS
+  });
+  if (prepared.chunks.length <= 1) {
+    return [{ label: `${fieldName} 全量素材`, material: prepared.material }];
+  }
+  return prepared.chunks.map((material, index) => ({
+    label: `${fieldName} 分块 ${index + 1}/${prepared.chunks.length}`,
+    material
+  }));
+}
+
+function isLargeFieldSchema(schema) {
+  if (!schema) return true;
+  if (schema.type === "array") return true;
+  if (schema.type === "object") return true;
+  if (schema.anyOf) return schema.anyOf.some(isLargeFieldSchema);
+  return false;
+}
+
+function outputTokensForFieldSchema(schema) {
+  if (!schema) return CUSTOM_FIELD_SUMMARY_MAX_OUTPUT_TOKENS;
+  if (schema.type === "array") return CUSTOM_FIELD_SUMMARY_MAX_OUTPUT_TOKENS;
+  if (schema.type === "object") return CUSTOM_FIELD_SUMMARY_MAX_OUTPUT_TOKENS;
+  return Math.min(1200, CUSTOM_FIELD_SUMMARY_MAX_OUTPUT_TOKENS);
+}
+
+function assertSummaryInputWithinBudget(input, label) {
+  const length = inputTextLength(input);
+  if (length <= SUMMARY_PART_INPUT_MAX_CHARS) return;
+  const error = new Error(`最终汇总分块输入超过预算：${label || "unknown"} ${length}/${SUMMARY_PART_INPUT_MAX_CHARS} 字。`);
+  error.status = 502;
+  throw error;
+}
+
+function assertFieldResponse(fieldName, fieldSchema, value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !Object.hasOwn(value, fieldName)) {
+    const error = new Error(`分字段汇总缺少字段：${fieldName}`);
+    error.status = 502;
+    throw error;
+  }
+  assertFieldValueUseful(fieldName, fieldSchema, value[fieldName], 3);
+}
+
+function assertFieldValueUseful(fieldName, fieldSchema, value, sourceChapterCount) {
+  if (sourceChapterCount < 3) return;
+  if (fieldSchema?.type === "array") {
+    if (!Array.isArray(value)) {
+      const error = new Error(`分字段汇总字段 ${fieldName} 必须是数组。`);
+      error.status = 502;
+      throw error;
+    }
+    return;
+  }
+  if (fieldSchema?.type === "object") {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      const error = new Error(`分字段汇总字段 ${fieldName} 必须是对象。`);
+      error.status = 502;
+      throw error;
+    }
+    return;
+  }
+  if (typeof value === "string" && isPlaceholderText(value)) {
+    const error = new Error(`分字段汇总字段 ${fieldName} 是占位内容。`);
+    error.status = 502;
+    throw error;
+  }
+}
+
+function mergeFieldBatchValues(values, fieldSchema, options = {}) {
+  if (fieldSchema?.type === "array") {
+    const mergedByKey = new Map();
+    const fallbackItems = [];
+    const fallbackSeen = new Set();
+    for (const value of values) {
+      const items = Array.isArray(value) ? value : [];
+      for (const item of items) {
+        const subjectKey = arrayItemSubjectKey(item);
+        if (!subjectKey) {
+          const fallbackKey = stableStringify(item);
+          if (fallbackSeen.has(fallbackKey)) continue;
+          fallbackSeen.add(fallbackKey);
+          fallbackItems.push(item);
+          continue;
+        }
+        const existing = mergedByKey.get(subjectKey);
+        mergedByKey.set(subjectKey, existing ? mergeArrayItems(existing, item, subjectKey) : cloneJsonValue(item));
+      }
+    }
+    return applyArrayMergeConstraints([...mergedByKey.values(), ...fallbackItems], {
+      userPrompt: options.userPrompt,
+      fieldName: options.fieldName
+    });
+  }
+  if (fieldSchema?.type === "object") {
+    return Object.assign({}, ...values.filter((value) => value && typeof value === "object" && !Array.isArray(value)));
+  }
+  return values.find((value) => value !== undefined && value !== null && value !== "") ?? values[0] ?? "";
+}
+
+function arrayItemSubjectKey(item) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return "";
+  const entries = Object.entries(item);
+  for (const preferred of ARRAY_ITEM_KEY_FIELDS) {
+    const match = entries.find(([key, value]) => normalizeFieldKey(key) === preferred && usefulKeyValue(value));
+    if (match) return normalizeArrayItemKey(match[1]);
+  }
+  for (const [key, value] of entries) {
+    const normalized = normalizeFieldKey(key);
+    if (!usefulKeyValue(value)) continue;
+    if (/(^|_)(name|title|entity|subject|label)(_|$)/.test(normalized)) return normalizeArrayItemKey(value);
+    if (/名称|名字|姓名|标题|主体|实体|对象/.test(String(key))) return normalizeArrayItemKey(value);
+  }
+  return "";
+}
+
+const ARRAY_ITEM_KEY_FIELDS = [
+  "name",
+  "title",
+  "entity",
+  "subject",
+  "label",
+  "character_name",
+  "role_name",
+  "item_name",
+  "force_name",
+  "faction_name",
+  "system_name",
+  "cultivation_name",
+  "relationship_name",
+  "角色名称",
+  "角色名",
+  "姓名",
+  "名称",
+  "名字",
+  "物品名称",
+  "势力名称",
+  "宗门名称",
+  "体系名称",
+  "境界名称",
+  "关系名称",
+  "主体",
+  "实体",
+  "对象",
+  "标题"
+].map(normalizeFieldKey);
+
+function usefulKeyValue(value) {
+  if (value === undefined || value === null) return false;
+  if (Array.isArray(value) || typeof value === "object") return false;
+  const text = String(value).trim();
+  return Boolean(text) && !isPlaceholderText(text) && !isTemplatePlaceholderText(text);
+}
+
+function normalizeArrayItemKey(value) {
+  return normalizeRouteToken(value)
+    .replace(/[“”"'`‘’「」『』《》（）()[\]{}<>]/g, "")
+    .replace(/\s+/g, "")
+    .trim();
+}
+
+function normalizeFieldKey(value) {
+  return String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+}
+
+function mergeArrayItems(left, right, subjectKey) {
+  if (!left || typeof left !== "object" || Array.isArray(left)) return cloneJsonValue(right);
+  if (!right || typeof right !== "object" || Array.isArray(right)) return cloneJsonValue(left);
+  const output = cloneJsonValue(left);
+  for (const [key, value] of Object.entries(right)) {
+    if (value === undefined || value === null || value === "") continue;
+    if (!Object.hasOwn(output, key) || output[key] === undefined || output[key] === null || output[key] === "" || isPlaceholderText(output[key])) {
+      output[key] = cloneJsonValue(value);
+      continue;
+    }
+    output[key] = mergeArrayItemValue(output[key], value, {
+      fieldKey: key,
+      subjectKey
+    });
+  }
+  return output;
+}
+
+function mergeArrayItemValue(left, right, { fieldKey, subjectKey }) {
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return mergeJsonArrays(Array.isArray(left) ? left : [left], Array.isArray(right) ? right : [right]);
+  }
+  if (isPlainObject(left) && isPlainObject(right)) {
+    return mergeArrayItems(left, right, subjectKey);
+  }
+  if (typeof left === "string" || typeof right === "string") {
+    return mergeTextValue(left, right, { fieldKey, subjectKey });
+  }
+  if (typeof left === "number" && typeof right === "number") return Math.max(left, right);
+  if (typeof left === "boolean" && typeof right === "boolean") return left || right;
+  return left;
+}
+
+function mergeJsonArrays(left, right) {
+  const output = [];
+  const seen = new Set();
+  for (const item of [...left, ...right]) {
+    const key = arrayItemSubjectKey(item) || stableStringify(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(cloneJsonValue(item));
+  }
+  return output;
+}
+
+function mergeTextValue(left, right, { fieldKey, subjectKey }) {
+  const leftText = String(left || "").trim();
+  const rightText = String(right || "").trim();
+  if (!leftText) return rightText;
+  if (!rightText) return leftText;
+  if (leftText === rightText) return leftText;
+  if (normalizeArrayItemKey(leftText) === subjectKey) return leftText;
+  if (normalizeArrayItemKey(rightText) === subjectKey) return leftText;
+  if (isPlaceholderText(leftText) || isTemplatePlaceholderText(leftText)) return rightText;
+  if (isPlaceholderText(rightText) || isTemplatePlaceholderText(rightText)) return leftText;
+  if (leftText.includes(rightText)) return leftText;
+  if (rightText.includes(leftText)) return rightText;
+  if (isIdentityLikeField(fieldKey)) return leftText.length >= rightText.length ? leftText : rightText;
+  return `${leftText}；${rightText}`;
+}
+
+function isIdentityLikeField(key) {
+  return /^(name|title|entity|subject|label)$/i.test(String(key || ""))
+    || /名称|名字|姓名|标题|主体|实体|对象/.test(String(key || ""));
+}
+
+function applyArrayMergeConstraints(items, { userPrompt, fieldName }) {
+  const constraints = parseArrayMergeConstraints(userPrompt, fieldName);
+  let output = items.map((item) => applyItemTextConstraints(item, constraints.textFieldLimits));
+  if (constraints.labeledLimits.length) {
+    output = applyLabeledItemLimits(output, constraints.labeledLimits);
+  }
+  if (constraints.maxItems && output.length > constraints.maxItems) {
+    output = output.slice(0, constraints.maxItems);
+  }
+  return output;
+}
+
+function applyItemTextConstraints(item, limits) {
+  if (!limits.length || !item || typeof item !== "object" || Array.isArray(item)) return item;
+  const output = cloneJsonValue(item);
+  for (const [key, value] of Object.entries(output)) {
+    if (typeof value === "string") {
+      const limit = textLimitForField(key, limits);
+      if (limit) output[key] = clipText(value, limit);
+    } else if (Array.isArray(value)) {
+      output[key] = value.map((entry) => typeof entry === "string"
+        ? clipText(entry, textLimitForField(key, limits) || entry.length)
+        : entry);
+    }
+  }
+  return output;
+}
+
+function applyLabeledItemLimits(items, labeledLimits) {
+  const keptByLabel = new Map();
+  const output = [];
+  for (const item of items) {
+    const text = arrayItemLabelText(item);
+    const matched = labeledLimits.find((limit) => text.includes(limit.label));
+    if (!matched) {
+      output.push(item);
+      continue;
+    }
+    const count = keptByLabel.get(matched.label) || 0;
+    if (count >= matched.maxItems) continue;
+    keptByLabel.set(matched.label, count + 1);
+    output.push(item);
+  }
+  return output;
+}
+
+function arrayItemLabelText(item) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return "";
+  return Object.values(item)
+    .filter((value) => typeof value === "string" || typeof value === "number" || typeof value === "boolean")
+    .map(normalizeRouteToken)
+    .join(" ");
+}
+
+function textLimitForField(fieldKey, limits) {
+  const normalized = normalizeFieldKey(fieldKey);
+  const fieldText = normalizeRouteToken(fieldKey);
+  const matched = limits
+    .filter((limit) => {
+      if (limit.field && normalized === limit.field) return true;
+      if (limit.field && normalized.includes(limit.field)) return true;
+      if (limit.label && fieldText.includes(limit.label)) return true;
+      return limit.aliases.some((alias) => normalized.includes(alias) || fieldText.includes(alias));
+    })
+    .sort((left, right) => left.maxChars - right.maxChars)[0];
+  return matched?.maxChars || 0;
+}
+
+function parseArrayMergeConstraints(userPrompt, fieldName) {
+  const text = String(userPrompt || "");
+  return {
+    maxItems: parseGlobalArrayItemLimit(text, fieldName),
+    labeledLimits: parseLabeledArrayItemLimits(text),
+    textFieldLimits: parseTextFieldLimits(text)
+  };
+}
+
+function parseGlobalArrayItemLimit(text, fieldName) {
+  const normalizedField = normalizeFieldKey(fieldName);
+  const candidates = [];
+  const patterns = [
+    /(?:最多|至多|不超过|上限|限制为|控制在)\s*([0-9一二两三四五六七八九十百〇零]+)\s*(?:个|条|项)/g,
+    /(?:输出|保留|收录)[^。；\n]{0,12}?([0-9一二两三四五六七八九十百〇零]+)\s*(?:个|条|项)(?:以内|以下|之内)/g
+  ];
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const number = parseLooseNumber(match[1]);
+      if (!number) continue;
+      const context = text.slice(Math.max(0, match.index - 24), Math.min(text.length, match.index + match[0].length + 24));
+      if (/非核心|次要|每个|每条|每项/.test(context)) continue;
+      const fieldRelevant = !normalizedField || normalizeRouteToken(context).includes(normalizeRouteToken(fieldName));
+      candidates.push({ number, fieldRelevant });
+    }
+  }
+  const relevant = candidates.filter((candidate) => candidate.fieldRelevant);
+  const values = (relevant.length ? relevant : candidates).map((candidate) => candidate.number);
+  return values.length ? Math.min(...values) : 0;
+}
+
+function parseLabeledArrayItemLimits(text) {
+  const limits = [];
+  const pattern = /([\u4e00-\u9fa5A-Za-z_]{2,16})[^。；\n]{0,12}?(?:最多|至多|不超过|上限|限制为|控制在)\s*([0-9一二两三四五六七八九十百〇零]+)\s*(?:个|条|项)/g;
+  for (const match of text.matchAll(pattern)) {
+    const label = normalizeRouteToken(match[1]);
+    const maxItems = parseLooseNumber(match[2]);
+    if (!label || !maxItems) continue;
+    if (/字段|输出|结果|json|每个|每条|每项/.test(label)) continue;
+    limits.push({ label, maxItems });
+  }
+  return limits;
+}
+
+function parseTextFieldLimits(text) {
+  const limits = [];
+  const pattern = /([A-Za-z_][A-Za-z0-9_]{1,40}|[\u4e00-\u9fa5]{2,12})[^。；\n]{0,20}?(?:控制在|不超过|最多|限制在|限制为)\s*([0-9一二两三四五六七八九十百〇零]+)\s*(?:字|字符)(?:以内|以下|之内)?/g;
+  for (const match of text.matchAll(pattern)) {
+    const rawField = normalizeLimitFieldCandidate(match[1]);
+    const maxChars = parseLooseNumber(match[2]);
+    if (!rawField || !maxChars) continue;
+    limits.push({
+      field: /^[A-Za-z_]/.test(rawField) ? normalizeFieldKey(rawField) : "",
+      label: /^[A-Za-z_]/.test(rawField) ? "" : normalizeRouteToken(rawField),
+      aliases: fieldLimitAliases(rawField),
+      maxChars
+    });
+  }
+  return limits;
+}
+
+function normalizeLimitFieldCandidate(value) {
+  const text = String(value || "").trim();
+  const ascii = text.match(/[A-Za-z_][A-Za-z0-9_]{1,40}/g);
+  if (ascii?.length) return ascii.at(-1);
+  const cjk = text.match(/[\u4e00-\u9fa5]{2,12}/g);
+  return cjk?.at(-1) || text;
+}
+
+function fieldLimitAliases(field) {
+  const normalized = normalizeRouteToken(field);
+  const aliases = new Set([normalizeFieldKey(field), normalized]);
+  if (/appearance|外貌|形象|描述/.test(normalized)) {
+    aliases.add("appearance");
+    aliases.add("外貌");
+    aliases.add("形象");
+    aliases.add("描述");
+  }
+  if (/identity|身份|定位/.test(normalized)) {
+    aliases.add("identity");
+    aliases.add("身份");
+    aliases.add("定位");
+  }
+  if (/summary|note|说明|总结/.test(normalized)) {
+    aliases.add("summary");
+    aliases.add("note");
+    aliases.add("说明");
+    aliases.add("总结");
+  }
+  return [...aliases].filter(Boolean);
+}
+
+function parseLooseNumber(value) {
+  const text = String(value || "").trim();
+  const direct = Number(text);
+  if (Number.isFinite(direct) && direct > 0) return Math.floor(direct);
+  return parseChineseNumber(text);
+}
+
+function parseChineseNumber(text) {
+  const chars = String(text || "").replace(/两/g, "二").replace(/〇/g, "零");
+  if (!chars) return 0;
+  const digits = { 零: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  if ([...chars].every((char) => Object.hasOwn(digits, char))) {
+    return Number([...chars].map((char) => digits[char]).join(""));
+  }
+  if (chars.includes("百")) {
+    const [head, tail = ""] = chars.split("百");
+    return (digits[head] || 1) * 100 + parseChineseNumber(tail);
+  }
+  if (chars.includes("十")) {
+    const [head, tail = ""] = chars.split("十");
+    return (head ? digits[head] : 1) * 10 + (tail ? digits[tail] : 0);
+  }
+  return digits[chars] || 0;
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function cloneJsonValue(value) {
+  if (value === undefined) return undefined;
+  return JSON.parse(JSON.stringify(value));
+}
+
+async function runPersistedSummaryNode(task, metadata, operation) {
+  const existing = await getReusableSummaryPart(metadata);
+  if (existing) {
+    await saveAnalysisSummaryPart({
+      ...metadata,
+      status: "completed",
+      result: existing
+    });
+    updateTask(task, {
+      progress: {
+        ...task.progress,
+        current: `复用汇总分块 ${metadata.partKey}`,
+        summary_parts: await summaryProgressForAnalysis(metadata.analysisId)
+      },
+      message: `复用已完成汇总分块：${metadata.partKey}`
+    });
+    return existing;
+  }
+  await saveAnalysisSummaryPart({
+    ...metadata,
+    status: "running"
+  });
+  try {
+    const result = await runSummaryStageWithRetry(task, metadata.partKey, operation);
+    await saveAnalysisSummaryPart({
+      ...metadata,
+      status: "completed",
+      result
+    });
+    updateTask(task, {
+      progress: {
+        ...task.progress,
+        summary_parts: await summaryProgressForAnalysis(metadata.analysisId)
+      },
+      message: `汇总分块完成：${metadata.partKey}`
+    });
+    return result;
+  } catch (error) {
+    await saveAnalysisSummaryPart({
+      ...metadata,
+      status: "failed",
+      errorSummary: sanitizeText(error.message)
+    });
+    throw error;
+  }
+}
+
+async function getReusableSummaryPart(metadata) {
+  const existing = getAnalysisSummaryPartMetadata(metadata.analysisId, metadata.partKey);
+  if (!existing || existing.status !== "completed" || !existing.has_result) return null;
+  if (existing.content_hash !== metadata.contentHash) return null;
+  if (existing.prompt_hash !== metadata.promptHash) return null;
+  if (existing.schema_hash !== metadata.schemaHash) return null;
+  if (existing.model !== metadata.model) return null;
+  if (existing.reasoning_effort !== metadata.reasoningEffort) return null;
+  return decryptAnalysisSummaryPartResult(metadata.analysisId, metadata.partKey);
+}
+
+async function summaryProgressForAnalysis(analysisId) {
+  const parts = listAnalysisSummaryPartMetadata(analysisId);
+  return {
+    total: parts.length,
+    completed: parts.filter((part) => part.status === "completed").length,
+    failed: parts.filter((part) => part.status === "failed").length,
+    running: parts.filter((part) => part.status === "running").length
+  };
+}
+
+function summaryContentHash(value) {
+  return shaString(stableStringify(value));
+}
+
+function shaString(value) {
+  return crypto.createHash("sha256").update(String(value || "")).digest("hex");
+}
+
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function scopedSourceMaterialForField({ sourceMaterial, fieldName, userPrompt }) {
+  const material = sourceMaterial && typeof sourceMaterial === "object" ? sourceMaterial : {};
+  const facts = Array.isArray(material.facts) ? material.facts : [];
+  const reviewedChapters = Array.isArray(material.reviewedChapters) ? material.reviewedChapters : [];
+  const field = String(fieldName || "").toLowerCase();
+  const metadataOnly = /^(book_id|book_name|task|title|version|metadata)$/i.test(fieldName);
+  const categories = summaryFieldCategories(field);
+  const entityQueries = field.includes("core") ? inferEntityQueriesFromPrompt(userPrompt || material.userPrompt || "", "") : [];
+  const riskOnly = /uncertain|uncertainties|conflict|风险|不确定/.test(field);
+  let scopedFacts = metadataOnly
+    ? []
+    : categories.length
+      ? facts.filter((fact) => categories.includes(String(fact.category || "")))
+      : facts;
+  if (entityQueries.length) {
+    const matched = scopedFacts.filter((fact) => factMatchesAnyEntity(fact, entityQueries));
+    if (matched.length) scopedFacts = matched;
+  }
+  if (riskOnly) {
+    scopedFacts = facts.filter((fact) => {
+      const confidence = Number(fact.confidence || 0);
+      const text = factSearchText(fact);
+      return confidence < 0.65 || /冲突|不确定|未知|缺失|矛盾|存疑|待确认/.test(text);
+    });
+  }
+
+  const maxFacts = maxFactsForSummaryField(field);
+  const compactFacts = scopedFacts
+    .sort((left, right) => Number(right.importance || 0) * 2 + Number(right.confidence || 0)
+      - (Number(left.importance || 0) * 2 + Number(left.confidence || 0)))
+    .slice(0, maxFacts)
+    .sort((left, right) => Number(left.chapter_index || 0) - Number(right.chapter_index || 0))
+    .map(compactFactForFinalSummary);
+
+  return {
+    userPrompt: material.userPrompt,
+    sourceStats: material.sourceStats,
+    failedChapters: Array.isArray(material.failedChapters) ? material.failedChapters.slice(0, 120) : [],
+    missingChapters: Array.isArray(material.missingChapters) ? material.missingChapters.slice(0, 120) : [],
+    reviewedChapters: metadataOnly ? [] : reviewedChapters.map((chapter) => ({
+      chapter_index: chapter.chapter_index,
+      title: chapter.title,
+      facts: (chapter.facts || [])
+        .filter((fact) => !categories.length || categories.includes(String(fact.category || "")))
+        .slice(0, 20)
+        .map(compactFactForFinalSummary)
+    })).filter((chapter) => chapter.facts.length),
+    facts: compactFacts
+  };
+}
+
+function prepareEvidenceSourceMaterial({ sourceMaterial, fieldName, fieldSchema, userPrompt, materialLabel, budget }) {
+  const base = sourceMaterial && typeof sourceMaterial === "object" ? sourceMaterial : {};
+  const packets = buildEvidencePacketsForField({
+    sourceMaterial: base,
+    fieldName,
+    fieldSchema,
+    userPrompt
+  });
+  const rankedPackets = rankEvidencePackets({
+    packets,
+    fieldName,
+    fieldSchema,
+    userPrompt
+  });
+  const baseMaterial = evidenceBaseMaterial({ sourceMaterial: base, fieldName, materialLabel });
+  const fullMaterial = {
+    ...baseMaterial,
+    sourceStats: {
+      ...(baseMaterial.sourceStats || {}),
+      evidence_packet_count: rankedPackets.length
+    },
+    evidence_packets: rankedPackets
+  };
+  if (fieldName === "final") {
+    const material = ensureEvidenceInputWithinBudget({
+      material: fullMaterial,
+      userPrompt,
+      fieldName,
+      fieldSchema,
+      materialLabel,
+      budget,
+      preserveCoverage: true
+    });
+    return {
+      material,
+      chunks: [material]
+    };
+  }
+  const forceChunk = isLargeFieldSchema(fieldSchema) && rankedPackets.length > 8;
+  if (!forceChunk && inputTextLength(buildCustomFieldSummaryInput({
+    userPrompt,
+    sourceMaterial: fullMaterial,
+    materialLabel,
+    fieldName,
+    fieldSchema
+  })) <= budget) {
+    return {
+      material: fullMaterial,
+      chunks: [fullMaterial]
+    };
+  }
+
+  const chunks = splitEvidencePacketsIntoBudgetedChunks({
+    baseMaterial,
+    packets: rankedPackets,
+    userPrompt,
+    fieldName,
+    fieldSchema,
+    materialLabel,
+    budget
+  });
+  return {
+    material: chunks[0] || fullMaterial,
+    chunks: chunks.length ? chunks : [fullMaterial]
+  };
+}
+
+function sourceTraceFromMaterial({ partKey, parentKey = "", stage, fieldName, material }) {
+  const safeMaterial = material && typeof material === "object" ? material : {};
+  const packets = Array.isArray(safeMaterial.evidence_packets) ? safeMaterial.evidence_packets : [];
+  const chapters = [...new Set(packets
+    .map((packet) => Number(packet.chapter_index || 0))
+    .filter((chapterIndex) => Number.isFinite(chapterIndex) && chapterIndex > 0))]
+    .sort((left, right) => left - right);
+  const subjects = uniqueCompact(packets.map((packet) => packet.subject), 12);
+  const relatedSubjects = uniqueCompact(packets.flatMap((packet) => packet.related_subjects || []), 8);
+  const sourceStats = safeMaterial.sourceStats && typeof safeMaterial.sourceStats === "object" ? safeMaterial.sourceStats : {};
+  return {
+    part_key: String(partKey || ""),
+    parent_key: String(parentKey || ""),
+    stage: String(stage || ""),
+    field_name: String(fieldName || safeMaterial.split?.fieldName || ""),
+    batch: Number(safeMaterial.split?.batch || 1),
+    total_batches: Number(safeMaterial.split?.total || 1),
+    evidence_packet_count: packets.length,
+    source_types: countValues(packets.map((packet) => packet.source_type || "unknown")),
+    chapters: {
+      count: chapters.length,
+      min: chapters[0] || null,
+      max: chapters[chapters.length - 1] || null,
+      sample: compactChapterSample(chapters)
+    },
+    categories: countValues(packets.map((packet) => packet.category).filter(Boolean)),
+    fact_types: countValues(packets.map((packet) => packet.fact_type).filter(Boolean)),
+    subjects,
+    related_subjects: relatedSubjects,
+    trimmed_by_budget: Boolean(sourceStats.evidence_packets_trimmed_by_budget),
+    omitted_by_budget: Number(sourceStats.evidence_packets_omitted_by_budget || 0)
+  };
+}
+
+function mergeSourceTraces(traces, overrides = {}) {
+  const normalized = (traces || []).filter((trace) => trace && typeof trace === "object");
+  const chapters = new Set();
+  const sourceTypes = new Map();
+  const categories = new Map();
+  const factTypes = new Map();
+  const subjects = [];
+  const relatedSubjects = [];
+  let packetCount = 0;
+  let omittedByBudget = 0;
+  let trimmedByBudget = false;
+  for (const trace of normalized) {
+    packetCount += Number(trace.evidence_packet_count || 0);
+    omittedByBudget += Number(trace.omitted_by_budget || 0);
+    trimmedByBudget = trimmedByBudget || Boolean(trace.trimmed_by_budget);
+    mergeCountMap(sourceTypes, trace.source_types);
+    mergeCountMap(categories, trace.categories);
+    mergeCountMap(factTypes, trace.fact_types);
+    for (const chapterIndex of trace.chapters?.sample || []) {
+      const number = Number(chapterIndex || 0);
+      if (Number.isFinite(number) && number > 0) chapters.add(number);
+    }
+    if (trace.chapters?.min) chapters.add(Number(trace.chapters.min));
+    if (trace.chapters?.max) chapters.add(Number(trace.chapters.max));
+    subjects.push(...(Array.isArray(trace.subjects) ? trace.subjects : []));
+    relatedSubjects.push(...(Array.isArray(trace.related_subjects) ? trace.related_subjects : []));
+  }
+  const chapterList = [...chapters].filter(Boolean).sort((left, right) => left - right);
+  return {
+    part_key: String(overrides.partKey || ""),
+    parent_key: String(overrides.parentKey || ""),
+    stage: String(overrides.stage || ""),
+    field_name: String(overrides.fieldName || ""),
+    batch: 1,
+    total_batches: normalized.length || 1,
+    evidence_packet_count: packetCount,
+    source_types: Object.fromEntries(sourceTypes),
+    chapters: {
+      count: chapterList.length,
+      min: chapterList[0] || null,
+      max: chapterList[chapterList.length - 1] || null,
+      sample: compactChapterSample(chapterList)
+    },
+    categories: Object.fromEntries(categories),
+    fact_types: Object.fromEntries(factTypes),
+    subjects: uniqueCompact(subjects, 12),
+    related_subjects: uniqueCompact(relatedSubjects, 8),
+    trimmed_by_budget: trimmedByBudget,
+    omitted_by_budget: omittedByBudget
+  };
+}
+
+function mergeCountMap(target, source) {
+  if (!source || typeof source !== "object") return;
+  for (const [key, value] of Object.entries(source)) {
+    if (!key) continue;
+    target.set(key, (target.get(key) || 0) + Number(value || 0));
+  }
+}
+
+function countValues(values) {
+  const counts = {};
+  for (const value of values || []) {
+    const key = String(value || "").trim();
+    if (!key) continue;
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  return counts;
+}
+
+function uniqueCompact(values, limit) {
+  return [...new Set((values || []).map((value) => String(value || "").trim()).filter(Boolean))]
+    .slice(0, limit);
+}
+
+function compactChapterSample(chapters, limit = 16) {
+  const values = [...new Set(chapters || [])].filter(Boolean).sort((left, right) => left - right);
+  if (values.length <= limit) return values;
+  const headCount = Math.ceil(limit / 2);
+  const tailCount = Math.floor(limit / 2);
+  return [...values.slice(0, headCount), ...values.slice(-tailCount)];
+}
+
+function evidenceBaseMaterial({ sourceMaterial, fieldName, materialLabel }) {
+  const base = sourceMaterial && typeof sourceMaterial === "object" ? sourceMaterial : {};
+  return {
+    sourceStats: base.sourceStats || {},
+    failedChapters: Array.isArray(base.failedChapters) ? base.failedChapters.slice(0, 120) : [],
+    missingChapters: Array.isArray(base.missingChapters) ? base.missingChapters.slice(0, 120) : [],
+    split: {
+      fieldName,
+      materialLabel,
+      batch: 1,
+      total: 1
+    }
+  };
+}
+
+function splitEvidencePacketsIntoBudgetedChunks({ baseMaterial, packets, userPrompt, fieldName, fieldSchema, materialLabel, budget }) {
+  if (!packets.length) {
+    const emptyMaterial = { ...baseMaterial, evidence_packets: [] };
+    return [ensureEvidenceInputWithinBudget({
+      material: emptyMaterial,
+      userPrompt,
+      fieldName,
+      fieldSchema,
+      materialLabel,
+      budget
+    })];
+  }
+
+  const chunks = [];
+  let current = [];
+  for (const packet of packets) {
+    const candidate = [...current, packet];
+    const candidateMaterial = budgetEvidenceMaterial({
+      baseMaterial,
+      packets: candidate,
+      userPrompt,
+      fieldName,
+      fieldSchema,
+      materialLabel,
+      budget,
+      batch: chunks.length + 1,
+      total: 1
+    });
+    if (current.length && candidateMaterial.evidence_packets.length < candidate.length) {
+      chunks.push(current);
+      current = [packet];
+      continue;
+    }
+    if (current.length && inputTextLength(buildCustomFieldSummaryInput({
+      userPrompt,
+      sourceMaterial: candidateMaterial,
+      materialLabel,
+      fieldName,
+      fieldSchema
+    })) > budget) {
+      chunks.push(current);
+      current = [packet];
+      continue;
+    }
+    current = candidate;
+  }
+  if (current.length) chunks.push(current);
+
+  const total = chunks.length || 1;
+  return (chunks.length ? chunks : [[]]).map((chunk, index) => budgetEvidenceMaterial({
+    baseMaterial,
+    packets: chunk,
+    userPrompt,
+    fieldName,
+    fieldSchema,
+    materialLabel,
+    budget,
+    batch: index + 1,
+    total
+  }));
+}
+
+function budgetEvidenceMaterial({ baseMaterial, packets, userPrompt, fieldName, fieldSchema, materialLabel, budget, batch, total }) {
+  const material = {
+    ...baseMaterial,
+    split: {
+      ...(baseMaterial.split || {}),
+      fieldName,
+      materialLabel,
+      batch,
+      total
+    },
+    sourceStats: {
+      ...(baseMaterial.sourceStats || {}),
+      evidence_packet_count: packets.length
+    },
+    evidence_packets: packets
+  };
+  return ensureEvidenceInputWithinBudget({
+    material,
+    userPrompt,
+    fieldName,
+    fieldSchema,
+    materialLabel,
+    budget
+  });
+}
+
+function ensureEvidenceInputWithinBudget({ material, userPrompt, fieldName, fieldSchema, materialLabel, budget, preserveCoverage = false }) {
+  let output = material;
+  let packets = Array.isArray(output.evidence_packets) ? output.evidence_packets : [];
+  if (preserveCoverage && inputTextLength(buildCustomFieldSummaryInput({
+    userPrompt,
+    sourceMaterial: output,
+    materialLabel,
+    fieldName,
+    fieldSchema
+  })) > budget) {
+    const passOnePackets = packets.map((packet) => compactEvidencePacketForBudget(packet, {
+      contentChars: 48,
+      evidenceItems: 0,
+      evidenceChars: 0,
+      tagItems: 0,
+      tagChars: 0
+    }));
+    output = {
+      ...output,
+      sourceStats: {
+        ...(output.sourceStats || {}),
+        evidence_packet_count: passOnePackets.length,
+        evidence_packets_trimmed_by_budget: true
+      },
+      evidence_packets: passOnePackets
+    };
+    packets = passOnePackets;
+  }
+  if (preserveCoverage && inputTextLength(buildCustomFieldSummaryInput({
+    userPrompt,
+    sourceMaterial: output,
+    materialLabel,
+    fieldName,
+    fieldSchema
+  })) > budget) {
+    const passTwoPackets = packets.map((packet) => compactEvidencePacketForBudget(packet, {
+      contentChars: 16,
+      evidenceItems: 0,
+      evidenceChars: 0,
+      tagItems: 0,
+      tagChars: 0
+    }));
+    output = {
+      ...output,
+      sourceStats: {
+        ...(output.sourceStats || {}),
+        evidence_packet_count: passTwoPackets.length,
+        evidence_packets_trimmed_by_budget: true
+      },
+      evidence_packets: passTwoPackets
+    };
+    packets = passTwoPackets;
+  }
+  while (packets.length && inputTextLength(buildCustomFieldSummaryInput({
+    userPrompt,
+    sourceMaterial: output,
+    materialLabel,
+    fieldName,
+    fieldSchema
+  })) > budget) {
+    packets = packets.slice(0, -1);
+    output = {
+      ...output,
+      sourceStats: {
+        ...(output.sourceStats || {}),
+        evidence_packet_count: packets.length,
+        evidence_packets_omitted_by_budget: Math.max(0, (material.evidence_packets || []).length - packets.length)
+      },
+      evidence_packets: packets
+    };
+  }
+  if (inputTextLength(buildCustomFieldSummaryInput({
+    userPrompt,
+    sourceMaterial: output,
+    materialLabel,
+    fieldName,
+    fieldSchema
+  })) <= budget) {
+    return output;
+  }
+
+  const trimmedPackets = packets.map((packet) => ({
+    ...packet,
+    content: clipText(packet.content, 120),
+    evidence: compactStringArray(packet.evidence, 1, 60)
+  }));
+  output = {
+    ...output,
+    sourceStats: {
+      ...(output.sourceStats || {}),
+      evidence_packet_count: trimmedPackets.length,
+      evidence_packets_trimmed_by_budget: true
+    },
+    evidence_packets: trimmedPackets
+  };
+  while (trimmedPackets.length && inputTextLength(buildCustomFieldSummaryInput({
+    userPrompt,
+    sourceMaterial: output,
+    materialLabel,
+    fieldName,
+    fieldSchema
+  })) > budget) {
+    trimmedPackets.pop();
+    output = {
+      ...output,
+      sourceStats: {
+        ...(output.sourceStats || {}),
+        evidence_packet_count: trimmedPackets.length,
+        evidence_packets_omitted_by_budget: Math.max(0, (material.evidence_packets || []).length - trimmedPackets.length),
+        evidence_packets_trimmed_by_budget: true
+      },
+      evidence_packets: [...trimmedPackets]
+    };
+  }
+  return output;
+}
+
+function compactEvidencePacketForBudget(packet, { contentChars, evidenceItems, evidenceChars, tagItems, tagChars }) {
+  const compacted = {
+    source_type: packet.source_type,
+    chapter_index: packet.chapter_index,
+    category: packet.category,
+    subject: packet.subject,
+    related_subjects: compactStringArray(packet.related_subjects, 2, 20),
+    fact_type: packet.fact_type,
+    content: clipText(packet.content, contentChars),
+    evidence: compactStringArray(packet.evidence, evidenceItems, evidenceChars),
+    importance: packet.importance,
+    confidence: packet.confidence,
+    tags: compactStringArray(packet.tags, tagItems, tagChars)
+  };
+  for (const [key, value] of Object.entries(compacted)) {
+    if (value === null || value === undefined || value === "" || (Array.isArray(value) && !value.length)) {
+      delete compacted[key];
+    }
+  }
+  return compacted;
+}
+
+function buildEvidencePacketsForField({ sourceMaterial, fieldName, fieldSchema, userPrompt }) {
+  const material = sourceMaterial && typeof sourceMaterial === "object" ? sourceMaterial : {};
+  const packets = [];
+  for (const fact of Array.isArray(material.facts) ? material.facts : []) {
+    const packet = factToEvidencePacket(fact);
+    if (packet) packets.push(packet);
+  }
+  for (const chapter of Array.isArray(material.reviewedChapters) ? material.reviewedChapters : []) {
+    packets.push(...reviewedChapterToEvidencePackets(chapter));
+  }
+  for (const result of Array.isArray(material.compressedResults) ? material.compressedResults : []) {
+    const packet = compressedResultToEvidencePacket(result);
+    if (packet) packets.push(packet);
+  }
+  return dedupeEvidencePackets(packets)
+    .map((packet) => ({
+      ...packet,
+      relevance: evidenceRelevanceScore({ packet, fieldName, fieldSchema, userPrompt })
+    }));
+}
+
+function factToEvidencePacket(fact) {
+  if (!fact || typeof fact !== "object") return null;
+  return {
+    source_type: fact.review_source === "source_review" ? "source_review" : "l2_fact",
+    chapter_index: Number(fact.chapter_index || 0) || null,
+    category: String(fact.category || ""),
+    subject: String(fact.entity || ""),
+    related_subjects: compactStringArray(fact.related_entities, 5, 40),
+    fact_type: String(fact.fact_type || ""),
+    content: clipText(fact.fact || "", EVIDENCE_PACKET_CONTENT_CHARS),
+    evidence: compactStringArray(fact.evidence, 2, EVIDENCE_PACKET_EVIDENCE_CHARS),
+    importance: numberOrNull(fact.importance),
+    confidence: numberOrNull(fact.confidence),
+    tags: compactStringArray(fact.tags, 6, 32)
+  };
+}
+
+function reviewedChapterToEvidencePackets(chapter) {
+  const chapterIndex = Number(chapter?.chapter_index || 0) || null;
+  return (Array.isArray(chapter?.facts) ? chapter.facts : [])
+    .map((fact) => factToEvidencePacket({ ...fact, chapter_index: chapterIndex, review_source: "source_review" }))
+    .filter(Boolean)
+    .map((packet) => ({
+      ...packet,
+      chapter_title: clipText(chapter?.title || "", 80)
+    }));
+}
+
+function compressedResultToEvidencePacket(result) {
+  if (!result || typeof result !== "object") return null;
+  return {
+    source_type: "chapter_summary",
+    chapter_index: Number(result.chapter_index || 0) || null,
+    chapter_title: clipText(result.chapter_title || result.title || "", 80),
+    category: "",
+    subject: "",
+    related_subjects: [],
+    fact_type: "chapter_summary",
+    content: clipText(result.summary || summarizeUnknownResult(result, EVIDENCE_PACKET_CONTENT_CHARS), EVIDENCE_PACKET_CONTENT_CHARS),
+    evidence: compactStringArray([
+      ...(Array.isArray(result.key_points) ? result.key_points : []),
+      ...(Array.isArray(result.evidence_notes) ? result.evidence_notes : [])
+    ], 2, EVIDENCE_PACKET_EVIDENCE_CHARS),
+    importance: null,
+    confidence: null,
+    tags: compactStringArray(result.key_points, 4, 32)
+  };
+}
+
+function dedupeEvidencePackets(packets) {
+  const seen = new Set();
+  const output = [];
+  for (const packet of packets) {
+    const key = [
+      packet.source_type,
+      packet.chapter_index,
+      packet.category,
+      packet.subject,
+      packet.fact_type,
+      packet.content
+    ].join("|");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(packet);
+  }
+  return output;
+}
+
+function rankEvidencePackets({ packets, fieldName, fieldSchema, userPrompt }) {
+  return [...packets].sort((left, right) => {
+    const leftScore = evidenceRelevanceScore({ packet: left, fieldName, fieldSchema, userPrompt });
+    const rightScore = evidenceRelevanceScore({ packet: right, fieldName, fieldSchema, userPrompt });
+    return rightScore - leftScore
+      || Number(left.chapter_index || 0) - Number(right.chapter_index || 0);
+  });
+}
+
+function evidenceRelevanceScore({ packet, fieldName, fieldSchema, userPrompt }) {
+  const haystack = evidencePacketSearchText(packet);
+  const fieldTokens = tokenizeForRelevance(fieldName);
+  const promptTokens = tokenizeForRelevance(userPrompt).slice(0, 80);
+  let score = Number(packet.importance || 0) * 3 + Number(packet.confidence || 0) * 1.5;
+  if (packet.source_type === "source_review") score += 1.2;
+  if (fieldSchema?.type === "array") score += 0.15;
+  for (const token of fieldTokens) {
+    if (token.length >= 2 && haystack.includes(token)) score += 1.6;
+  }
+  for (const token of promptTokens) {
+    if (token.length >= 2 && haystack.includes(token)) score += 0.45;
+  }
+  return score;
+}
+
+function evidencePacketSearchText(packet) {
+  return [
+    packet.source_type,
+    packet.category,
+    packet.subject,
+    packet.fact_type,
+    packet.content,
+    ...(packet.related_subjects || []),
+    ...(packet.tags || []),
+    ...(packet.evidence || [])
+  ].map(normalizeRouteToken).join(" ");
+}
+
+function tokenizeForRelevance(value) {
+  const text = normalizeRouteToken(value);
+  const ascii = text.match(/[a-z0-9_]{2,}/g) || [];
+  const cjk = text.match(/[\u4e00-\u9fa5]{2,}/g) || [];
+  const fragments = [];
+  for (const token of cjk) {
+    fragments.push(token);
+    for (let size = 2; size <= Math.min(4, token.length); size += 1) {
+      for (let index = 0; index <= token.length - size; index += 1) {
+        fragments.push(token.slice(index, index + size));
+      }
+    }
+  }
+  return [...new Set([...ascii, ...fragments])].filter((token) => !RELEVANCE_STOPWORDS.has(token));
+}
+
+const RELEVANCE_STOPWORDS = new Set([
+  "json",
+  "schema",
+  "字段",
+  "输出",
+  "分析",
+  "要求",
+  "章节",
+  "结果",
+  "信息",
+  "资料",
+  "说明"
+]);
+
+function numberOrNull(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function summaryFieldCategories(field) {
+  if (/character|角色|人物|appearance|外貌/.test(field)) return ["character", "relationship"];
+  if (/relationship|关系/.test(field)) return ["relationship", "character"];
+  if (/cultivation|修炼|境界|体系/.test(field)) return ["cultivation"];
+  if (/item|weapon|物品|武器|法宝|剑/.test(field)) return ["item"];
+  if (/force|faction|势力|宗门/.test(field)) return ["force"];
+  if (/location|place|地点|空间/.test(field)) return ["location"];
+  if (/event|事件|timeline|时间线/.test(field)) return ["event"];
+  return [];
+}
+
+function maxFactsForSummaryField(field) {
+  if (/core|核心/.test(field)) return 260;
+  if (/important|重要/.test(field)) return 360;
+  if (/minor|次要/.test(field)) return 220;
+  if (/uncertain|uncertainties|conflict|风险|不确定/.test(field)) return 160;
+  return 280;
+}
+
+function factMatchesAnyEntity(fact, entityQueries) {
+  const text = factSearchText(fact);
+  return entityQueries.some((entity) => text.includes(normalizeRouteToken(entity)));
+}
+
+function factSearchText(fact) {
+  return [
+    fact?.entity,
+    fact?.fact_type,
+    fact?.fact,
+    ...(fact?.aliases || []),
+    ...(fact?.tags || []),
+    ...(fact?.related_entities || []),
+    ...(fact?.evidence || [])
+  ].map(normalizeRouteToken).join(" ");
+}
+
+function compactFactForFinalSummary(fact) {
+  return {
+    chapter_index: fact.chapter_index,
+    category: fact.category,
+    entity: fact.entity,
+    related_entities: compactStringArray(fact.related_entities, 4, 40),
+    fact_type: fact.fact_type,
+    fact: clipText(fact.fact, 280),
+    evidence: compactStringArray(fact.evidence, 2, 120),
+    importance: fact.importance,
+    confidence: fact.confidence
+  };
+}
+
+function buildEvidenceSummaryInput({ userPrompt, sourceMaterial, materialLabel, contextLabel = "最终汇总" }) {
   return [
     {
       role: "user",
@@ -1135,8 +2958,32 @@ function buildCustomFieldSummaryInput({ userPrompt, compressedResults, failedCha
           text: [
             userPrompt,
             "",
-            "以下是逐章理解结果的分批压缩摘要 JSON。请基于这些中间摘要进行最终汇总。",
-            "注意：中间摘要已经包含章节引用和关键证据线索；不要要求重新读取原文。",
+            `以下是${materialLabel || "汇总素材"}的标准证据包 JSON。请基于这些证据包完成${contextLabel}。`,
+            "要求：证据包已经包含来源类型、章节、主体、事实、证据摘记、重要度和置信度；不要要求重新读取原文。",
+            "取舍：优先使用高相关、高重要度、高置信度证据；证据不足时保持不确定，不要补写不存在的信息。",
+            "",
+            "证据包素材 JSON：",
+            JSON.stringify(sourceMaterial || {})
+          ].join("\n")
+        }
+      ]
+    }
+  ];
+}
+
+function buildCustomFieldSummaryInput({ userPrompt, sourceMaterial, materialLabel, fieldName, fieldSchema }) {
+  return [
+    {
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text: [
+            userPrompt,
+            "",
+            `以下是${materialLabel || "汇总素材"}的标准证据包 JSON。请基于这些证据包进行最终汇总。`,
+            "注意：证据包已经包含来源类型、章节、主体、事实、证据摘记、重要度和置信度；不要要求重新读取原文。",
+            "取舍：优先使用高相关、高重要度、高置信度证据；证据不足时保持不确定，不要补写不存在的信息。",
             "",
             `当前只生成最终 JSON 的一个顶层字段：${fieldName}`,
             "输出要求：",
@@ -1148,11 +2995,8 @@ function buildCustomFieldSummaryInput({ userPrompt, compressedResults, failedCha
             "当前字段 Schema JSON：",
             JSON.stringify(fieldSchema || looseJsonValueSchema()),
             "",
-            "分批压缩摘要 JSON：",
-            JSON.stringify(compressedResults),
-            "",
-            "失败章节：",
-            JSON.stringify(failedChapters)
+            "证据包素材 JSON：",
+            JSON.stringify(sourceMaterial || {})
           ].join("\n")
         }
       ]
@@ -1221,20 +3065,29 @@ function parseOutputSchemaOrNull(value) {
 }
 
 function deriveFinalSummarySchema({ userPrompt, configuredSchema }) {
-  if (configuredSchema && shouldUseJsonFinalSummary(userPrompt)) {
-    return {
-      schema: configuredSchema,
-      schemaName: "final_analysis",
-      strict: true
-    };
-  }
-
   const promptSchema = schemaFromPromptJsonTemplate(userPrompt);
   if (promptSchema) {
     return {
       schema: promptSchema,
       schemaName: "custom_final_analysis",
       strict: false
+    };
+  }
+
+  const declaredFieldSchema = schemaFromPromptFieldDeclaration(userPrompt);
+  if (declaredFieldSchema) {
+    return {
+      schema: declaredFieldSchema,
+      schemaName: "custom_final_analysis",
+      strict: false
+    };
+  }
+
+  if (configuredSchema && shouldUseJsonFinalSummary(userPrompt)) {
+    return {
+      schema: configuredSchema,
+      schemaName: "final_analysis",
+      strict: true
     };
   }
 
@@ -1272,7 +3125,59 @@ function schemaFromPromptJsonTemplate(userPrompt) {
   return schemaFromJsonTemplate(template);
 }
 
+function schemaFromPromptFieldDeclaration(userPrompt) {
+  const text = String(userPrompt || "");
+  if (!/json/i.test(text)) return null;
+  const declaration = text.match(/(?:字段包括|字段为|顶层字段(?:包括|为)?|JSON\s*字段(?:包括|为)?)[：:\s]*([\s\S]{0,600})/i);
+  if (!declaration) return null;
+  const segment = declaration[1].split(/\n\s*\n|。/)[0] || "";
+  const fields = segment
+    .split(/[、,，\s]+/)
+    .map((field) => field.trim().replace(/^["'`“”‘’]+|["'`“”‘’]+$/g, ""))
+    .filter((field) => /^[A-Za-z_][A-Za-z0-9_]{1,80}$/.test(field));
+  const uniqueFields = [...new Set(fields)];
+  if (uniqueFields.length < 2) return null;
+  return schemaFromDeclaredFields(uniqueFields);
+}
+
+function schemaFromDeclaredFields(fields) {
+  const properties = {};
+  for (const field of fields) {
+    properties[field] = schemaForDeclaredField(field);
+  }
+  return {
+    type: "object",
+    additionalProperties: true,
+    properties,
+    required: fields
+  };
+}
+
+function schemaForDeclaredField(fieldName) {
+  const normalized = String(fieldName || "").toLowerCase();
+  if (/characters|uncertainties|items|stages|evidence|chapters|facts|list|array/.test(normalized)) {
+    return {
+      type: "array",
+      items: { type: "object", additionalProperties: true }
+    };
+  }
+  if (/count|chapter_index|start_chapter|end_chapter/.test(normalized)) return { type: "integer" };
+  if (/is_|has_|should_|重大|是否/.test(normalized)) return { type: "boolean" };
+  return { type: "string" };
+}
+
 function extractLastJsonObjectTemplate(value) {
+  const text = String(value || "");
+  const range = lastJsonObjectTemplateRange(text);
+  if (!range) return null;
+  try {
+    return JSON.parse(text.slice(range.start, range.end + 1));
+  } catch {
+    return null;
+  }
+}
+
+function lastJsonObjectTemplateRange(value) {
   const text = String(value || "");
   for (let end = text.length - 1; end >= 0; end -= 1) {
     if (text[end] !== "}") continue;
@@ -1301,7 +3206,7 @@ function extractLastJsonObjectTemplate(value) {
         if (depth === 0) {
           try {
             const parsed = JSON.parse(text.slice(start, end + 1));
-            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return { start, end };
           } catch {
             break;
           }
@@ -1358,10 +3263,10 @@ function inputTextLength(input) {
   ), 0);
 }
 
-function compactChapterResultsForSummary({ chapterResults, failedChapters, userPrompt }) {
+function compactChapterResultsForSummary({ chapterResults, failedChapters, userPrompt, targetChars = SUMMARY_COMPACT_TARGET_CHARS }) {
   const count = Math.max(1, chapterResults.length);
   const promptReserve = String(userPrompt || "").length + JSON.stringify(failedChapters || []).length + 1500;
-  const perChapterBudget = Math.max(160, Math.min(420, Math.floor((SUMMARY_COMPACT_TARGET_CHARS - promptReserve) / count)));
+  const perChapterBudget = Math.max(80, Math.min(420, Math.floor((targetChars - promptReserve) / count)));
   return chapterResults.map((result) => compactChapterResult(result, perChapterBudget));
 }
 
@@ -1519,6 +3424,10 @@ export async function publicAnalysisRunWithResult(id) {
     throw error;
   }
   const chapters = listAnalysisChapterMetadata(id);
+  const summaryParts = listAnalysisSummaryPartMetadata(id);
+  const promptConfigError = isAnalysisPromptConfigError(run.error_summary);
+  const visibleSummaryParts = promptConfigError ? [] : summaryParts;
+  const sourceTrace = sourceTraceFromSummaryParts(summaryParts);
   const chapterResults = await decryptCompletedAnalysisChapterResults(id);
   const resultIndexes = new Set(chapterResults.map((entry) => entry.chapter_index));
   const selection = parseChapterSelection(run);
@@ -1538,9 +3447,19 @@ export async function publicAnalysisRunWithResult(id) {
     pendingChapterIndexes,
     completedChapterIndexes: [...resultIndexes].sort((left, right) => left - right),
     canResume: canResumeAnalysisRun(run, chapters, selection),
+    summaryParts: visibleSummaryParts,
+    summaryProgress: summaryProgressFromParts(visibleSummaryParts),
+    failedSummaryParts: visibleSummaryParts.filter((part) => part.status === "failed"),
+    canResumeSummary: visibleSummaryParts.some((part) => part.status === "failed"),
+    sourceTrace,
+    sourceTraceSummary: sourceTraceSummary(sourceTrace),
     prompt: await decryptAnalysisPromptSnapshot(id),
     finalResult: run.status === "completed" && run.ciphertext ? await decryptFinalAnalysisResult(id) : null
   };
+}
+
+function isAnalysisPromptConfigError(message) {
+  return /分析 Prompt 的字段 .*?(缺少具体分析对象|目标范围|仍是占位内容)/.test(String(message || ""));
 }
 
 export function publicAnalysisRun(run) {
@@ -1645,12 +3564,50 @@ function inferL2CategoriesFromPrompt(prompt) {
   return categories.size ? [...categories] : [];
 }
 
-function inferEntityQueryFromPrompt(prompt) {
+function inferEntityQueriesFromPrompt(prompt, bookId = "") {
   const text = String(prompt || "");
-  const matches = [...text.matchAll(/[《“「『]([^》”」』]{1,24})[》”」』]/g)]
-    .map((match) => match[1])
-    .filter((value) => !/json|schema|markdown/i.test(value));
-  return matches[0] || "";
+  const stopwords = new Set([
+    "json",
+    "schema",
+    "markdown",
+    "剑来",
+    "第一瞳术师",
+    "废材那又怎样",
+    String(bookId || "")
+  ].filter(Boolean));
+  const candidates = [
+    ...[...text.matchAll(/[《“「『]([^》”」』]{1,24})[》”」』]/g)].map((match) => match[1]),
+    ...[...text.matchAll(/(?:主体|对象|关键词|关键主体|分析对象|围绕|关于|聚焦|只看|查询)[:：为是\s]*([^\n，。；;、]{2,40})/g)].flatMap((match) => splitEntityCandidates(match[1])),
+    ...[...text.matchAll(/[\u4e00-\u9fa5A-Za-z0-9]{2,12}(?:本命飞剑|飞剑|本命物|佩剑|剑|法宝|境界|关系)/g)].map((match) => match[0]),
+    ...[...text.matchAll(/(?:陈平安|齐静春|宁姚|阮邛|阿良|崔瀺|陆沉|老秀才|左右|裴钱|魏檗|宋集薪|顾璨|刘羡阳|飞剑|本命飞剑|本命物)/g)].map((match) => match[0])
+  ];
+  const normalized = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const value = normalizeEntityCandidate(candidate);
+    if (!value || stopwords.has(value) || /json|schema|markdown/i.test(value)) continue;
+    if (seen.has(value)) continue;
+    seen.add(value);
+    normalized.push(value);
+  }
+  return normalized.slice(0, 6);
+}
+
+function splitEntityCandidates(value) {
+  return String(value || "")
+    .split(/[、,，/和与及\s]+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function normalizeEntityCandidate(value) {
+  return String(value || "")
+    .replace(/[。；;：:，,、]/g, " ")
+    .trim()
+    .replace(/^(请|要|需要|分析|总结|整理|输出|围绕|关于|聚焦|只看|中|里|其中|有关|关于)+/, "")
+    .replace(/(相关|有关|的信息|的内容|资料|设定|分析|总结|输出)+$/, "")
+    .trim()
+    .slice(0, 24);
 }
 
 function resolveSelectedChapters({ bookId, startChapter, endChapter, chapterIndexes }) {
@@ -1704,4 +3661,82 @@ function canResumeAnalysisRun(run, chapters, selection) {
   if (!selectedCount) return false;
   const completed = chapters.filter((chapter) => chapter.status === "completed" && chapter.has_result).length;
   return completed < selectedCount || run.status === "failed" || run.status === "cancelled";
+}
+
+function summaryProgressFromParts(parts = []) {
+  return {
+    total: parts.length,
+    completed: parts.filter((part) => part.status === "completed").length,
+    failed: parts.filter((part) => part.status === "failed").length,
+    running: parts.filter((part) => part.status === "running").length
+  };
+}
+
+function sourceTraceFromSummaryParts(parts = []) {
+  return parts
+    .map((part) => {
+      const trace = part.trace_summary || {};
+      if (!trace || typeof trace !== "object" || !Number(trace.evidence_packet_count || 0)) return null;
+      return {
+        part_key: part.part_key,
+        parent_key: part.parent_key || "",
+        stage: part.stage,
+        status: part.status,
+        field_name: trace.field_name || inferFieldNameFromPartKey(part.part_key),
+        batch: Number(trace.batch || 1),
+        total_batches: Number(trace.total_batches || 1),
+        evidence_packet_count: Number(trace.evidence_packet_count || 0),
+        source_types: trace.source_types || {},
+        chapters: trace.chapters || { count: 0, sample: [] },
+        categories: trace.categories || {},
+        fact_types: trace.fact_types || {},
+        subjects: Array.isArray(trace.subjects) ? trace.subjects : [],
+        related_subjects: Array.isArray(trace.related_subjects) ? trace.related_subjects : [],
+        trimmed_by_budget: Boolean(trace.trimmed_by_budget),
+        omitted_by_budget: Number(trace.omitted_by_budget || 0)
+      };
+    })
+    .filter(Boolean);
+}
+
+function sourceTraceSummary(traces = []) {
+  const sourceTypes = new Map();
+  const categories = new Map();
+  const chapters = new Set();
+  const subjects = [];
+  const preferred = traces.some((trace) => trace.stage === "json_field_batch")
+    ? traces.filter((trace) => trace.stage === "json_field_batch")
+    : traces.filter((trace) => trace.part_key !== "json.final.merge" || traces.length === 1);
+  for (const trace of preferred) {
+    mergeCountMap(sourceTypes, trace.source_types);
+    mergeCountMap(categories, trace.categories);
+    subjects.push(...(trace.subjects || []));
+    for (const chapterIndex of trace.chapters?.sample || []) {
+      const number = Number(chapterIndex || 0);
+      if (Number.isFinite(number) && number > 0) chapters.add(number);
+    }
+    if (trace.chapters?.min) chapters.add(Number(trace.chapters.min));
+    if (trace.chapters?.max) chapters.add(Number(trace.chapters.max));
+  }
+  const chapterList = [...chapters].sort((left, right) => left - right);
+  return {
+    parts: traces.length,
+    evidence_packet_count: preferred.reduce((sum, trace) => sum + Number(trace.evidence_packet_count || 0), 0),
+    source_types: Object.fromEntries(sourceTypes),
+    categories: Object.fromEntries(categories),
+    chapters: {
+      count: chapterList.length,
+      min: chapterList[0] || null,
+      max: chapterList[chapterList.length - 1] || null,
+      sample: compactChapterSample(chapterList)
+    },
+    subjects: uniqueCompact(subjects, 12),
+    trimmed_by_budget: preferred.some((trace) => trace.trimmed_by_budget),
+    omitted_by_budget: preferred.reduce((sum, trace) => sum + Number(trace.omitted_by_budget || 0), 0)
+  };
+}
+
+function inferFieldNameFromPartKey(partKey) {
+  const match = String(partKey || "").match(/^json\.([^.]+)\./);
+  return match?.[1] || "final";
 }

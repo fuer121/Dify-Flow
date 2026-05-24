@@ -1,5 +1,6 @@
 import path from "node:path";
 import crypto from "node:crypto";
+import fs from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { config } from "./config.js";
 import { decryptText, encryptText, hmacText, sha256 } from "./crypto.js";
@@ -135,6 +136,30 @@ db.exec(`
     error_summary TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL,
     PRIMARY KEY (analysis_id, chapter_index),
+    FOREIGN KEY (analysis_id) REFERENCES analysis_runs(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS analysis_summary_parts (
+    analysis_id TEXT NOT NULL,
+    part_key TEXT NOT NULL,
+    parent_key TEXT NOT NULL DEFAULT '',
+    stage TEXT NOT NULL,
+    status TEXT NOT NULL,
+    content_hash TEXT NOT NULL DEFAULT '',
+    prompt_hash TEXT NOT NULL DEFAULT '',
+    schema_hash TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    reasoning_effort TEXT NOT NULL DEFAULT '',
+    input_summary TEXT NOT NULL DEFAULT '',
+    trace_summary TEXT NOT NULL DEFAULT '',
+    error_summary TEXT NOT NULL DEFAULT '',
+    ciphertext TEXT,
+    iv TEXT,
+    tag TEXT,
+    algorithm TEXT NOT NULL DEFAULT 'aes-256-gcm',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (analysis_id, part_key),
     FOREIGN KEY (analysis_id) REFERENCES analysis_runs(id) ON DELETE CASCADE
   );
 
@@ -289,6 +314,49 @@ export function listBooks() {
     GROUP BY b.book_id
     ORDER BY b.updated_at DESC
   `).all();
+}
+
+export function getDatabaseDiagnostics() {
+  const stats = safeStat(dbPath);
+  const books = listBooks().map((book) => ({
+    book_id: book.book_id,
+    book_name: book.book_name,
+    chapter_count: Number(book.chapter_count || 0),
+    first_chapter: book.first_chapter,
+    last_chapter: book.last_chapter,
+    last_import_status: book.last_import_status,
+    updated_at: book.updated_at,
+    l1: countStatusesForBook("l1_chapter_indexes", book.book_id),
+    l2: countStatusesForBook("l2_chapter_statuses", book.book_id),
+    l2_facts: countRows("l2_facts", "book_id = ?", [book.book_id]),
+    analyses: countStatusesForBook("analysis_runs", book.book_id),
+    prompt_groups: countRows("prompt_groups", "book_id = ?", [book.book_id])
+  }));
+  return {
+    generated_at: nowIso(),
+    storage: {
+      db_file_bytes: stats.size || 0,
+      db_updated_at: stats.mtime ? stats.mtime.toISOString() : ""
+    },
+    totals: {
+      books: countRows("books"),
+      chapters: countRows("chapters"),
+      l1_indexes: countRows("l1_chapter_indexes"),
+      l1_windows: countRows("l1_window_indexes"),
+      l2_chapter_statuses: countRows("l2_chapter_statuses"),
+      l2_facts: countRows("l2_facts"),
+      analyses: countRows("analysis_runs"),
+      prompt_groups: countRows("prompt_groups"),
+      summary_parts: countRows("analysis_summary_parts")
+    },
+    statuses: {
+      l1: countStatuses("l1_chapter_indexes"),
+      l2: countStatuses("l2_chapter_statuses"),
+      analyses: countStatuses("analysis_runs"),
+      summary_parts: countStatuses("analysis_summary_parts")
+    },
+    books
+  };
 }
 
 export function updateBookImportStatus(bookId, status) {
@@ -1078,20 +1146,28 @@ export function getL2Coverage({ bookId, startChapter, endChapter, model = "", pr
   };
 }
 
-export async function listL2Facts({ bookId, startChapter, endChapter, categories = [], entity = "", limit = 500, includeContent = true }) {
+export async function listL2Facts({ bookId, startChapter, endChapter, chapterIndexes = [], categories = [], entity = "", entities = [], limit = 500, includeContent = true }) {
   const range = normalizeRange(startChapter, endChapter);
+  const indexes = normalizeChapterIndexList(chapterIndexes)
+    .filter((index) => index >= range.startChapter && index <= range.endChapter);
   const categoryList = normalizeL2Categories(categories);
   const params = [normalizeBookId(bookId), range.startChapter, range.endChapter];
   const where = ["book_id = ?", "chapter_index BETWEEN ? AND ?", "status = 'completed'"];
+  if (indexes.length) {
+    where.push(`chapter_index IN (${indexes.map(() => "?").join(", ")})`);
+    params.push(...indexes);
+  }
   if (categoryList.length) {
     where.push(`category IN (${categoryList.map(() => "?").join(", ")})`);
     params.push(...categoryList);
   }
-  const entityQuery = String(entity || "").trim().toLowerCase();
-  if (entityQuery) {
-    where.push("(LOWER(entity) LIKE ? OR LOWER(aliases) LIKE ? OR LOWER(related_entities) LIKE ? OR LOWER(tags) LIKE ?)");
-    const pattern = `%${entityQuery}%`;
-    params.push(pattern, pattern, pattern, pattern);
+  const entityQueries = normalizeEntityQueries(entity, entities);
+  if (entityQueries.length) {
+    where.push(`(${entityQueries.map(() => "(LOWER(entity) LIKE ? OR LOWER(aliases) LIKE ? OR LOWER(related_entities) LIKE ? OR LOWER(tags) LIKE ? OR LOWER(fact_type) LIKE ?)").join(" OR ")})`);
+    for (const entityQuery of entityQueries) {
+      const pattern = `%${entityQuery}%`;
+      params.push(pattern, pattern, pattern, pattern, pattern);
+    }
   }
   params.push(Math.max(1, Math.min(2000, Number.parseInt(limit, 10) || 500)));
   const rows = db.prepare(`
@@ -1107,6 +1183,19 @@ export async function listL2Facts({ bookId, startChapter, endChapter, categories
     facts.push(includeContent ? await publicL2FactWithContent(row) : publicL2Fact(row));
   }
   return facts;
+}
+
+function normalizeChapterIndexList(values) {
+  const input = Array.isArray(values) ? values : [];
+  const seen = new Set();
+  const indexes = [];
+  for (const value of input) {
+    const number = Number(value);
+    if (!Number.isInteger(number) || number <= 0 || seen.has(number)) continue;
+    seen.add(number);
+    indexes.push(number);
+  }
+  return indexes.sort((left, right) => left - right);
 }
 
 export function listL2FactMetadata({ bookId, startChapter, endChapter, categories = [], entity = "", limit = 500 }) {
@@ -1247,6 +1336,109 @@ export async function decryptCompletedAnalysisChapterResults(analysisId) {
     });
   }
   return results;
+}
+
+export async function saveAnalysisSummaryPart({
+  analysisId,
+  partKey,
+  parentKey = "",
+  stage,
+  status,
+  contentHash = "",
+  promptHash = "",
+  schemaHash = "",
+  model = "",
+  reasoningEffort = "",
+  inputSummary = "",
+  traceSummary = null,
+  result,
+  errorSummary = ""
+}) {
+  const now = nowIso();
+  const encrypted = result === undefined ? null : await encryptText(JSON.stringify(result), analysisSummaryPartAad(analysisId, partKey));
+  const normalizedTraceSummary = traceSummary
+    ? JSON.stringify(traceSummary).slice(0, 12000)
+    : "";
+  db.prepare(`
+    INSERT INTO analysis_summary_parts (
+      analysis_id, part_key, parent_key, stage, status, content_hash, prompt_hash, schema_hash,
+      model, reasoning_effort, input_summary, trace_summary, error_summary,
+      ciphertext, iv, tag, algorithm, created_at, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(analysis_id, part_key) DO UPDATE SET
+      parent_key = excluded.parent_key,
+      stage = excluded.stage,
+      status = excluded.status,
+      content_hash = excluded.content_hash,
+      prompt_hash = excluded.prompt_hash,
+      schema_hash = excluded.schema_hash,
+      model = excluded.model,
+      reasoning_effort = excluded.reasoning_effort,
+      input_summary = excluded.input_summary,
+      trace_summary = excluded.trace_summary,
+      error_summary = excluded.error_summary,
+      ciphertext = excluded.ciphertext,
+      iv = excluded.iv,
+      tag = excluded.tag,
+      algorithm = excluded.algorithm,
+      updated_at = excluded.updated_at
+  `).run(
+    String(analysisId || ""),
+    normalizeSummaryPartKey(partKey),
+    String(parentKey || ""),
+    String(stage || ""),
+    String(status || ""),
+    String(contentHash || ""),
+    String(promptHash || ""),
+    String(schemaHash || ""),
+    String(model || ""),
+    String(reasoningEffort || ""),
+    String(inputSummary || "").slice(0, 1000),
+    normalizedTraceSummary,
+    String(errorSummary || "").slice(0, 1000),
+    encrypted?.ciphertext || null,
+    encrypted?.iv || null,
+    encrypted?.tag || null,
+    encrypted?.algorithm || "aes-256-gcm",
+    now,
+    now
+  );
+  return getAnalysisSummaryPartMetadata(analysisId, partKey);
+}
+
+export function getAnalysisSummaryPartMetadata(analysisId, partKey) {
+  const row = db.prepare(`
+    SELECT
+      analysis_id, part_key, parent_key, stage, status, content_hash, prompt_hash, schema_hash,
+      model, reasoning_effort, input_summary, trace_summary, error_summary, created_at, updated_at,
+      CASE WHEN ciphertext IS NOT NULL AND ciphertext != '' THEN 1 ELSE 0 END AS has_result
+    FROM analysis_summary_parts
+    WHERE analysis_id = ? AND part_key = ?
+  `).get(String(analysisId || ""), normalizeSummaryPartKey(partKey));
+  return publicAnalysisSummaryPart(row);
+}
+
+export function listAnalysisSummaryPartMetadata(analysisId) {
+  return db.prepare(`
+    SELECT
+      analysis_id, part_key, parent_key, stage, status, content_hash, prompt_hash, schema_hash,
+      model, reasoning_effort, input_summary, trace_summary, error_summary, created_at, updated_at,
+      CASE WHEN ciphertext IS NOT NULL AND ciphertext != '' THEN 1 ELSE 0 END AS has_result
+    FROM analysis_summary_parts
+    WHERE analysis_id = ?
+    ORDER BY part_key ASC
+  `).all(String(analysisId || "")).map(publicAnalysisSummaryPart);
+}
+
+export async function decryptAnalysisSummaryPartResult(analysisId, partKey) {
+  const row = db.prepare(`
+    SELECT ciphertext, iv, tag
+    FROM analysis_summary_parts
+    WHERE analysis_id = ? AND part_key = ?
+  `).get(String(analysisId || ""), normalizeSummaryPartKey(partKey));
+  if (!row?.ciphertext) return null;
+  return JSON.parse(await decryptText(row, analysisSummaryPartAad(analysisId, partKey)));
 }
 
 export async function saveFinalAnalysisResult(analysisId, result) {
@@ -1398,6 +1590,7 @@ function migrateSchema() {
   ensureColumn("analysis_runs", "prompt_iv", "prompt_iv TEXT");
   ensureColumn("analysis_runs", "prompt_tag", "prompt_tag TEXT");
   ensureColumn("analysis_runs", "prompt_algorithm", "prompt_algorithm TEXT NOT NULL DEFAULT 'aes-256-gcm'");
+  ensureColumn("analysis_summary_parts", "trace_summary", "trace_summary TEXT NOT NULL DEFAULT ''");
   migrateBookIndexPrompts();
   migratePromptGroupsToBooks();
 }
@@ -1567,6 +1760,28 @@ function publicL2Fact(row) {
   };
 }
 
+function publicAnalysisSummaryPart(row) {
+  if (!row) return null;
+  return {
+    analysis_id: row.analysis_id,
+    part_key: row.part_key,
+    parent_key: row.parent_key || "",
+    stage: row.stage,
+    status: row.status,
+    content_hash: row.content_hash || "",
+    prompt_hash: row.prompt_hash || "",
+    schema_hash: row.schema_hash || "",
+    model: row.model || "",
+    reasoning_effort: row.reasoning_effort || "",
+    input_summary: row.input_summary || "",
+    trace_summary: parseJsonObject(row.trace_summary),
+    error_summary: row.error_summary || "",
+    has_result: Boolean(row.has_result),
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
 async function publicL2FactWithContent(row) {
   const payload = row.ciphertext
     ? JSON.parse(await decryptText(row, l2FactAad(row.id)))
@@ -1590,6 +1805,47 @@ function parseJsonArray(value) {
   } catch {
     return [];
   }
+}
+
+function parseJsonObject(value) {
+  try {
+    const parsed = JSON.parse(value || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function safeStat(filePath) {
+  try {
+    return fs.statSync(filePath);
+  } catch {
+    return {};
+  }
+}
+
+function countRows(table, where = "", params = []) {
+  const sql = `SELECT COUNT(*) AS count FROM ${table}${where ? ` WHERE ${where}` : ""}`;
+  return Number(db.prepare(sql).get(...params)?.count || 0);
+}
+
+function countStatuses(table) {
+  return Object.fromEntries(db.prepare(`
+    SELECT status, COUNT(*) AS count
+    FROM ${table}
+    GROUP BY status
+    ORDER BY status ASC
+  `).all().map((row) => [row.status || "unknown", Number(row.count || 0)]));
+}
+
+function countStatusesForBook(table, bookId) {
+  return Object.fromEntries(db.prepare(`
+    SELECT status, COUNT(*) AS count
+    FROM ${table}
+    WHERE book_id = ?
+    GROUP BY status
+    ORDER BY status ASC
+  `).all(normalizeBookId(bookId)).map((row) => [row.status || "unknown", Number(row.count || 0)]));
 }
 
 function normalizeConfidence(value) {
@@ -1644,6 +1900,22 @@ function normalizeL2Categories(value) {
   return [...new Set(raw.map(normalizeL2Category).filter(Boolean))].filter((category) => category !== "other" || raw.some((entry) => String(entry).trim().toLowerCase() === "other"));
 }
 
+function normalizeEntityQueries(entity, entities) {
+  const values = [
+    entity,
+    ...(Array.isArray(entities) ? entities : [])
+  ];
+  const seen = new Set();
+  const result = [];
+  for (const value of values) {
+    const normalized = String(value || "").trim().toLowerCase();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(normalized);
+  }
+  return result.slice(0, 8);
+}
+
 function normalizeStringArray(value, maxItems, maxChars) {
   const items = Array.isArray(value) ? value : [];
   return items
@@ -1668,6 +1940,16 @@ export function buildAlignedWindowRanges(startChapter, endChapter, windowSize = 
   return windows;
 }
 
+function normalizeSummaryPartKey(value) {
+  const key = String(value || "").trim();
+  if (!key) {
+    const error = new Error("summary part key 不能为空。");
+    error.status = 400;
+    throw error;
+  }
+  return key.slice(0, 240);
+}
+
 function chapterAad(bookId, chapterIndex) {
   return `chapter:${bookId}:${chapterIndex}`;
 }
@@ -1678,6 +1960,10 @@ function analysisChapterAad(analysisId, chapterIndex) {
 
 function analysisRunAad(analysisId) {
   return `analysis-final:${analysisId}`;
+}
+
+function analysisSummaryPartAad(analysisId, partKey) {
+  return `analysis-summary-part:${analysisId}:${normalizeSummaryPartKey(partKey)}`;
 }
 
 function analysisPromptAad(analysisId) {

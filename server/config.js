@@ -28,7 +28,8 @@ export const config = {
     retentionMode: String(process.env.OPENAI_RETENTION_MODE || "").toLowerCase(),
     chapterConcurrency: clampInteger(process.env.OPENAI_CHAPTER_CONCURRENCY, 1, 5, 1),
     proxyUrl: process.env.OPENAI_PROXY_URL || "",
-    requestTimeoutMs: clampInteger(process.env.OPENAI_REQUEST_TIMEOUT_MS, 30_000, 600_000, 180_000)
+    requestTimeoutMs: clampInteger(process.env.OPENAI_REQUEST_TIMEOUT_MS, 30_000, 600_000, 180_000),
+    maxRetries: clampInteger(process.env.OPENAI_MAX_RETRIES, 0, 5, 2)
   },
   keychain: {
     service: process.env.KEYCHAIN_SERVICE || "novel-chapter-gpt-service",
@@ -54,7 +55,8 @@ export function publicRuntimeConfig() {
     appLabel: config.appLabel || defaultAppLabel(config.appEnv),
     isPreview: config.appEnv === "preview",
     importBatchSize: config.dify.batchSize,
-    chapterConcurrency: config.openai.chapterConcurrency
+    chapterConcurrency: config.openai.chapterConcurrency,
+    openaiMaxRetries: config.openai.maxRetries
   };
 }
 

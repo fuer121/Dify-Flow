@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, BarChart3, BookOpen, ClipboardList, ShieldCheck } from "lucide-react";
+import { AlertTriangle, BarChart3, BookOpen, ClipboardList, ShieldCheck, Stethoscope } from "lucide-react";
 import { apiGet, apiPost, apiPut, followTask } from "./api.js";
 import { AnalysisPage } from "./pages/AnalysisPage.jsx";
+import { DiagnosticsPage } from "./pages/DiagnosticsPage.jsx";
 import { LibraryPage } from "./pages/LibraryPage.jsx";
 import { PromptLibraryPage } from "./pages/PromptLibraryPage.jsx";
 import { LoadingScreen, RuntimeGrid, StatusPill } from "./ui.jsx";
 
 function currentRoute() {
   if (window.location.pathname === "/prompts") return "prompts";
+  if (window.location.pathname === "/diagnostics") return "diagnostics";
   return window.location.pathname === "/library" ? "library" : "analysis";
 }
 
@@ -388,7 +390,13 @@ export default function App() {
   }
 
   function navigate(nextRoute) {
-    const path = nextRoute === "library" ? "/library" : nextRoute === "prompts" ? "/prompts" : "/";
+    const path = nextRoute === "library"
+      ? "/library"
+      : nextRoute === "prompts"
+        ? "/prompts"
+        : nextRoute === "diagnostics"
+          ? "/diagnostics"
+          : "/";
     window.history.pushState({}, "", path);
     setRoute(nextRoute);
   }
@@ -444,6 +452,14 @@ export default function App() {
           >
             <ClipboardList size={16} />
             Prompt 库
+          </button>
+          <button
+            type="button"
+            className={route === "diagnostics" ? "active" : ""}
+            onClick={() => navigate("diagnostics")}
+          >
+            <Stethoscope size={16} />
+            诊断
           </button>
         </nav>
 
@@ -519,6 +535,11 @@ export default function App() {
           onStartL2Index={startL2Index}
           onLoadPromptGroups={loadPromptGroupsForBook}
           onPromptGroupsChanged={reloadPromptGroups}
+          setError={setError}
+        />
+      ) : route === "diagnostics" ? (
+        <DiagnosticsPage
+          config={config}
           setError={setError}
         />
       ) : (

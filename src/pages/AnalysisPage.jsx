@@ -14,7 +14,8 @@ import { IconButton, Panel, ResultActions, StatusPill, TaskBox } from "../ui.jsx
 import {
   normalizePrompt,
   outputSchemaForPrompt,
-  resultColumnsFromPrompt
+  parseJsonLike,
+  tableViewsFromJson
 } from "../schemaTools.js";
 
 const initialAnalysisForm = {
@@ -509,50 +510,32 @@ function ResultView({ analysis, analysisBusy, onResume }) {
     return <PartialResultView analysis={analysis} analysisBusy={analysisBusy} onResume={onResume} />;
   }
   if (typeof analysis.finalResult === "string") {
+    const parsed = parseJsonLike(analysis.finalResult);
+    const tables = tableViewsFromJson(parsed);
+    if (tables.length) {
+      return (
+        <div className="result-stack">
+          <SourceStats stats={analysis.source_stats} />
+          <SourceTracePanel summary={analysis.sourceTraceSummary} traces={analysis.sourceTrace} />
+          <JsonTableResult tables={tables} rawValue={parsed} title={analysis.name} />
+        </div>
+      );
+    }
     return (
       <div className="result-stack">
         <SourceStats stats={analysis.source_stats} />
+        <SourceTracePanel summary={analysis.sourceTraceSummary} traces={analysis.sourceTrace} />
         <TextPreview value={analysis.finalResult} />
       </div>
     );
   }
-  const columns = resultColumnsFromPrompt(null, analysis.finalResult);
-  const rows = Array.isArray(analysis.finalResult.items) ? analysis.finalResult.items : [];
-
-  if (rows.length && columns.length) {
+  const tables = tableViewsFromJson(analysis.finalResult);
+  if (tables.length) {
     return (
       <div className="result-stack">
         <SourceStats stats={analysis.source_stats} />
-        <div className="result-summary">
-          <h3>{analysis.finalResult.title || analysis.name}</h3>
-          <p>{analysis.finalResult.summary || ""}</p>
-        </div>
-        <div className="table-wrap result-table">
-          <table>
-            <thead>
-              <tr>
-                {columns.map((column) => (
-                  <th key={column.key}>{column.label}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row, index) => (
-                <tr key={index}>
-                  {columns.map((column) => (
-                    <td key={column.key}>{formatCell(row?.[column.key])}</td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        {analysis.finalResult.failed_chapters?.length ? (
-          <div className="inline-warning">
-            <FileText size={15} />
-            失败章节：{analysis.finalResult.failed_chapters.join(", ")}
-          </div>
-        ) : null}
+        <SourceTracePanel summary={analysis.sourceTraceSummary} traces={analysis.sourceTrace} />
+        <JsonTableResult tables={tables} rawValue={analysis.finalResult} title={analysis.name} />
       </div>
     );
   }
@@ -560,8 +543,64 @@ function ResultView({ analysis, analysisBusy, onResume }) {
   return (
     <div className="result-stack">
       <SourceStats stats={analysis.source_stats} />
+      <SourceTracePanel summary={analysis.sourceTraceSummary} traces={analysis.sourceTrace} />
       <JsonPreview value={analysis.finalResult} />
     </div>
+  );
+}
+
+function JsonTableResult({ tables, rawValue, title }) {
+  const displayTitle = typeof rawValue?.title === "string" && rawValue.title.trim()
+    ? rawValue.title
+    : title;
+  const displaySummary = typeof rawValue?.summary === "string" ? rawValue.summary : "";
+  return (
+    <>
+      <div className="result-summary">
+        <h3>{displayTitle || "分析结果"}</h3>
+        {displaySummary ? <p>{displaySummary}</p> : null}
+      </div>
+      <div className="result-table-stack">
+        {tables.map((table) => (
+          <section className="result-table-block" key={table.key}>
+            <div className="result-table-head">
+              <strong>{table.title}</strong>
+              <span>{table.rows.length} 行 · {table.columns.length} 列</span>
+            </div>
+            <div className="table-wrap result-table">
+              <table>
+                <thead>
+                  <tr>
+                    {table.columns.map((column) => (
+                      <th key={column.key}>{column.label}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {table.rows.map((row, index) => (
+                    <tr key={index}>
+                      {table.columns.map((column) => (
+                        <td key={column.key}>{formatCell(row?.[column.key])}</td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        ))}
+      </div>
+      {Array.isArray(rawValue?.failed_chapters) && rawValue.failed_chapters.length ? (
+        <div className="inline-warning">
+          <FileText size={15} />
+          失败章节：{rawValue.failed_chapters.join(", ")}
+        </div>
+      ) : null}
+      <details className="result-json-details">
+        <summary>查看完整 JSON</summary>
+        <JsonPreview value={rawValue} />
+      </details>
+    </>
   );
 }
 
@@ -578,16 +617,100 @@ function SourceStats({ stats }) {
       <span>{modeLabel}</span>
       <span>召回事实 {Number(stats.recalled_facts || 0)} 条</span>
       <span>涉及章节 {Number(stats.recalled_chapters || 0)} 章</span>
+      {stats.l1_route_enabled ? <span>L1 命中 {stats.l1_matched_chapters?.length || 0} 章</span> : null}
       <span>原文复核 {Number(stats.source_review_chapters || 0)}/{Number(stats.source_review_budget || 0)} 章</span>
-      {stats.missing_chapters?.length ? <span>索引缺口 {stats.missing_chapters.length} 章</span> : null}
+      {stats.entity_queries?.length ? <span>主体 {stats.entity_queries.slice(0, 4).join(" / ")}</span> : null}
+      {stats.recall_fallback_used ? <span>已启用兜底召回</span> : null}
+      {stats.l2_missing_chapters?.length ? <span>L2 覆盖缺口 {stats.l2_missing_chapters.length} 章</span> : null}
+      {stats.unrecalled_chapters?.length ? <span>未召回 {stats.unrecalled_chapters.length} 章</span> : null}
     </div>
   );
+}
+
+function SourceTracePanel({ summary, traces }) {
+  const traceList = Array.isArray(traces) ? traces : [];
+  if (!summary?.evidence_packet_count && !traceList.length) return null;
+  const sourceTypes = countEntries(summary?.source_types);
+  const categories = countEntries(summary?.categories).slice(0, 6);
+  const visibleParts = traceList
+    .filter((trace) => trace.stage === "json_field_batch" || trace.stage === "text_final_merge" || trace.part_key === "json.final.merge")
+    .slice(0, 8);
+  return (
+    <details className="source-trace-panel">
+      <summary>
+        <span>来源追踪</span>
+        <small>
+          {Number(summary?.evidence_packet_count || 0)} 个证据包
+          {summary?.chapters?.count ? ` · ${summary.chapters.count} 章` : ""}
+        </small>
+      </summary>
+      <div className="source-trace-body">
+        <div className="source-trace-chips">
+          {sourceTypes.map(([key, value]) => <span key={key}>{sourceTypeLabel(key)} {value}</span>)}
+          {categories.map(([key, value]) => <span key={key}>{categoryLabel(key)} {value}</span>)}
+          {summary?.trimmed_by_budget ? <span>已按预算压缩</span> : null}
+          {summary?.omitted_by_budget ? <span>省略 {summary.omitted_by_budget} 包</span> : null}
+        </div>
+        {summary?.subjects?.length ? (
+          <div className="muted-line">主体：{summary.subjects.slice(0, 8).join(" / ")}</div>
+        ) : null}
+        {summary?.chapters?.sample?.length ? (
+          <div className="muted-line">章节样本：{compactIndexes(summary.chapters.sample)}</div>
+        ) : null}
+        {visibleParts.length ? (
+          <div className="source-trace-grid">
+            {visibleParts.map((trace) => (
+              <div className="source-trace-card" key={trace.part_key}>
+                <strong>{trace.field_name || trace.part_key}</strong>
+                <span>{trace.part_key}</span>
+                <small>
+                  {Number(trace.evidence_packet_count || 0)} 包
+                  {trace.chapters?.count ? ` · ${trace.chapters.count} 章` : ""}
+                  {trace.batch && trace.total_batches > 1 ? ` · ${trace.batch}/${trace.total_batches}` : ""}
+                </small>
+              </div>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </details>
+  );
+}
+
+function countEntries(value) {
+  return Object.entries(value || {})
+    .filter(([, count]) => Number(count || 0) > 0)
+    .sort((left, right) => Number(right[1] || 0) - Number(left[1] || 0));
+}
+
+function sourceTypeLabel(value) {
+  return {
+    l2_fact: "L2",
+    source_review: "原文复核",
+    chapter_summary: "章节摘要"
+  }[value] || value;
+}
+
+function categoryLabel(value) {
+  return {
+    character: "人物",
+    relationship: "关系",
+    cultivation: "修行",
+    item: "物品",
+    force: "势力",
+    location: "地点",
+    event: "事件",
+    foreshadowing: "伏笔",
+    other: "其他"
+  }[value] || value;
 }
 
 function PartialResultView({ analysis, analysisBusy, onResume }) {
   const completed = analysis.chapterResults || [];
   const failed = analysis.failedChapterIndexes || [];
   const pending = analysis.pendingChapterIndexes || [];
+  const summaryProgress = analysis.summaryProgress || null;
+  const failedSummaryParts = analysis.failedSummaryParts || [];
   return (
     <div className="partial-result-stack">
       <div className="partial-result-header">
@@ -607,10 +730,32 @@ function PartialResultView({ analysis, analysisBusy, onResume }) {
         ) : null}
       </div>
 
+      {analysis.error_summary ? (
+        <div className="inline-warning">
+          <FileText size={15} />
+          {analysis.error_summary}
+        </div>
+      ) : null}
+
+      {summaryProgress?.total ? (
+        <div className="source-stats">
+          <span>最终汇总分块 {summaryProgress.completed}/{summaryProgress.total}</span>
+          {summaryProgress.running ? <span>运行 {summaryProgress.running}</span> : null}
+          {summaryProgress.failed ? <span>失败 {summaryProgress.failed}</span> : null}
+        </div>
+      ) : null}
+      <SourceTracePanel summary={analysis.sourceTraceSummary} traces={analysis.sourceTrace} />
+
       {failed.length ? (
         <div className="inline-warning">
           <FileText size={15} />
           失败章节：{failed.join(", ")}
+        </div>
+      ) : null}
+      {failedSummaryParts.length ? (
+        <div className="inline-warning">
+          <FileText size={15} />
+          汇总分块失败：{failedSummaryParts.slice(0, 4).map((part) => part.part_key).join(", ")}
         </div>
       ) : null}
       {pending.length ? (

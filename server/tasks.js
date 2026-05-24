@@ -67,6 +67,34 @@ export function listTasks(filter = {}) {
     .map((task) => publicTask(task));
 }
 
+export function taskDiagnostics() {
+  const all = [...tasks.values()];
+  const byStatus = {};
+  const byType = {};
+  for (const task of all) {
+    byStatus[task.status] = (byStatus[task.status] || 0) + 1;
+    byType[task.type] = (byType[task.type] || 0) + 1;
+  }
+  return {
+    total: all.length,
+    live: all.filter(isLiveTask).length,
+    by_status: byStatus,
+    by_type: byType,
+    recent: all
+      .sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime())
+      .slice(0, 12)
+      .map((task) => ({
+        id: task.id,
+        type: task.type,
+        status: task.status,
+        createdAt: task.createdAt,
+        updatedAt: task.updatedAt,
+        progress: task.progress,
+        error: task.error
+      }))
+  };
+}
+
 export function publicTask(task) {
   return {
     id: task.id,

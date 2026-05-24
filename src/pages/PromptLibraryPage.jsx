@@ -12,9 +12,11 @@ import {
   Plus,
   RefreshCcw,
   Save,
+  Sparkles,
+  X,
   Trash2
 } from "lucide-react";
-import { apiDelete, apiPost, apiPut, formatTime } from "../api.js";
+import { apiDelete, apiGet, apiPost, apiPut, formatTime } from "../api.js";
 import { IconButton, Panel } from "../ui.jsx";
 
 const emptyDraft = {
@@ -66,6 +68,8 @@ export function PromptLibraryPage({
   const [indexData, setIndexData] = useState(null);
   const [indexSaving, setIndexSaving] = useState({ l1: false, l2: false });
   const [rebuildPrompt, setRebuildPrompt] = useState(null);
+  const [guideTemplates, setGuideTemplates] = useState(null);
+  const [guideRequest, setGuideRequest] = useState(null);
 
   const selectedBook = useMemo(
     () => books.find((book) => book.book_id === selectedBookId) || null,
@@ -93,11 +97,13 @@ export function PromptLibraryPage({
   async function loadBookPromptState(bookId) {
     setError("");
     try {
-      const [indexResponse, groups] = await Promise.all([
+      const [indexResponse, groups, templatesResponse] = await Promise.all([
         onLoadBookIndexPrompts(bookId),
-        onLoadPromptGroups(bookId)
+        onLoadPromptGroups(bookId),
+        guideTemplates ? Promise.resolve({ templates: guideTemplates }) : apiGet("/api/prompt-guides/templates")
       ]);
       setIndexData(indexResponse);
+      setGuideTemplates(templatesResponse.templates || {});
       setBookPromptGroups(groups);
       const first = groups[0] || null;
       setSelectedId(first?.id || "");
@@ -230,6 +236,53 @@ export function PromptLibraryPage({
     setDraft((current) => ({ ...current, ...patch }));
   }
 
+  function openGuide(type, currentPrompt = "", mode = "create") {
+    if (!selectedBookId) {
+      setError("请先选择或新建一本书。");
+      return;
+    }
+    if (mode === "optimize" && !String(currentPrompt || "").trim()) {
+      setError("请先选择或填写一条分析 Prompt。");
+      return;
+    }
+    setGuideRequest({
+      type,
+      mode,
+      bookId: selectedBookId,
+      bookName: selectedBook?.book_name || selectedBookId,
+      currentPrompt
+    });
+  }
+
+  function applyGuideSuggestion(type, suggestion) {
+    const prompt = suggestion?.prompt_suggestion || "";
+    if (!prompt) return;
+    if (type === "l1") {
+      setIndexData((current) => current ? {
+        ...current,
+        indexPrompts: {
+          ...current.indexPrompts,
+          l1_index_prompt: prompt
+        }
+      } : current);
+      return;
+    }
+    if (type === "l2") {
+      setIndexData((current) => current ? {
+        ...current,
+        indexPrompts: {
+          ...current.indexPrompts,
+          l2_index_prompt: prompt
+        }
+      } : current);
+      return;
+    }
+    updateDraft({
+      name: draft.name || suggestion.title_suggestion || "",
+      summary_prompt: prompt
+    });
+  }
+
   const indexPrompts = indexData?.indexPrompts || null;
   const l1Coverage = indexData?.coverage?.l1 || null;
   const l2Coverage = indexData?.coverage?.l2 || null;
@@ -298,6 +351,7 @@ export function PromptLibraryPage({
               <div className="index-prompt-stack">
                 <IndexPromptEditor
                   key={`l1-${selectedBookId}-${indexPrompts.l1_index_prompt_hash}-${indexPrompts.updated_at}`}
+                  type="l1"
                   title="L1 Prompt"
                   value={indexPrompts.l1_index_prompt}
                   hash={indexPrompts.l1_index_prompt_hash}
@@ -305,9 +359,11 @@ export function PromptLibraryPage({
                   coverage={l1Coverage}
                   saving={indexSaving.l1}
                   onSave={(prompt) => saveIndexPrompt("l1", prompt)}
+                  onOpenGuide={(currentPrompt) => openGuide("l1", currentPrompt)}
                 />
                 <IndexPromptEditor
                   key={`l2-${selectedBookId}-${indexPrompts.l2_index_prompt_hash}-${indexPrompts.updated_at}`}
+                  type="l2"
                   title="L2 Prompt"
                   value={indexPrompts.l2_index_prompt}
                   hash={indexPrompts.l2_index_prompt_hash}
@@ -315,6 +371,7 @@ export function PromptLibraryPage({
                   coverage={l2Coverage}
                   saving={indexSaving.l2}
                   onSave={(prompt) => saveIndexPrompt("l2", prompt)}
+                  onOpenGuide={(currentPrompt) => openGuide("l2", currentPrompt)}
                 />
                 {rebuildPrompt ? (
                   <RebuildConfirm
@@ -330,7 +387,16 @@ export function PromptLibraryPage({
         </section>
 
         <section className="prompt-analysis-column">
-          <Panel icon={ClipboardList} title="分析 Prompt" action={<IconButton icon={Plus} label="新建" onClick={startCreatePrompt} />}>
+          <Panel
+            icon={ClipboardList}
+            title="分析 Prompt"
+            action={
+              <div className="panel-action-row">
+                <IconButton icon={Sparkles} label="创建引导" onClick={() => openGuide("analysis", draft.summary_prompt, "create")} />
+                <IconButton icon={Plus} label="新建" onClick={startCreatePrompt} />
+              </div>
+            }
+          >
             <div className="prompt-analysis-grid">
               <div className="prompt-group-list scoped">
                 {bookPromptGroups.length ? bookPromptGroups.map((group) => (
@@ -359,7 +425,18 @@ export function PromptLibraryPage({
                   />
                 </label>
                 <label>
-                  <span>分析 Prompt</span>
+                  <span className="label-action-row">
+                    分析 Prompt
+                    <button
+                      className="ghost mini"
+                      type="button"
+                      onClick={() => openGuide("analysis", draft.summary_prompt, "optimize")}
+                      disabled={!draft.summary_prompt.trim()}
+                    >
+                      <Sparkles size={13} />
+                      优化
+                    </button>
+                  </span>
                   <textarea
                     className="prompt-library-textarea"
                     value={draft.summary_prompt}
@@ -382,6 +459,15 @@ export function PromptLibraryPage({
           </Panel>
         </section>
       </div>
+      {guideRequest ? (
+        <PromptGuideDrawer
+          request={guideRequest}
+          templates={guideTemplates || {}}
+          onClose={() => setGuideRequest(null)}
+          onApply={(suggestion) => applyGuideSuggestion(guideRequest.type, suggestion)}
+          setError={setError}
+        />
+      ) : null}
     </section>
   );
 }
@@ -396,15 +482,21 @@ function PromptBookMeta({ book }) {
   );
 }
 
-function IndexPromptEditor({ title, description, value, hash, updatedAt, coverage, saving, onSave }) {
+function IndexPromptEditor({ type, title, description, value, hash, updatedAt, coverage, saving, onSave, onOpenGuide }) {
   const [locked, setLocked] = useState(true);
-  const [draft, setDraft] = useState(value);
+  const [draftState, setDraftState] = useState({ source: value, draft: value });
+  const syncedDraftState = draftState.source === value ? draftState : { source: value, draft: value };
+  const draft = syncedDraftState.draft;
   const shortHash = String(hash || "").slice(0, 10);
   const tipConfig = title.startsWith("L1")
     ? { title: "L1 撰写建议", tips: l1WritingTips }
     : title.startsWith("L2")
       ? { title: "L2 撰写建议", tips: l2WritingTips }
       : null;
+
+  function setDraft(nextDraft) {
+    setDraftState({ source: value, draft: nextDraft });
+  }
 
   async function handleSave() {
     try {
@@ -429,7 +521,7 @@ function IndexPromptEditor({ title, description, value, hash, updatedAt, coverag
           className="secondary inline"
           type="button"
           onClick={() => {
-            if (!locked) setDraft(value);
+            if (!locked) setDraftState({ source: value, draft: value });
             setLocked((state) => !state);
           }}
         >
@@ -453,8 +545,212 @@ function IndexPromptEditor({ title, description, value, hash, updatedAt, coverag
           </button>
         </div>
       ) : null}
+      <div className="index-prompt-guide-row">
+        <button className="ghost" type="button" onClick={() => onOpenGuide?.(draft)}>
+          <Sparkles size={14} />
+          {type === "l1" ? "L1 创建引导" : "L2 创建引导"}
+        </button>
+      </div>
     </div>
   );
+}
+
+function PromptGuideDrawer({ request, templates, onClose, onApply, setError }) {
+  const mode = request.mode || "create";
+  const isOptimize = mode === "optimize";
+  const template = isOptimize ? templates.analysisOptimization : templates[request.type] || null;
+  const steps = template?.steps || [];
+  const [activeStep, setActiveStep] = useState(0);
+  const [answers, setAnswers] = useState(() => defaultGuideAnswers(steps));
+  const [showRules, setShowRules] = useState(true);
+  const [generating, setGenerating] = useState(false);
+  const [suggestion, setSuggestion] = useState(null);
+  const [applied, setApplied] = useState(false);
+  const currentStep = steps[activeStep] || null;
+  const answeredCount = steps.filter((step) => String(answers[step.id] || "").trim()).length;
+  const canGenerate = answeredCount > 0 && !generating;
+  const guideKind = request.type === "analysis" ? "analysis" : "index";
+
+  function updateAnswer(stepId, value) {
+    setAnswers((current) => ({ ...current, [stepId]: value }));
+  }
+
+  async function generateSuggestion() {
+    setGenerating(true);
+    setError("");
+    setSuggestion(null);
+    setApplied(false);
+    try {
+      const data = await apiPost("/api/prompt-guides/generate", {
+        type: request.type,
+        book_id: request.bookId,
+        current_prompt: request.currentPrompt,
+        answers: steps.map((step) => ({ id: step.id, answer: answers[step.id] || "" }))
+      });
+      setSuggestion(data.suggestion);
+    } catch (error) {
+      setError(error.message);
+    } finally {
+      setGenerating(false);
+    }
+  }
+
+  async function optimizeSuggestion() {
+    setGenerating(true);
+    setError("");
+    setSuggestion(null);
+    setApplied(false);
+    try {
+      const data = await apiPost("/api/prompt-guides/optimize", {
+        book_id: request.bookId,
+        current_prompt: request.currentPrompt,
+        optimization_request: answers[steps[0]?.id] || ""
+      });
+      setSuggestion(data.suggestion);
+    } catch (error) {
+      setError(error.message);
+    } finally {
+      setGenerating(false);
+    }
+  }
+
+  async function copySuggestion() {
+    if (!suggestion?.prompt_suggestion) return;
+    await navigator.clipboard?.writeText(suggestion.prompt_suggestion);
+  }
+
+  function applySuggestion() {
+    if (!suggestion?.prompt_suggestion) return;
+    onApply(suggestion);
+    setApplied(true);
+  }
+
+  return (
+    <div className="guide-drawer-overlay" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) onClose();
+    }}>
+      <aside className="guide-drawer" aria-label="Prompt 创建引导">
+        <div className="guide-drawer-head">
+          <div>
+            <span>{request.bookName}</span>
+            <h2>{template?.label || "Prompt 创建引导"}</h2>
+            <p>{template?.positioning}</p>
+          </div>
+          <button className="icon-only" type="button" onClick={onClose} aria-label="关闭">
+            <X size={16} />
+          </button>
+        </div>
+
+        <div className={`guide-scope-card ${guideKind}`}>
+          <strong>{guideKind === "index" ? "书籍级索引 Prompt" : "书籍级分析 Prompt"}</strong>
+          <span>
+            {guideKind === "index"
+              ? "绑定当前书籍，构建后不轻易调整；修改会影响索引过期判断。"
+              : isOptimize
+                ? "基于当前分析 Prompt 进行打磨；生成后可套用到草稿，仍需手动保存。"
+                : "绑定当前书籍，可为不同分析任务创建多条；创建任务时选择使用。"}
+          </span>
+        </div>
+
+        <div className="guide-step-tabs">
+          {steps.map((step, index) => (
+            <button
+              key={step.id}
+              type="button"
+              className={index === activeStep ? "active" : ""}
+              onClick={() => setActiveStep(index)}
+            >
+              <span>{index + 1}</span>
+              {step.title}
+            </button>
+          ))}
+        </div>
+
+        {currentStep ? (
+          <section className="guide-question-card">
+            <div className="guide-question-top">
+              <span>{currentStep.title}</span>
+              <small>{activeStep + 1}/{steps.length}</small>
+            </div>
+            <h3>{currentStep.question}</h3>
+            {currentStep.helper ? <p className="guide-question-help">{currentStep.helper}</p> : null}
+            <textarea
+              value={answers[currentStep.id] || ""}
+              placeholder={currentStep.placeholder}
+              onChange={(event) => updateAnswer(currentStep.id, event.target.value)}
+            />
+            <div className="guide-nav-row">
+              <button className="secondary inline" type="button" onClick={() => setActiveStep(Math.max(0, activeStep - 1))} disabled={activeStep === 0}>
+                上一步
+              </button>
+              <button className="secondary inline" type="button" onClick={() => setActiveStep(Math.min(steps.length - 1, activeStep + 1))} disabled={activeStep >= steps.length - 1}>
+                下一步
+              </button>
+            </div>
+          </section>
+        ) : null}
+
+        <section className="guide-rules-card">
+          <button className="guide-rules-toggle" type="button" onClick={() => setShowRules((state) => !state)}>
+            <span>{isOptimize ? "内置优化规则" : "内置生成规则"}</span>
+            <strong>{showRules ? "收起" : "查看"}</strong>
+          </button>
+          {showRules ? <pre>{template?.builtInPrompt || ""}</pre> : null}
+        </section>
+
+        <div className="guide-generate-row">
+          <button className="primary" type="button" onClick={isOptimize ? optimizeSuggestion : generateSuggestion} disabled={!canGenerate}>
+            {generating ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
+            {isOptimize ? "生成优化参考" : "生成 Prompt 参考"}
+          </button>
+          <span>{answeredCount}/{steps.length} 段已填写</span>
+        </div>
+
+        {suggestion ? (
+          <section className="guide-result-card">
+            <div className="guide-result-head">
+              <div>
+                <span>参考结果</span>
+                <h3>{suggestion.title_suggestion || "Prompt 建议"}</h3>
+              </div>
+              <div className="guide-result-actions">
+                <button className="ghost" type="button" onClick={copySuggestion}>
+                  <Copy size={14} />
+                  复制
+                </button>
+                <button className="secondary inline" type="button" onClick={applySuggestion}>
+                  套用到编辑器
+                </button>
+              </div>
+            </div>
+            {applied ? <div className="draft-banner active">已套用到当前草稿，仍需手动保存。</div> : null}
+            <textarea readOnly value={suggestion.prompt_suggestion || ""} />
+            {suggestion.rationale ? <p>{suggestion.rationale}</p> : null}
+            {suggestion.usage_notes?.length ? (
+              <div className="guide-note-list">
+                <strong>使用提示</strong>
+                <ul>
+                  {suggestion.usage_notes.map((note) => <li key={note}>{note}</li>)}
+                </ul>
+              </div>
+            ) : null}
+            {suggestion.quality_checklist?.length ? (
+              <div className="guide-note-list">
+                <strong>检查清单</strong>
+                <ul>
+                  {suggestion.quality_checklist.map((note) => <li key={note}>{note}</li>)}
+                </ul>
+              </div>
+            ) : null}
+          </section>
+        ) : null}
+      </aside>
+    </div>
+  );
+}
+
+function defaultGuideAnswers(steps) {
+  return Object.fromEntries((steps || []).map((step) => [step.id, step.placeholder || ""]));
 }
 
 function PromptTipPopover({ title, tips }) {

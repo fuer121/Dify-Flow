@@ -10,6 +10,7 @@ import {
   deletePromptGroup,
   ensureBook,
   getBookIndexPrompts,
+  getDatabaseDiagnostics,
   getPromptGroup,
   getPromptSettings,
   getIndexPromptSettings,
@@ -25,9 +26,10 @@ import {
   saveIndexPromptSettings,
   savePromptSettings
 } from "./db.js";
-import { cancelTask, getTask, listTasks, pauseTask, publicTask, resumeTask, subscribeTask } from "./tasks.js";
+import { cancelTask, getTask, listTasks, pauseTask, publicTask, resumeTask, subscribeTask, taskDiagnostics } from "./tasks.js";
 import { sanitizeError } from "./sanitize.js";
 import { testDifyConnection } from "./dify.js";
+import { generatePromptGuideSuggestion, getPromptGuideTemplates, optimizeAnalysisPromptSuggestion } from "./promptGuides.js";
 import {
   publicAnalysisRunWithResult,
   getL2IndexCoverageForBook,
@@ -48,6 +50,25 @@ app.use(express.json({ limit: "2mb" }));
 
 app.get("/api/config", (_request, response) => {
   response.json({ ok: true, runtime: publicRuntimeConfig() });
+});
+
+app.get("/api/health", (_request, response) => {
+  response.json({
+    ok: true,
+    status: "ok",
+    generated_at: new Date().toISOString(),
+    runtime: publicRuntimeConfig()
+  });
+});
+
+app.get("/api/diagnostics", (_request, response) => {
+  response.json({
+    ok: true,
+    generated_at: new Date().toISOString(),
+    runtime: publicRuntimeConfig(),
+    database: getDatabaseDiagnostics(),
+    tasks: taskDiagnostics()
+  });
 });
 
 app.get("/api/openai/test", async (_request, response, next) => {
@@ -519,6 +540,26 @@ app.put("/api/prompt-groups/:id", (request, response, next) => {
 app.delete("/api/prompt-groups/:id", (request, response, next) => {
   try {
     response.json({ ok: true, ...deletePromptGroup(request.params.id) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/prompt-guides/templates", (_request, response) => {
+  response.json({ ok: true, templates: getPromptGuideTemplates() });
+});
+
+app.post("/api/prompt-guides/generate", async (request, response, next) => {
+  try {
+    response.json({ ok: true, ...(await generatePromptGuideSuggestion(request.body || {})) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/prompt-guides/optimize", async (request, response, next) => {
+  try {
+    response.json({ ok: true, ...(await optimizeAnalysisPromptSuggestion(request.body || {})) });
   } catch (error) {
     next(error);
   }

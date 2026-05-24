@@ -6,6 +6,41 @@ import { sanitizeDetails, sanitizeText } from "./sanitize.js";
 
 export async function callOpenAIJson({ model, reasoningEffort, instructions, input, schema, schemaName = "result", maxOutputTokens, strict = true }) {
   requireOpenAIConfig();
+  const body = buildOpenAIJsonBody({ model, reasoningEffort, instructions, input, schema, schemaName, maxOutputTokens, strict });
+
+  const response = await postOpenAIJson("responses", body);
+
+  if (!response.ok) {
+    const error = new Error(sanitizeText(response.data?.error?.message || response.data?.message || `OpenAI 调用失败：HTTP ${response.status}`));
+    error.status = response.status;
+    error.details = sanitizeDetails(response.data);
+    throw error;
+  }
+
+  const text = extractResponseText(response.data);
+  const parsed = parseJsonOrNull(text);
+  if (parsed !== null) {
+    return {
+      value: parsed,
+      responseId: response.data?.id || null
+    };
+  }
+
+  const repaired = await repairOpenAIJsonOutput({
+    model,
+    reasoningEffort,
+    schema,
+    schemaName,
+    strict,
+    originalText: text
+  });
+  return {
+    value: repaired.value,
+    responseId: [response.data?.id, repaired.responseId].filter(Boolean).join(",") || null
+  };
+}
+
+function buildOpenAIJsonBody({ model, reasoningEffort, instructions, input, schema, schemaName = "result", maxOutputTokens, strict = true }) {
   const body = {
     model: model || config.openai.model,
     store: false,
@@ -26,27 +61,69 @@ export async function callOpenAIJson({ model, reasoningEffort, instructions, inp
   if (Number.isFinite(Number(maxOutputTokens)) && Number(maxOutputTokens) > 0) {
     body.max_output_tokens = Number(maxOutputTokens);
   }
+  return body;
+}
 
-  const response = await postOpenAIJson("responses", body);
-
-  if (!response.ok) {
-    const error = new Error(sanitizeText(response.data?.error?.message || response.data?.message || `OpenAI 调用失败：HTTP ${response.status}`));
-    error.status = response.status;
-    error.details = sanitizeDetails(response.data);
-    throw error;
-  }
-
-  const text = extractResponseText(response.data);
-  try {
-    return {
-      value: JSON.parse(text),
-      responseId: response.data?.id || null
-    };
-  } catch (error) {
-    const wrapped = new Error(`OpenAI 返回不是合法 JSON：${error.message}`);
+async function repairOpenAIJsonOutput({ model, schema, schemaName, strict, originalText }) {
+  if (!String(originalText || "").trim()) {
+    const wrapped = new Error("OpenAI 返回不是合法 JSON：空响应");
     wrapped.status = 502;
     throw wrapped;
   }
+  const repairBody = buildOpenAIJsonBody({
+    model,
+    reasoningEffort: "low",
+    instructions: "你是 JSON 修复器。请只把用户提供的破损 JSON 修复为符合目标 Schema 的合法 JSON。不得添加解释、Markdown 或额外字段；缺失且无法恢复的字段使用符合 Schema 的空值。",
+    input: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: [
+              "目标 Schema JSON：",
+              JSON.stringify(schema || {}),
+              "",
+              "破损 JSON 文本：",
+              clipRepairText(originalText)
+            ].join("\n")
+          }
+        ]
+      }
+    ],
+    schema,
+    schemaName: safeRepairSchemaName(schemaName),
+    strict,
+    maxOutputTokens: 2000
+  });
+  const repairResponse = await postOpenAIJson("responses", repairBody);
+  if (!repairResponse.ok) {
+    const error = new Error(sanitizeText(repairResponse.data?.error?.message || repairResponse.data?.message || `OpenAI JSON 修复失败：HTTP ${repairResponse.status}`));
+    error.status = repairResponse.status;
+    error.details = sanitizeDetails(repairResponse.data);
+    throw error;
+  }
+  const repairedText = extractResponseText(repairResponse.data);
+  const repairedValue = parseJsonOrNull(repairedText);
+  if (repairedValue !== null) {
+    return {
+      value: repairedValue,
+      responseId: repairResponse.data?.id || null
+    };
+  }
+  const wrapped = new Error("OpenAI 返回不是合法 JSON，自动修复后仍失败。");
+  wrapped.status = 502;
+  throw wrapped;
+}
+
+function safeRepairSchemaName(schemaName) {
+  return `${String(schemaName || "result").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 48) || "result"}_repair`;
+}
+
+function clipRepairText(value) {
+  const text = String(value || "");
+  if (text.length <= 12_000) return text;
+  return `${text.slice(0, 10_000)}\n...\n${text.slice(-2000)}`;
 }
 
 export async function callOpenAIText({ model, reasoningEffort, instructions, input, maxOutputTokens }) {
@@ -87,23 +164,38 @@ async function postOpenAIJson(path, body) {
   };
   const payload = JSON.stringify(body);
 
-  try {
-    if (config.openai.proxyUrl) {
-      return await postJsonViaHttpProxy(endpoint, headers, payload);
+  let lastError = null;
+  for (let attempt = 0; attempt <= config.openai.maxRetries; attempt += 1) {
+    try {
+      const result = config.openai.proxyUrl
+        ? await postJsonViaHttpProxy(endpoint, headers, payload)
+        : await postJsonDirect(endpoint, headers, payload);
+      if (!isRetryableOpenAIStatus(result.status) || attempt >= config.openai.maxRetries) {
+        return result;
+      }
+      lastError = new Error(`OpenAI 临时失败：HTTP ${result.status}`);
+    } catch (error) {
+      if (!isRetryableOpenAIError(error) || attempt >= config.openai.maxRetries) {
+        throw openAINetworkError(error);
+      }
+      lastError = error;
     }
-    const response = await fetchWithTimeout(endpoint, {
-      method: "POST",
-      headers,
-      body: payload
-    });
-    return {
-      ok: response.ok,
-      status: response.status,
-      data: await response.json().catch(() => null)
-    };
-  } catch (error) {
-    throw openAINetworkError(error);
+    await delay(openAIRetryDelayMs(attempt));
   }
+  throw openAINetworkError(lastError);
+}
+
+async function postJsonDirect(endpoint, headers, payload) {
+  const response = await fetchWithTimeout(endpoint, {
+    method: "POST",
+    headers,
+    body: payload
+  });
+  return {
+    ok: response.ok,
+    status: response.status,
+    data: await response.json().catch(() => null)
+  };
 }
 
 async function fetchWithTimeout(url, options) {
@@ -231,6 +323,42 @@ function openAINetworkError(error) {
     proxyConfigured: Boolean(config.openai.proxyUrl)
   });
   return wrapped;
+}
+
+function isRetryableOpenAIStatus(status) {
+  return [408, 409, 425, 429, 500, 502, 503, 504].includes(Number(status));
+}
+
+function isRetryableOpenAIError(error) {
+  if (error?.status && !isRetryableOpenAIStatus(error.status)) return false;
+  const message = String(error?.message || "").toLowerCase();
+  return [
+    "aborted",
+    "aborterror",
+    "timeout",
+    "timed out",
+    "socket",
+    "tls",
+    "econnreset",
+    "econnrefused",
+    "enotfound",
+    "etimedout",
+    "fetch failed",
+    "proxy",
+    "network",
+    "超时",
+    "代理",
+    "连接失败",
+    "网络"
+  ].some((token) => message.includes(token));
+}
+
+function openAIRetryDelayMs(attempt) {
+  return Math.min(12_000, 1000 * 2 ** attempt);
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export async function testOpenAIConnection() {

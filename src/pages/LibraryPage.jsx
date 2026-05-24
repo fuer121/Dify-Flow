@@ -192,12 +192,13 @@ export function LibraryPage({
       setError("L2 起始章节和结束章节必须填写为大于 0 的整数。");
       return;
     }
+    const mode = modeOverride || l2Form.mode;
     await onStartL2Index({
       bookId: selectedBookId,
       startChapter: Number(l2Form.start_chapter),
       endChapter: Number(l2Form.end_chapter),
-      force: l2Form.force,
-      mode: modeOverride || l2Form.mode
+      force: mode === "all" ? l2Form.force : false,
+      mode
     });
   }
 

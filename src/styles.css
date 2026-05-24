@@ -743,6 +743,13 @@ label {
   font-weight: 760;
 }
 
+.label-action-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
 input,
 select,
 textarea {
@@ -878,6 +885,12 @@ textarea:focus {
   background: var(--surface-soft);
   color: var(--text);
   font-size: 12px;
+}
+
+.ghost.mini {
+  min-height: 28px;
+  padding-inline: 8px;
+  gap: 5px;
 }
 
 .ghost:hover,

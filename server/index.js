@@ -29,7 +29,7 @@ import {
 import { cancelTask, getTask, listTasks, pauseTask, publicTask, resumeTask, subscribeTask, taskDiagnostics } from "./tasks.js";
 import { sanitizeError } from "./sanitize.js";
 import { testDifyConnection } from "./dify.js";
-import { generatePromptGuideSuggestion, getPromptGuideTemplates } from "./promptGuides.js";
+import { generatePromptGuideSuggestion, getPromptGuideTemplates, optimizeAnalysisPromptSuggestion } from "./promptGuides.js";
 import {
   publicAnalysisRunWithResult,
   getL2IndexCoverageForBook,
@@ -552,6 +552,14 @@ app.get("/api/prompt-guides/templates", (_request, response) => {
 app.post("/api/prompt-guides/generate", async (request, response, next) => {
   try {
     response.json({ ok: true, ...(await generatePromptGuideSuggestion(request.body || {})) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/prompt-guides/optimize", async (request, response, next) => {
+  try {
+    response.json({ ok: true, ...(await optimizeAnalysisPromptSuggestion(request.body || {})) });
   } catch (error) {
     next(error);
   }

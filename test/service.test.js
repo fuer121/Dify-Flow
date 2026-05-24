@@ -397,6 +397,10 @@ test("prompt guide generation exposes templates and keeps OpenAI request ZDR-sha
   assert.equal(templates.l1.scope, "书籍级索引 Prompt");
   assert.equal(templates.l2.steps.length >= 3, true);
   assert.equal(templates.analysis.scope, "书籍级分析 Prompt");
+  assert.equal(templates.analysis.steps.map((step) => step.title).join(","), "用途,输出");
+  assert.equal(templates.analysisOptimization.label, "分析 Prompt 优化");
+  assert.equal(templates.analysisOptimization.steps.length, 1);
+  assert.equal(templates.analysisOptimization.builtInPrompt.includes("优化一条已经存在"), true);
   for (const template of Object.values(templates)) {
     for (const step of template.steps) {
       assert.equal(step.placeholder.includes("例如"), false);
@@ -444,6 +448,55 @@ test("prompt guide generation exposes templates and keeps OpenAI request ZDR-sha
     assert.equal(Object.hasOwn(capturedBody, "background"), false);
     assert.equal(capturedBody.text.format.name, "prompt_guide_result");
     assert.equal(JSON.stringify(capturedBody.input).includes("引导测试书"), true);
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("analysis prompt optimization keeps OpenAI request ZDR-shaped and includes current prompt", async () => {
+  db.ensureBook("guide-opt-book", "优化测试书");
+  const previousFetch = global.fetch;
+  let capturedBody;
+  global.fetch = async (url, request) => {
+    if (!String(url).includes("api.openai.com/v1/responses")) {
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    }
+    capturedBody = JSON.parse(request.body);
+    return {
+      ok: true,
+      json: async () => ({
+        id: "resp_prompt_optimize",
+        output: [{
+          content: [{
+            type: "output_text",
+            text: JSON.stringify({
+              title_suggestion: "轻量人物形象分析",
+              prompt_suggestion: "只输出角色、身份和形象描述。",
+              rationale: "按优化诉求收窄字段。",
+              usage_notes: ["套用后保存。"],
+              quality_checklist: ["字段足够轻。"]
+            })
+          }]
+        }]
+      })
+    };
+  };
+
+  try {
+    const result = await promptGuides.optimizeAnalysisPromptSuggestion({
+      book_id: "guide-opt-book",
+      current_prompt: "当前 Prompt：输出角色关系和证据。",
+      optimization_request: "删掉关系和证据，只保留形象字段。"
+    });
+    assert.equal(result.suggestion.title_suggestion, "轻量人物形象分析");
+    assert.equal(result.suggestion.prompt_suggestion, "只输出角色、身份和形象描述。");
+    assert.equal(capturedBody.store, false);
+    assert.equal(Object.hasOwn(capturedBody, "background"), false);
+    assert.equal(capturedBody.text.format.name, "prompt_optimization_result");
+    const inputText = JSON.stringify(capturedBody.input);
+    assert.equal(inputText.includes("优化测试书"), true);
+    assert.equal(inputText.includes("当前 Prompt：输出角色关系和证据。"), true);
+    assert.equal(inputText.includes("删掉关系和证据，只保留形象字段。"), true);
   } finally {
     global.fetch = previousFetch;
   }

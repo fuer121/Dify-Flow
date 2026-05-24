@@ -236,13 +236,18 @@ export function PromptLibraryPage({
     setDraft((current) => ({ ...current, ...patch }));
   }
 
-  function openGuide(type, currentPrompt = "") {
+  function openGuide(type, currentPrompt = "", mode = "create") {
     if (!selectedBookId) {
       setError("请先选择或新建一本书。");
       return;
     }
+    if (mode === "optimize" && !String(currentPrompt || "").trim()) {
+      setError("请先选择或填写一条分析 Prompt。");
+      return;
+    }
     setGuideRequest({
       type,
+      mode,
       bookId: selectedBookId,
       bookName: selectedBook?.book_name || selectedBookId,
       currentPrompt
@@ -387,7 +392,7 @@ export function PromptLibraryPage({
             title="分析 Prompt"
             action={
               <div className="panel-action-row">
-                <IconButton icon={Sparkles} label="创建引导" onClick={() => openGuide("analysis", draft.summary_prompt)} />
+                <IconButton icon={Sparkles} label="创建引导" onClick={() => openGuide("analysis", draft.summary_prompt, "create")} />
                 <IconButton icon={Plus} label="新建" onClick={startCreatePrompt} />
               </div>
             }
@@ -420,7 +425,18 @@ export function PromptLibraryPage({
                   />
                 </label>
                 <label>
-                  <span>分析 Prompt</span>
+                  <span className="label-action-row">
+                    分析 Prompt
+                    <button
+                      className="ghost mini"
+                      type="button"
+                      onClick={() => openGuide("analysis", draft.summary_prompt, "optimize")}
+                      disabled={!draft.summary_prompt.trim()}
+                    >
+                      <Sparkles size={13} />
+                      优化
+                    </button>
+                  </span>
                   <textarea
                     className="prompt-library-textarea"
                     value={draft.summary_prompt}
@@ -540,7 +556,9 @@ function IndexPromptEditor({ type, title, description, value, hash, updatedAt, c
 }
 
 function PromptGuideDrawer({ request, templates, onClose, onApply, setError }) {
-  const template = templates[request.type] || null;
+  const mode = request.mode || "create";
+  const isOptimize = mode === "optimize";
+  const template = isOptimize ? templates.analysisOptimization : templates[request.type] || null;
   const steps = template?.steps || [];
   const [activeStep, setActiveStep] = useState(0);
   const [answers, setAnswers] = useState(() => defaultGuideAnswers(steps));
@@ -568,6 +586,25 @@ function PromptGuideDrawer({ request, templates, onClose, onApply, setError }) {
         book_id: request.bookId,
         current_prompt: request.currentPrompt,
         answers: steps.map((step) => ({ id: step.id, answer: answers[step.id] || "" }))
+      });
+      setSuggestion(data.suggestion);
+    } catch (error) {
+      setError(error.message);
+    } finally {
+      setGenerating(false);
+    }
+  }
+
+  async function optimizeSuggestion() {
+    setGenerating(true);
+    setError("");
+    setSuggestion(null);
+    setApplied(false);
+    try {
+      const data = await apiPost("/api/prompt-guides/optimize", {
+        book_id: request.bookId,
+        current_prompt: request.currentPrompt,
+        optimization_request: answers[steps[0]?.id] || ""
       });
       setSuggestion(data.suggestion);
     } catch (error) {
@@ -609,7 +646,9 @@ function PromptGuideDrawer({ request, templates, onClose, onApply, setError }) {
           <span>
             {guideKind === "index"
               ? "绑定当前书籍，构建后不轻易调整；修改会影响索引过期判断。"
-              : "绑定当前书籍，可为不同分析任务创建多条；创建任务时选择使用。"}
+              : isOptimize
+                ? "基于当前分析 Prompt 进行打磨；生成后可套用到草稿，仍需手动保存。"
+                : "绑定当前书籍，可为不同分析任务创建多条；创建任务时选择使用。"}
           </span>
         </div>
 
@@ -653,16 +692,16 @@ function PromptGuideDrawer({ request, templates, onClose, onApply, setError }) {
 
         <section className="guide-rules-card">
           <button className="guide-rules-toggle" type="button" onClick={() => setShowRules((state) => !state)}>
-            <span>内置生成规则</span>
+            <span>{isOptimize ? "内置优化规则" : "内置生成规则"}</span>
             <strong>{showRules ? "收起" : "查看"}</strong>
           </button>
           {showRules ? <pre>{template?.builtInPrompt || ""}</pre> : null}
         </section>
 
         <div className="guide-generate-row">
-          <button className="primary" type="button" onClick={generateSuggestion} disabled={!canGenerate}>
+          <button className="primary" type="button" onClick={isOptimize ? optimizeSuggestion : generateSuggestion} disabled={!canGenerate}>
             {generating ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
-            生成 Prompt 参考
+            {isOptimize ? "生成优化参考" : "生成 Prompt 参考"}
           </button>
           <span>{answeredCount}/{steps.length} 段已填写</span>
         </div>

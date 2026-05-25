@@ -1366,15 +1366,23 @@ async function runFinalSummaryCall({ analysisId, task, partKey, stageLabel, mode
       const response = await callOpenAIJson({
         model,
         reasoningEffort,
-        instructions: "你是严谨的小说多章节汇总引擎。按用户汇总 Prompt 输出最终结果；如果用户要求 JSON，则只输出合法 JSON，否则直接输出文本，不要添加无关解释。",
+        instructions: [
+          "你是严谨的小说多章节汇总引擎。按用户汇总 Prompt 输出最终结果；如果用户要求 JSON，则只输出合法 JSON，否则直接输出文本，不要添加无关解释。",
+          schema?.unwrapField ? `结构化输出时请先用 ${schema.unwrapField} 字段承载用户要求的数组，系统保存前会自动解包为用户要求的数组。` : ""
+        ].filter(Boolean).join("\n"),
         input,
         schema: schema.schema,
         schemaName: schema.schemaName,
         maxOutputTokens: SUMMARY_FINAL_MAX_OUTPUT_TOKENS,
         strict: schema.strict
       });
-      assertFinalSummaryUseful(parseJsonOrText(response.value), sourceChapterCount);
-      return response;
+      const finalValue = normalizeFinalSchemaValue(response.value, schema);
+      assertFinalSummaryUseful(parseJsonOrText(finalValue), sourceChapterCount, {
+        schema: schema.schema,
+        schemaName: schema.schemaName,
+        userPrompt
+      });
+      return { ...response, value: finalValue };
     });
   }
   return runPersistedSummaryNode(task, basePart, async () => {
@@ -1385,16 +1393,30 @@ async function runFinalSummaryCall({ analysisId, task, partKey, stageLabel, mode
       input,
       maxOutputTokens: SUMMARY_FINAL_MAX_OUTPUT_TOKENS
     });
-    assertFinalSummaryUseful(parseJsonOrText(response.value), sourceChapterCount);
+    assertFinalSummaryUseful(parseJsonOrText(response.value), sourceChapterCount, {
+      schema: schema?.schema || null,
+      schemaName: schema?.schemaName || "",
+      userPrompt
+    });
     return response;
   });
 }
 
 function shouldSplitCustomFinalSummary(schema) {
   if (schema?.schemaName !== "custom_final_analysis") return false;
+  if (schema?.unwrapField) return false;
   const properties = schema.schema?.properties;
   if (!properties || typeof properties !== "object" || Array.isArray(properties)) return false;
   return Object.keys(properties).length >= 2;
+}
+
+function normalizeFinalSchemaValue(value, schemaConfig) {
+  const unwrapField = schemaConfig?.unwrapField;
+  if (!unwrapField) return value;
+  if (value && typeof value === "object" && !Array.isArray(value) && Array.isArray(value[unwrapField])) {
+    return value[unwrapField];
+  }
+  return value;
 }
 
 async function runCustomFieldSummaryCalls({ analysisId, task, analysisContext = {}, model, reasoningEffort, userPrompt, sourceMaterial, materialLabel, schema, sourceChapterCount }) {
@@ -1402,6 +1424,9 @@ async function runCustomFieldSummaryCalls({ analysisId, task, analysisContext = 
   const finalValue = {};
   const responseIds = [];
   const fieldNames = Object.keys(properties);
+  const primaryContentFieldCount = fieldNames
+    .filter((fieldName) => isPotentialPrimaryContentField(fieldName, properties[fieldName]))
+    .length;
 
   for (const fieldName of fieldNames) {
     const deterministicValue = deterministicFinalFieldValue(fieldName, analysisContext, {
@@ -1446,14 +1471,19 @@ async function runCustomFieldSummaryCalls({ analysisId, task, analysisContext = 
       fieldName,
       fieldSchema: properties[fieldName],
       wrapperSchema: fieldSchema,
-      sourceChapterCount
+      sourceChapterCount,
+      primaryContentFieldCount
     });
 
     finalValue[fieldName] = fieldResult.value;
     if (fieldResult.responseId) responseIds.push(fieldResult.responseId);
   }
 
-  assertFinalSummaryUseful(finalValue, sourceChapterCount);
+  assertFinalSummaryUseful(finalValue, sourceChapterCount, {
+    schema: schema.schema,
+    schemaName: schema.schemaName,
+    userPrompt
+  });
   await saveAnalysisSummaryPart({
     analysisId,
     partKey: "json.final.merge",
@@ -1520,11 +1550,11 @@ function isDeterministicTemplateField(fieldName, fieldSchema, templateValue) {
 
 function isAnalysisParameterField(fieldName, fieldSchema) {
   if (!isScalarFieldSchema(fieldSchema)) return false;
-  return /^(target|target_subject|subject|analysis_subject|analysis_goal|task_goal|scope|range|dimension|dimensions|目标主体|分析主体|分析目标|任务目标|范围|维度)$/i.test(String(fieldName || ""));
+  return /^(target|target_subject|subject|analysis_subject|analysis_goal|task_goal|scope|range|stage|phase|period|era|context|dimension|dimensions|目标主体|分析主体|分析目标|任务目标|范围|分析范围|阶段|时期|时代|上下文|维度)$/i.test(String(fieldName || ""));
 }
 
 function isMetadataLikeFieldName(fieldName) {
-  return /^(version|schema_version|language|locale|format|output_format|analysis_mode|mode|source|source_type)$/i.test(String(fieldName || ""));
+  return /^(version|schema_version|language|locale|format|output_format|analysis_mode|mode|source|source_type|stage|phase|period|era)$/i.test(String(fieldName || ""));
 }
 
 function isScalarFieldSchema(schema) {
@@ -1544,6 +1574,9 @@ function inferAnalysisParameterValue(fieldName, userPrompt, analysisContext = {}
   if (/goal|目标/.test(field) && taskGoal) return taskGoal[1].trim();
   const scope = prompt.match(/(?:筛选范围|分析范围|范围)[：:]\s*([^\n。；]{2,80})/);
   if (/scope|range|范围/.test(field) && scope) return scope[1].trim();
+  const stage = prompt.match(/(?:阶段|时期|stage|phase|period)[：:]\s*([^\n。；]{2,80})/i)
+    || prompt.match(/[“"「『]([^”"」』]{1,60}(?:阶段|时期))[”"」』]/);
+  if (/stage|phase|period|era|阶段|时期|时代/.test(field) && stage) return stage[1].trim();
   if (/task|goal|目标/.test(field)) return analysisContext.taskName || "";
   return "";
 }
@@ -1630,7 +1663,8 @@ async function runJsonFieldSummaryParts({
   fieldName,
   fieldSchema,
   wrapperSchema,
-  sourceChapterCount
+  sourceChapterCount,
+  primaryContentFieldCount = 0
 }) {
   const chunks = splitSourceMaterialForField({
     sourceMaterial,
@@ -1641,6 +1675,7 @@ async function runJsonFieldSummaryParts({
   });
   const batchValues = [];
   const responseIds = [];
+  const reusableBatchValues = [];
   for (let index = 0; index < chunks.length; index += 1) {
     const chunk = chunks[index];
     const batchNumber = String(index + 1).padStart(3, "0");
@@ -1654,17 +1689,15 @@ async function runJsonFieldSummaryParts({
       fieldName,
       material: chunk.material
     });
-    updateTask(task, {
-      progress: {
-        ...task.progress,
-        current: chunks.length > 1 ? `GPT 分字段汇总 ${fieldName} ${batchNumber}/${chunks.length}` : `GPT 分字段汇总 ${fieldName}`,
-        summary_parts: await summaryProgressForAnalysis(analysisId)
-      },
-      message: chunks.length > 1
-        ? `正在生成最终 JSON 字段：${fieldName}（${index + 1}/${chunks.length}）`
-        : `正在生成最终 JSON 字段：${fieldName}`
+    const requireNonEmpty = shouldRequireNonEmptyField({
+      fieldName,
+      fieldSchema,
+      sourceMaterial: chunk.material,
+      userPrompt,
+      sourceChapterCount,
+      primaryContentFieldCount
     });
-    const response = await runPersistedSummaryNode(task, {
+    const fieldBatchMetadata = {
       analysisId,
       partKey,
       parentKey: chunks.length > 1 ? `json.${fieldName}.merge` : "",
@@ -1676,7 +1709,20 @@ async function runJsonFieldSummaryParts({
       reasoningEffort,
       inputSummary: `${fieldName} · ${chunk.label} · ${JSON.stringify(chunk.material).length} 字`,
       traceSummary
-    }, async () => {
+    };
+    const reusable = await getReusableSummaryPart(fieldBatchMetadata);
+    if (reusable) reusableBatchValues.push(reusable.value[fieldName]);
+    updateTask(task, {
+      progress: {
+        ...task.progress,
+        current: chunks.length > 1 ? `GPT 分字段汇总 ${fieldName} ${batchNumber}/${chunks.length}` : `GPT 分字段汇总 ${fieldName}`,
+        summary_parts: await summaryProgressForAnalysis(analysisId)
+      },
+      message: chunks.length > 1
+        ? `正在生成最终 JSON 字段：${fieldName}（${index + 1}/${chunks.length}）`
+        : `正在生成最终 JSON 字段：${fieldName}`
+    });
+    const response = await runPersistedSummaryNode(task, fieldBatchMetadata, async () => {
       const input = buildCustomFieldSummaryInput({
         userPrompt,
         sourceMaterial: chunk.material,
@@ -1695,7 +1741,7 @@ async function runJsonFieldSummaryParts({
         maxOutputTokens: outputTokensForFieldSchema(fieldSchema),
         strict: false
       });
-      assertFieldResponse(fieldName, fieldSchema, result.value);
+      assertFieldResponse(fieldName, fieldSchema, result.value, { requireNonEmpty });
       return result;
     });
     batchValues.push(response.value[fieldName]);
@@ -1704,21 +1750,56 @@ async function runJsonFieldSummaryParts({
 
   if (chunks.length === 1) {
     const value = mergeFieldBatchValues(batchValues, fieldSchema, { fieldName, userPrompt });
-    assertFieldValueUseful(fieldName, fieldSchema, value, sourceChapterCount);
+    assertFieldValueUseful(fieldName, fieldSchema, value, sourceChapterCount, {
+      requireNonEmpty: shouldRequireNonEmptyField({
+        fieldName,
+        fieldSchema,
+        sourceMaterial,
+        userPrompt,
+        sourceChapterCount,
+        primaryContentFieldCount
+      })
+    });
     return {
       value,
       responseId: responseIds.join(",") || null
     };
   }
 
+  const existingMerge = await getReusableSummaryPart({
+    analysisId,
+    partKey: `json.${fieldName}.merge`,
+    stage: "json_field_merge",
+    contentHash: summaryContentHash({ fieldName, batchValues: reusableBatchValues.length === chunks.length ? reusableBatchValues : batchValues }),
+    promptHash: shaString(userPrompt || ""),
+    schemaHash: shaString(JSON.stringify(fieldSchema || {})),
+    model,
+    reasoningEffort
+  });
+  if (existingMerge) {
+    return {
+      value: existingMerge.value[fieldName],
+      responseId: responseIds.join(",") || null
+    };
+  }
+
   const mergedValue = mergeFieldBatchValues(batchValues, fieldSchema, { fieldName, userPrompt });
-  assertFieldValueUseful(fieldName, fieldSchema, mergedValue, sourceChapterCount);
+  assertFieldValueUseful(fieldName, fieldSchema, mergedValue, sourceChapterCount, {
+    requireNonEmpty: shouldRequireNonEmptyField({
+      fieldName,
+      fieldSchema,
+      sourceMaterial,
+      userPrompt,
+      sourceChapterCount,
+      primaryContentFieldCount
+    })
+  });
   await saveAnalysisSummaryPart({
     analysisId,
     partKey: `json.${fieldName}.merge`,
     stage: "json_field_merge",
     status: "completed",
-    contentHash: summaryContentHash({ fieldName, mergedValue }),
+    contentHash: summaryContentHash({ fieldName, batchValues }),
     promptHash: shaString(userPrompt || ""),
     schemaHash: shaString(JSON.stringify(fieldSchema || {})),
     model,
@@ -1777,6 +1858,29 @@ function outputTokensForFieldSchema(schema) {
   return Math.min(1200, CUSTOM_FIELD_SUMMARY_MAX_OUTPUT_TOKENS);
 }
 
+function shouldRequireNonEmptyField({ fieldName, fieldSchema, sourceMaterial, userPrompt, sourceChapterCount = 0, primaryContentFieldCount = 0 }) {
+  if (Number(sourceChapterCount || 0) < 3) return false;
+  if (!materialHasEvidence(sourceMaterial)) return false;
+  if (sourceMaterial?.sourceStats?.recalled_facts === 0 && !sourceMaterial?.sourceStats?.source_review_chapters) return false;
+  if (isMetadataOnlyFieldName(fieldName)) return false;
+  if (!isLargeFieldSchema(fieldSchema)) return false;
+  const field = String(fieldName || "");
+  if (!isRequiredPrimaryContentField(field)) return false;
+  if (Number(primaryContentFieldCount || 0) > 1) return false;
+  if (isOptionalSummaryFieldName(field)) {
+    return false;
+  }
+  const prompt = String(userPrompt || "");
+  if (new RegExp(`${escapeRegExp(field)}[^\\n。；]{0,80}(?:可为空|允许为空|没有则为空|没有则写空|没有则输出空)`, "i").test(prompt)) {
+    return false;
+  }
+  return true;
+}
+
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function assertSummaryInputWithinBudget(input, label) {
   const length = inputTextLength(input);
   if (length <= SUMMARY_PART_INPUT_MAX_CHARS) return;
@@ -1785,22 +1889,25 @@ function assertSummaryInputWithinBudget(input, label) {
   throw error;
 }
 
-function assertFieldResponse(fieldName, fieldSchema, value) {
+function assertFieldResponse(fieldName, fieldSchema, value, options = {}) {
   if (!value || typeof value !== "object" || Array.isArray(value) || !Object.hasOwn(value, fieldName)) {
     const error = new Error(`分字段汇总缺少字段：${fieldName}`);
     error.status = 502;
     throw error;
   }
-  assertFieldValueUseful(fieldName, fieldSchema, value[fieldName], 3);
+  assertFieldValueUseful(fieldName, fieldSchema, value[fieldName], 3, options);
 }
 
-function assertFieldValueUseful(fieldName, fieldSchema, value, sourceChapterCount) {
+function assertFieldValueUseful(fieldName, fieldSchema, value, sourceChapterCount, options = {}) {
   if (sourceChapterCount < 3) return;
   if (fieldSchema?.type === "array") {
     if (!Array.isArray(value)) {
       const error = new Error(`分字段汇总字段 ${fieldName} 必须是数组。`);
       error.status = 502;
       throw error;
+    }
+    if (!value.length && options.requireNonEmpty) {
+      throw emptyContentFieldError(fieldName);
     }
     return;
   }
@@ -1809,6 +1916,9 @@ function assertFieldValueUseful(fieldName, fieldSchema, value, sourceChapterCoun
       const error = new Error(`分字段汇总字段 ${fieldName} 必须是对象。`);
       error.status = 502;
       throw error;
+    }
+    if (options.requireNonEmpty && !isUsefulFinalValue(value)) {
+      throw emptyContentFieldError(fieldName);
     }
     return;
   }
@@ -2263,8 +2373,9 @@ function scopedSourceMaterialForField({ sourceMaterial, fieldName, userPrompt })
   const material = sourceMaterial && typeof sourceMaterial === "object" ? sourceMaterial : {};
   const facts = Array.isArray(material.facts) ? material.facts : [];
   const reviewedChapters = Array.isArray(material.reviewedChapters) ? material.reviewedChapters : [];
+  const compressedResults = Array.isArray(material.compressedResults) ? material.compressedResults : [];
   const field = String(fieldName || "").toLowerCase();
-  const metadataOnly = /^(book_id|book_name|task|title|version|metadata)$/i.test(fieldName);
+  const metadataOnly = isMetadataOnlyFieldName(fieldName);
   const categories = summaryFieldCategories(field);
   const entityQueries = field.includes("core") ? inferEntityQueriesFromPrompt(userPrompt || material.userPrompt || "", "") : [];
   const riskOnly = /uncertain|uncertainties|conflict|风险|不确定/.test(field);
@@ -2273,6 +2384,9 @@ function scopedSourceMaterialForField({ sourceMaterial, fieldName, userPrompt })
     : categories.length
       ? facts.filter((fact) => categories.includes(String(fact.category || "")))
       : facts;
+  if (!metadataOnly && categories.length && !scopedFacts.length && facts.length) {
+    scopedFacts = facts;
+  }
   if (entityQueries.length) {
     const matched = scopedFacts.filter((fact) => factMatchesAnyEntity(fact, entityQueries));
     if (matched.length) scopedFacts = matched;
@@ -2298,6 +2412,7 @@ function scopedSourceMaterialForField({ sourceMaterial, fieldName, userPrompt })
     sourceStats: material.sourceStats,
     failedChapters: Array.isArray(material.failedChapters) ? material.failedChapters.slice(0, 120) : [],
     missingChapters: Array.isArray(material.missingChapters) ? material.missingChapters.slice(0, 120) : [],
+    compressedResults: metadataOnly ? [] : compressedResults,
     reviewedChapters: metadataOnly ? [] : reviewedChapters.map((chapter) => ({
       chapter_index: chapter.chapter_index,
       title: chapter.title,
@@ -2308,6 +2423,10 @@ function scopedSourceMaterialForField({ sourceMaterial, fieldName, userPrompt })
     })).filter((chapter) => chapter.facts.length),
     facts: compactFacts
   };
+}
+
+function isMetadataOnlyFieldName(fieldName) {
+  return /^(book_id|book_name|task|title|version|schema_version|metadata|language|locale|format|output_format|analysis_mode|mode|source|source_type|stage|phase|period|era|阶段|时期|时代)$/i.test(String(fieldName || ""));
 }
 
 function prepareEvidenceSourceMaterial({ sourceMaterial, fieldName, fieldSchema, userPrompt, materialLabel, budget }) {
@@ -2333,6 +2452,27 @@ function prepareEvidenceSourceMaterial({ sourceMaterial, fieldName, fieldSchema,
     },
     evidence_packets: rankedPackets
   };
+  if (!rankedPackets.length && Array.isArray(base.compressedResults) && base.compressedResults.length) {
+    return {
+      material: fullMaterial,
+      chunks: [fullMaterial]
+    };
+  }
+  if (rankedPackets.length && rankedPackets.every((packet) => packet.source_type === "chapter_summary")) {
+    const material = ensureEvidenceInputWithinBudget({
+      material: fullMaterial,
+      userPrompt,
+      fieldName,
+      fieldSchema,
+      materialLabel,
+      budget,
+      preserveCoverage: true
+    });
+    return {
+      material,
+      chunks: [material]
+    };
+  }
   if (fieldName === "final") {
     const material = ensureEvidenceInputWithinBudget({
       material: fullMaterial,
@@ -2348,7 +2488,9 @@ function prepareEvidenceSourceMaterial({ sourceMaterial, fieldName, fieldSchema,
       chunks: [material]
     };
   }
-  const forceChunk = isLargeFieldSchema(fieldSchema) && rankedPackets.length > 8;
+  const forceChunk = isLargeFieldSchema(fieldSchema)
+    && rankedPackets.length > 8
+    && !rankedPackets.every((packet) => packet.source_type === "chapter_summary");
   if (!forceChunk && inputTextLength(buildCustomFieldSummaryInput({
     userPrompt,
     sourceMaterial: fullMaterial,
@@ -2380,6 +2522,7 @@ function prepareEvidenceSourceMaterial({ sourceMaterial, fieldName, fieldSchema,
 function sourceTraceFromMaterial({ partKey, parentKey = "", stage, fieldName, material }) {
   const safeMaterial = material && typeof material === "object" ? material : {};
   const packets = Array.isArray(safeMaterial.evidence_packets) ? safeMaterial.evidence_packets : [];
+  const compressedResults = Array.isArray(safeMaterial.compressedResults) ? safeMaterial.compressedResults : [];
   const chapters = [...new Set(packets
     .map((packet) => Number(packet.chapter_index || 0))
     .filter((chapterIndex) => Number.isFinite(chapterIndex) && chapterIndex > 0))]
@@ -2406,6 +2549,7 @@ function sourceTraceFromMaterial({ partKey, parentKey = "", stage, fieldName, ma
     fact_types: countValues(packets.map((packet) => packet.fact_type).filter(Boolean)),
     subjects,
     related_subjects: relatedSubjects,
+    compressed_results_count: compressedResults.length,
     trimmed_by_budget: Boolean(sourceStats.evidence_packets_trimmed_by_budget),
     omitted_by_budget: Number(sourceStats.evidence_packets_omitted_by_budget || 0)
   };
@@ -2420,10 +2564,12 @@ function mergeSourceTraces(traces, overrides = {}) {
   const subjects = [];
   const relatedSubjects = [];
   let packetCount = 0;
+  let compressedResultsCount = 0;
   let omittedByBudget = 0;
   let trimmedByBudget = false;
   for (const trace of normalized) {
     packetCount += Number(trace.evidence_packet_count || 0);
+    compressedResultsCount += Number(trace.compressed_results_count || 0);
     omittedByBudget += Number(trace.omitted_by_budget || 0);
     trimmedByBudget = trimmedByBudget || Boolean(trace.trimmed_by_budget);
     mergeCountMap(sourceTypes, trace.source_types);
@@ -2446,7 +2592,7 @@ function mergeSourceTraces(traces, overrides = {}) {
     field_name: String(overrides.fieldName || ""),
     batch: 1,
     total_batches: normalized.length || 1,
-    evidence_packet_count: packetCount,
+    evidence_packet_count: packetCount || compressedResultsCount,
     source_types: Object.fromEntries(sourceTypes),
     chapters: {
       count: chapterList.length,
@@ -2458,6 +2604,7 @@ function mergeSourceTraces(traces, overrides = {}) {
     fact_types: Object.fromEntries(factTypes),
     subjects: uniqueCompact(subjects, 12),
     related_subjects: uniqueCompact(relatedSubjects, 8),
+    compressed_results_count: compressedResultsCount,
     trimmed_by_budget: trimmedByBudget,
     omitted_by_budget: omittedByBudget
   };
@@ -2755,6 +2902,15 @@ function buildEvidencePacketsForField({ sourceMaterial, fieldName, fieldSchema, 
       ...packet,
       relevance: evidenceRelevanceScore({ packet, fieldName, fieldSchema, userPrompt })
     }));
+}
+
+function materialHasEvidence(sourceMaterial) {
+  const material = sourceMaterial && typeof sourceMaterial === "object" ? sourceMaterial : {};
+  if (Array.isArray(material.evidence_packets) && material.evidence_packets.length) return true;
+  if (Array.isArray(material.facts) && material.facts.length) return true;
+  if (Array.isArray(material.reviewedChapters) && material.reviewedChapters.some((chapter) => Array.isArray(chapter?.facts) && chapter.facts.length)) return true;
+  if (Array.isArray(material.compressedResults) && material.compressedResults.length) return true;
+  return false;
 }
 
 function factToEvidencePacket(fact) {
@@ -3074,6 +3230,16 @@ function deriveFinalSummarySchema({ userPrompt, configuredSchema }) {
     };
   }
 
+  const arrayItemFieldSchema = schemaFromPromptJsonArrayFieldDeclaration(userPrompt);
+  if (arrayItemFieldSchema) {
+    return {
+      schema: arrayItemFieldSchema,
+      schemaName: "custom_final_analysis",
+      strict: false,
+      unwrapField: "items"
+    };
+  }
+
   const declaredFieldSchema = schemaFromPromptFieldDeclaration(userPrompt);
   if (declaredFieldSchema) {
     return {
@@ -3128,16 +3294,67 @@ function schemaFromPromptJsonTemplate(userPrompt) {
 function schemaFromPromptFieldDeclaration(userPrompt) {
   const text = String(userPrompt || "");
   if (!/json/i.test(text)) return null;
-  const declaration = text.match(/(?:字段包括|字段为|顶层字段(?:包括|为)?|JSON\s*字段(?:包括|为)?)[：:\s]*([\s\S]{0,600})/i);
+  const declaration = findTopLevelFieldDeclaration(text);
   if (!declaration) return null;
-  const segment = declaration[1].split(/\n\s*\n|。/)[0] || "";
-  const fields = segment
-    .split(/[、,，\s]+/)
-    .map((field) => field.trim().replace(/^["'`“”‘’]+|["'`“”‘’]+$/g, ""))
-    .filter((field) => /^[A-Za-z_][A-Za-z0-9_]{1,80}$/.test(field));
-  const uniqueFields = [...new Set(fields)];
+  const uniqueFields = declaredFieldsFromSegment(declaration[1]);
   if (uniqueFields.length < 2) return null;
   return schemaFromDeclaredFields(uniqueFields);
+}
+
+function schemaFromPromptJsonArrayFieldDeclaration(userPrompt) {
+  const text = String(userPrompt || "");
+  if (!/json/i.test(text)) return null;
+  const declaration = findArrayItemFieldDeclaration(text);
+  if (!declaration) return null;
+  const fields = declaredFieldsFromSegment(declaration[1]);
+  if (fields.length < 2) return null;
+  return schemaFromDeclaredItemFields(fields);
+}
+
+function findTopLevelFieldDeclaration(text) {
+  const pattern = /(?:字段包括|字段为|顶层字段(?:包括|为)?|JSON\s*字段(?:包括|为)?)[：:\s]*([\s\S]{0,600})/ig;
+  for (const match of text.matchAll(pattern)) {
+    const prefix = text.slice(Math.max(0, match.index - 24), match.index);
+    if (/(?:每个|每一|每项|每条|每条记录|对象|条目|数组|元素|记录)\s*$/.test(prefix)) continue;
+    return match;
+  }
+  return null;
+}
+
+function findArrayItemFieldDeclaration(text) {
+  const patterns = [
+    /(?:JSON\s*)?数组[^。；\n]{0,140}?(?:每(?:个|一)?(?:对象|条目|项|元素|记录)|数组(?:对象|条目|项|元素|记录)?)[^。；\n]{0,50}?(?:字段(?:包括|为)?|包含字段)[：:\s]*([\s\S]{0,600})/i,
+    /(?:每(?:个|一)?(?:对象|条目|项|元素|记录)|数组(?:对象|条目|项|元素|记录)?)[^。；\n]{0,80}?(?:字段(?:包括|为)?|包含字段)[：:\s]*([\s\S]{0,600})/i
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const contextStart = Math.max(0, (match.index || 0) - 160);
+    const context = text.slice(contextStart, (match.index || 0) + match[0].length);
+    if (/json\s*数组|数组/i.test(context)) return match;
+  }
+  return null;
+}
+
+function declaredFieldsFromSegment(value) {
+  const segment = String(value || "").split(/\n\s*\n|。|；|;/)[0] || "";
+  const fields = segment
+    .split(/[、,，\s]+/)
+    .map(cleanDeclaredFieldToken)
+    .filter(isValidDeclaredFieldName);
+  return [...new Set(fields)];
+}
+
+function cleanDeclaredFieldToken(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^["'`“”‘’]+|["'`“”‘’]+$/g, "")
+    .replace(/[：:。；;,.，、]+$/g, "")
+    .trim();
+}
+
+function isValidDeclaredFieldName(value) {
+  return /^[A-Za-z_\u4e00-\u9fff][A-Za-z0-9_\u4e00-\u9fff]{0,80}$/.test(String(value || ""));
 }
 
 function schemaFromDeclaredFields(fields) {
@@ -3150,6 +3367,29 @@ function schemaFromDeclaredFields(fields) {
     additionalProperties: true,
     properties,
     required: fields
+  };
+}
+
+function schemaFromDeclaredItemFields(fields) {
+  const properties = {};
+  for (const field of fields) {
+    properties[field] = schemaForDeclaredField(field);
+  }
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      items: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties,
+          required: fields
+        }
+      }
+    },
+    required: ["items"]
   };
 }
 
@@ -3337,7 +3577,7 @@ function parseJsonObject(value) {
   }
 }
 
-function assertFinalSummaryUseful(finalResult, sourceChapterCount) {
+function assertFinalSummaryUseful(finalResult, sourceChapterCount, options = {}) {
   if (sourceChapterCount < 3) return;
 
   if (typeof finalResult === "string") {
@@ -3355,16 +3595,53 @@ function assertFinalSummaryUseful(finalResult, sourceChapterCount) {
   const items = Array.isArray(finalResult.items) ? finalResult.items : [];
   const hasUsefulSummary = Boolean(summary) && !isPlaceholderText(summary);
   const hasUsefulTitle = Boolean(title) && !isPlaceholderText(title);
-  if (items.length || hasUsefulSummary || hasUsefulTitle || hasAnyUsefulCustomValue(finalResult)) return;
+  if (items.length || hasUsefulSummary || hasUsefulTitle || hasAnyUsefulCustomValue(finalResult, options)) return;
   throw finalSummaryQualityError();
 }
 
-function hasAnyUsefulCustomValue(value) {
+function hasAnyUsefulCustomValue(value, options = {}) {
+  let hasContentField = false;
+  let hasUsefulContentField = false;
+  const properties = options.schema?.properties && typeof options.schema.properties === "object"
+    ? options.schema.properties
+    : {};
   for (const [key, entry] of Object.entries(value)) {
     if (["title", "summary", "items", "failed_chapters"].includes(key)) continue;
+    const schema = properties[key];
+    const isContentField = isFinalContentField(key, schema, entry);
+    if (isContentField) {
+      hasContentField = true;
+      if (isUsefulFinalValue(entry)) hasUsefulContentField = true;
+      continue;
+    }
     if (isUsefulFinalValue(entry)) return true;
   }
-  return false;
+  return hasContentField ? hasUsefulContentField : false;
+}
+
+function isFinalContentField(fieldName, fieldSchema, value) {
+  if (isMetadataOnlyFieldName(fieldName)) return false;
+  if (isAnalysisParameterField(fieldName, fieldSchema)) return false;
+  if (isOptionalSummaryFieldName(fieldName)) {
+    return false;
+  }
+  return isPotentialPrimaryContentField(fieldName, fieldSchema, value);
+}
+
+function isRequiredPrimaryContentField(fieldName) {
+  return /timeline|records|entries|results|characters|subjects|entities|时间线|记录|结果|人物|角色|主体|实体/i.test(String(fieldName || ""));
+}
+
+function isPotentialPrimaryContentField(fieldName, fieldSchema, value) {
+  return isPrimaryContentFieldName(fieldName) && (isLargeFieldSchema(fieldSchema) || Array.isArray(value) || (value && typeof value === "object"));
+}
+
+function isPrimaryContentFieldName(fieldName) {
+  return /timeline|records|entries|items|results|facts|events|characters|subjects|entities|stages|chapters|assets|list|array|时间线|记录|结果|事实|事件|人物|角色|主体|实体|阶段|章节|资产|列表/i.test(String(fieldName || ""));
+}
+
+function isOptionalSummaryFieldName(fieldName) {
+  return /uncertain|uncertainties|conflict|risk|warning|error|failed|missing|important|minor|secondary|optional|note|notes|不确定|冲突|风险|失败|缺失|重要|次要|可选|备注/i.test(String(fieldName || ""));
 }
 
 function isUsefulFinalValue(value) {
@@ -3382,6 +3659,12 @@ function isPlaceholderText(value) {
 
 function finalSummaryQualityError() {
   const error = new Error("最终汇总结果疑似占位或为空，已拒绝保存。请续跑最终汇总。");
+  error.status = 502;
+  return error;
+}
+
+function emptyContentFieldError(fieldName) {
+  const error = new Error(`最终汇总字段 ${fieldName} 有可用证据但结果为空，已拒绝保存。请续跑最终汇总。`);
   error.status = 502;
   return error;
 }

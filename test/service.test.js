@@ -2179,6 +2179,22 @@ test("balanced custom JSON summary persists and resumes failed field batches onl
     const body = JSON.parse(request.body);
     const text = body.input[0].content[0].text;
     const formatName = body.text?.format?.name || "";
+    if (formatName === "chapter_result") {
+      const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
+      return {
+        ok: true,
+        json: async () => ({
+          id: `resp_stage_timeline_chapter_${chapterIndex}`,
+          output: [{ content: [{ type: "output_text", text: JSON.stringify({
+            chapter_index: chapterIndex,
+            chapter_title: `第${chapterIndex}章`,
+            summary: `章节${chapterIndex}关键成长经历${"长摘要".repeat(140)}`,
+            key_points: [`事件${chapterIndex}${"内容".repeat(100)}`],
+            evidence_notes: [`证据${chapterIndex}${"线索".repeat(100)}`]
+          }) }] }]
+        })
+      };
+    }
     if (!formatName.startsWith("custom_field_")) {
       throw new Error(`Unexpected format: ${formatName}`);
     }
@@ -2333,6 +2349,204 @@ test("analysis parameter scalar fields are filled deterministically instead of s
     assert.equal(result.finalResult.target_subject, "云筝");
     assert.equal(result.summaryParts.some((part) => part.part_key === "meta.target_subject"), true);
     assert.equal(result.summaryParts.some((part) => part.part_key.startsWith("json.target_subject")), false);
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("analysis stage scalar fields are metadata and compressed evidence feeds content arrays", async () => {
+  const chapterCount = 90;
+  for (let chapterIndex = 1; chapterIndex <= chapterCount; chapterIndex += 1) {
+    await db.saveEncryptedChapter({
+      bookId: "book-stage-timeline-summary",
+      chapterIndex,
+      title: `第${chapterIndex}章`,
+      content: `第${chapterIndex}章原文`
+    });
+  }
+
+  const previousFetch = global.fetch;
+  const generatedFields = [];
+  let timelineMaterial = null;
+  global.fetch = async (url, request) => {
+    if (String(url).includes("api.openai.com/v1/models")) {
+      return { ok: true, status: 200, json: async () => ({ data: [] }) };
+    }
+    const body = JSON.parse(request.body);
+    const text = body.input[0].content[0].text;
+    const formatName = body.text?.format?.name || "";
+    if (formatName === "chapter_result") {
+      const chapterIndex = Number(text.match(/章节编号：(\d+)/)?.[1]);
+      return {
+        ok: true,
+        json: async () => ({
+          id: `resp_stage_timeline_chapter_${chapterIndex}`,
+          output: [{ content: [{ type: "output_text", text: JSON.stringify({
+            chapter_index: chapterIndex,
+            chapter_title: `第${chapterIndex}章`,
+            summary: `章节${chapterIndex}关键成长经历${"长摘要".repeat(140)}`,
+            key_points: [`事件${chapterIndex}${"内容".repeat(100)}`],
+            evidence_notes: [`证据${chapterIndex}${"线索".repeat(100)}`]
+          }) }] }]
+        })
+      };
+    }
+    if (!formatName.startsWith("custom_field_")) {
+      throw new Error(`Unexpected format: ${formatName}`);
+    }
+    const fieldName = formatName.replace(/^custom_field_/, "");
+    generatedFields.push(fieldName);
+    if (fieldName === "timeline") {
+      timelineMaterial = extractEvidenceMaterial(text);
+      assert.equal(Array.isArray(timelineMaterial.evidence_packets), true);
+      assert.equal(timelineMaterial.evidence_packets.length > 0, true);
+      assert.equal(timelineMaterial.evidence_packets[0].source_type, "chapter_summary");
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        id: `resp_stage_timeline_${fieldName}`,
+        output: [{ content: [{ type: "output_text", text: JSON.stringify({
+          [fieldName]: [
+            {
+              order: 1,
+              event: "关键事件",
+              event_meaning: "推动主体成长",
+              people: [],
+              foreshadowing_value: "无"
+            }
+          ]
+        }) }] }]
+      })
+    };
+  };
+
+  try {
+    const longChapterPrompt = `请逐章提取与成长经历有关的细节。${"保持章节证据。".repeat(240)}`;
+    const analysis = workflows.startAnalysisTask({
+      analysis_mode: "full_text",
+      book_id: "book-stage-timeline-summary",
+      start_chapter: 1,
+      end_chapter: chapterCount,
+      prompt: {
+        chapter_prompt: longChapterPrompt,
+        summary_prompt: [
+          "请围绕主角在“骊珠洞天阶段”的成长经历输出紧凑 JSON。",
+          "{",
+          "  \"book_name\": \"测试书\",",
+          "  \"subject\": \"陈平安\",",
+          "  \"stage\": \"骊珠洞天阶段\",",
+          "  \"timeline\": []",
+          "}"
+        ].join("\n")
+      }
+    });
+    await waitForTask(analysis);
+    assert.deepEqual(generatedFields, ["timeline"]);
+    assert.notEqual(timelineMaterial, null);
+    const result = await workflows.publicAnalysisRunWithResult(analysis.id);
+    assert.equal(result.finalResult.stage, "骊珠洞天阶段");
+    assert.equal(result.finalResult.timeline.length, 1);
+    assert.equal(result.summaryParts.some((part) => part.part_key === "meta.stage"), true);
+    assert.equal(result.summaryParts.some((part) => part.part_key.startsWith("json.stage")), false);
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("content array fields with available evidence cannot complete empty", async () => {
+  for (const chapterIndex of [1, 2, 3]) {
+    await db.saveEncryptedChapter({
+      bookId: "book-empty-content-array-rejected",
+      chapterIndex,
+      title: `第${chapterIndex}章`,
+      content: `第${chapterIndex}章原文`
+    });
+    const chapter = db.getChapterMetadata("book-empty-content-array-rejected", chapterIndex);
+    db.saveL1ChapterIndex({
+      bookId: "book-empty-content-array-rejected",
+      chapterIndex,
+      status: "completed",
+      sourceHmac: chapter.content_hmac,
+      model: "gpt-5.5",
+      promptHash: "l1-v1-chapter-window-10",
+      value: {
+        summary: "关键事件路标",
+        keywords: ["事件"],
+        entities: ["陈平安"],
+        key_events: ["关键事件"],
+        items_places_orgs: [],
+        open_questions: [],
+        confidence: 0.9
+      }
+    });
+    await db.saveL2ChapterFacts({
+      bookId: "book-empty-content-array-rejected",
+      chapterIndex,
+      status: "completed",
+      sourceHmac: chapter.content_hmac,
+      model: "gpt-5.5",
+      promptHash: "l2-v1-typed-facts",
+      schemaVersion: "l2-facts-v1",
+      facts: [{
+        category: "event",
+        entity: "陈平安",
+        tags: ["成长"],
+        related_entities: [],
+        fact_type: "experience",
+        fact: `第${chapterIndex}章关键成长事件。`,
+        evidence: [`证据${chapterIndex}`],
+        importance: 0.9,
+        confidence: 0.9
+      }]
+    });
+  }
+
+  const previousFetch = global.fetch;
+  let timelineCalls = 0;
+  global.fetch = async (url, request) => {
+    if (String(url).includes("api.openai.com/v1/models")) {
+      return { ok: true, status: 200, json: async () => ({ data: [] }) };
+    }
+    const body = JSON.parse(request.body);
+    const formatName = body.text?.format?.name || "";
+    assert.equal(formatName, "custom_field_timeline");
+    timelineCalls += 1;
+    return {
+      ok: true,
+      json: async () => ({
+        id: `resp_empty_timeline_${timelineCalls}`,
+        output: [{ content: [{ type: "output_text", text: JSON.stringify({ timeline: [] }) }] }]
+      })
+    };
+  };
+
+  try {
+    const analysis = workflows.startAnalysisTask({
+      analysis_mode: "balanced",
+      source_review_budget: 0,
+      book_id: "book-empty-content-array-rejected",
+      start_chapter: 1,
+      end_chapter: 3,
+      prompt: {
+        summary_prompt: [
+          "请输出合法 JSON。",
+          "{",
+          "  \"stage\": \"早期阶段\",",
+          "  \"timeline\": []",
+          "}"
+        ].join("\n")
+      }
+    });
+    await assert.rejects(() => waitForTask(analysis), /timeline 有可用证据但结果为空/);
+    await waitForTerminalTask(analysis);
+    assert.equal(analysis.status, "failed");
+    assert.equal(timelineCalls, 3);
+    const result = await workflows.publicAnalysisRunWithResult(analysis.id);
+    assert.equal(result.finalResult, null);
+    assert.equal(result.canResumeSummary, true);
+    assert.equal(result.summaryParts.some((part) => part.part_key === "meta.stage"), true);
+    assert.equal(result.failedSummaryParts.some((part) => part.part_key === "json.timeline.merge"), true);
   } finally {
     global.fetch = previousFetch;
   }
@@ -2785,6 +2999,96 @@ test("final summary array merge is generic for non-character entity fields", asy
     await waitForTask(analysis);
     const result = await workflows.publicAnalysisRunWithResult(analysis.id);
     assert.deepEqual(result.finalResult.items.map((item) => item.item_name).sort(), ["井中月", "笼中雀"]);
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("JSON array item field declarations are not split as top-level scalar fields", async () => {
+  const factCount = 3;
+  for (let chapterIndex = 1; chapterIndex <= factCount; chapterIndex += 1) {
+    await db.saveEncryptedChapter({
+      bookId: "book-json-array-item-fields",
+      chapterIndex,
+      title: `第${chapterIndex}章`,
+      content: `第${chapterIndex}章原文`
+    });
+    const chapter = db.getChapterMetadata("book-json-array-item-fields", chapterIndex);
+    await db.saveL2ChapterFacts({
+      bookId: "book-json-array-item-fields",
+      chapterIndex,
+      status: "completed",
+      sourceHmac: chapter.content_hmac,
+      model: "gpt-5.5",
+      promptHash: "l2-v1-typed-facts",
+      schemaVersion: "l2-facts-v1",
+      facts: [{
+        category: "item",
+        entity: chapterIndex === 1 ? "笼中雀" : "井中月",
+        tags: ["飞剑"],
+        related_entities: ["陈平安"],
+        fact_type: "sword_item",
+        fact: `飞剑资料事实${chapterIndex}`,
+        evidence: [`证据${chapterIndex}`],
+        importance: 0.9,
+        confidence: 0.85
+      }]
+    });
+  }
+
+  const previousFetch = global.fetch;
+  const formatNames = [];
+  global.fetch = async (url, request) => {
+    if (String(url).includes("api.openai.com/v1/models")) {
+      return { ok: true, status: 200, json: async () => ({ data: [] }) };
+    }
+    const body = JSON.parse(request.body);
+    const formatName = body.text?.format?.name || "";
+    formatNames.push(formatName);
+    assert.equal(formatName, "custom_final_analysis");
+    assert.equal(body.text.format.schema.properties.items.type, "array");
+    assert.equal(body.text.format.schema.properties.items.items.properties.owner.type, "string");
+    assert.equal(body.input[0].content[0].text.includes("飞剑资料事实"), true);
+    return {
+      ok: true,
+      json: async () => ({
+        id: "resp_json_array_item_fields",
+        output: [{ content: [{ type: "output_text", text: JSON.stringify({
+          items: [
+            {
+              name: "笼中雀",
+              owner: "陈平安",
+              ability: "不详",
+              appearance: "不详",
+              reliability: "确定事实"
+            }
+          ]
+        }) }] }]
+      })
+    };
+  };
+
+  try {
+    const analysis = workflows.startAnalysisTask({
+      name: "飞剑合集",
+      analysis_mode: "fast_index",
+      book_id: "book-json-array-item-fields",
+      start_chapter: 1,
+      end_chapter: factCount,
+      prompt: {
+        summary_prompt: [
+          "针对全书中出现的飞剑进行聚合分析。",
+          "输出格式使用紧凑 JSON 数组，每个对象字段为：name、owner、ability、appearance、reliability。",
+          "最终只输出 JSON，不附加解释。"
+        ].join("\n")
+      }
+    });
+    await waitForTask(analysis);
+    assert.deepEqual(formatNames, ["custom_final_analysis"]);
+    const result = await workflows.publicAnalysisRunWithResult(analysis.id);
+    assert.equal(Array.isArray(result.finalResult), true);
+    assert.equal(result.finalResult[0].name, "笼中雀");
+    assert.equal(result.summaryParts.some((part) => part.part_key.startsWith("json.name.")), false);
   } finally {
     global.fetch = previousFetch;
   }

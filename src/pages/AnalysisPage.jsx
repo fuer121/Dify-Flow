@@ -23,7 +23,7 @@ const initialAnalysisForm = {
   book_id: "",
   start_chapter: "1",
   end_chapter: "20",
-  analysis_mode: "balanced"
+  analysis_mode: "fast_index"
 };
 
 export function AnalysisPage({

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  ClipboardList,
   Copy,
   FileText,
   Layers,
@@ -304,9 +305,29 @@ export function AnalysisPage({
     }
   }
 
+  function openPromptManager() {
+    if (!analysisForm.book_id) return;
+    window.history.pushState({}, "", `/prompts?book_id=${encodeURIComponent(analysisForm.book_id)}&section=analysis`);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  }
+
   return (
-    <section className="analysis-layout">
-      <section className="analysis-compose">
+    <section className="analysis-layout analysis-workspace">
+      <header className="page-hero">
+        <div>
+          <span>分析工作台</span>
+          <h2>分析任务</h2>
+          <p>选择书籍、分析 Prompt 和章节范围，基于 L1 路标与 L2 事实生成结构化结果。</p>
+        </div>
+        <div className="page-hero-actions">
+          <button className="secondary inline" type="button" onClick={openPromptManager} disabled={!analysisForm.book_id}>
+            <ClipboardList size={16} />
+            管理 Prompt
+          </button>
+        </div>
+      </header>
+
+      <section className="analysis-command-row">
         <Panel
           icon={Play}
           title="新建任务"
@@ -373,27 +394,29 @@ export function AnalysisPage({
             </label>
           </div>
 
-          <div className="index-route-note">
-            {analysisRouteNote(analysisForm.analysis_mode, l2Coverage, selectedIndexes.length)}
+          <div className="command-footer">
+            <div className="index-route-note">
+              {analysisRouteNote(analysisForm.analysis_mode, l2Coverage, selectedIndexes.length)}
+            </div>
+            <button
+              className="primary inline command-primary"
+              type="button"
+              onClick={startAnalysis}
+              disabled={analysisBusy || !config.openaiConfigured || !config.retentionConfirmed || !analysisForm.book_id || !selectedIndexes.length || !selectedPromptGroupId}
+            >
+              {analysisBusy ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
+              {analysisBusy ? "分析中" : "开始分析"}
+            </button>
           </div>
-        </Panel>
 
-        <Panel icon={Play} title="运行" className="analysis-run-panel">
-          <button
-            className="primary"
-            type="button"
-            onClick={startAnalysis}
-            disabled={analysisBusy || !config.openaiConfigured || !config.retentionConfirmed || !analysisForm.book_id || !selectedIndexes.length || !selectedPromptGroupId}
-          >
-            {analysisBusy ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
-            {analysisBusy ? "分析中" : "开始分析"}
-          </button>
-          <TaskBox
-            task={analysisTask}
-            onCancel={() => controlAnalysis("cancel")}
-            onPause={() => controlAnalysis("pause")}
-            onResume={() => controlAnalysis("resume")}
-          />
+          {analysisTask ? (
+            <TaskBox
+              task={analysisTask}
+              onCancel={() => controlAnalysis("cancel")}
+              onPause={() => controlAnalysis("pause")}
+              onResume={() => controlAnalysis("resume")}
+            />
+          ) : null}
         </Panel>
       </section>
 
@@ -478,10 +501,19 @@ function coverageText(coverage) {
 function AnalysisHistory({ analyses, books, selectedId, onSelect, onCopy, onDelete }) {
   if (!analyses.length) return <div className="history-empty">无任务</div>;
   const bookNames = new Map(books.map((book) => [book.book_id, book.book_name || book.book_id]));
+  function selectFromCard(event, analysisId) {
+    if (event.target.closest("button")) return;
+    onSelect(analysisId);
+  }
+
   return (
     <div className="analysis-list expanded">
       {analyses.map((analysis) => (
-        <div key={analysis.id} className={analysis.id === selectedId ? "analysis-record active" : "analysis-record"}>
+        <div
+          key={analysis.id}
+          className={analysis.id === selectedId ? "analysis-record active" : "analysis-record"}
+          onClick={(event) => selectFromCard(event, analysis.id)}
+        >
           <button type="button" className="analysis-main" onClick={() => onSelect(analysis.id)}>
             <strong>{analysis.name || "未命名任务"}</strong>
             <span>{bookNames.get(analysis.book_id) || analysis.book_id} · {analysis.start_chapter}-{analysis.end_chapter} · {analysis.chapter_count} 章</span>

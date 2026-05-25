@@ -414,150 +414,168 @@ export default function App() {
     return <LoadingScreen />;
   }
 
-  return (
-    <main className="shell">
-      <header className="topbar">
-        <div className="brand">
-          <div className="brand-mark"><ShieldCheck size={22} /></div>
-          <div>
-            <h1>小说分析台</h1>
-            <p>本地库 · 索引 · 分析</p>
-          </div>
-        </div>
-        <RuntimeGrid config={config} />
-      </header>
+  const taskChips = (
+    <>
+      {importBusy && importTask ? (
+        <button className="background-task-chip" type="button" title={importStatusText} onClick={() => navigate("library")}>
+          <StatusPill status={importTask.status} />
+          <span>导入 · {importStatusText}</span>
+        </button>
+      ) : null}
+      {l1Busy && l1Task ? (
+        <button className="background-task-chip" type="button" title={l1Task.progress?.current || "L1 索引构建中"} onClick={() => navigate("library")}>
+          <StatusPill status={l1Task.status} />
+          <span>L1 · {l1Task.progress?.current || "索引构建中"}</span>
+        </button>
+      ) : null}
+      {l2Busy && l2Task ? (
+        <button className="background-task-chip" type="button" title={l2Task.progress?.current || "L2 索引构建中"} onClick={() => navigate("library")}>
+          <StatusPill status={l2Task.status} />
+          <span>L2 · {l2Task.progress?.current || "事实索引中"}</span>
+        </button>
+      ) : null}
+      {analysisBusy && analysisTask ? (
+        <button className="background-task-chip" type="button" title={analysisStatusText} onClick={() => navigate("analysis")}>
+          <StatusPill status={analysisTask.status} />
+          <span>分析 · {analysisStatusText}</span>
+        </button>
+      ) : null}
+    </>
+  );
 
-      <div className="navigation-row">
-        <nav className="page-tabs" aria-label="主要页面">
+  return (
+    <main className="app-shell">
+      <a className="skip-link" href="#main-content">跳到主内容</a>
+      <aside className="app-rail">
+        <div className="rail-brand" title="小说分析台">
+          <ShieldCheck size={21} />
+        </div>
+        <nav className="rail-nav" aria-label="主要页面">
           <button
             type="button"
             className={route === "analysis" ? "active" : ""}
+            aria-current={route === "analysis" ? "page" : undefined}
             onClick={() => navigate("analysis")}
+            title="分析"
           >
-            <BarChart3 size={16} />
-            分析
+            <BarChart3 size={18} />
+            <span>分析</span>
           </button>
           <button
             type="button"
             className={route === "library" ? "active" : ""}
+            aria-current={route === "library" ? "page" : undefined}
             onClick={() => navigate("library")}
+            title="书库"
           >
-            <BookOpen size={16} />
-            书库
+            <BookOpen size={18} />
+            <span>书库</span>
           </button>
           <button
             type="button"
             className={route === "prompts" ? "active" : ""}
+            aria-current={route === "prompts" ? "page" : undefined}
             onClick={() => navigate("prompts")}
+            title="Prompt 库"
           >
-            <ClipboardList size={16} />
-            Prompt 库
+            <ClipboardList size={18} />
+            <span>Prompt</span>
           </button>
           <button
             type="button"
             className={route === "diagnostics" ? "active" : ""}
+            aria-current={route === "diagnostics" ? "page" : undefined}
             onClick={() => navigate("diagnostics")}
+            title="诊断"
           >
-            <Stethoscope size={16} />
-            诊断
+            <Stethoscope size={18} />
+            <span>诊断</span>
           </button>
         </nav>
+      </aside>
 
-        <div className="background-task-stack">
-          {importBusy && importTask ? (
-            <button className="background-task-chip" type="button" title={importStatusText} onClick={() => navigate("library")}>
-              <StatusPill status={importTask.status} />
-              <span>导入 · {importStatusText}</span>
-            </button>
-          ) : null}
-          {l1Busy && l1Task ? (
-            <button className="background-task-chip" type="button" title={l1Task.progress?.current || "L1 索引构建中"} onClick={() => navigate("library")}>
-              <StatusPill status={l1Task.status} />
-              <span>L1 · {l1Task.progress?.current || "索引构建中"}</span>
-            </button>
-          ) : null}
-          {l2Busy && l2Task ? (
-            <button className="background-task-chip" type="button" title={l2Task.progress?.current || "L2 索引构建中"} onClick={() => navigate("library")}>
-              <StatusPill status={l2Task.status} />
-              <span>L2 · {l2Task.progress?.current || "事实索引中"}</span>
-            </button>
-          ) : null}
-          {analysisBusy && analysisTask ? (
-            <button className="background-task-chip" type="button" title={analysisStatusText} onClick={() => navigate("analysis")}>
-              <StatusPill status={analysisTask.status} />
-              <span>分析 · {analysisStatusText}</span>
-            </button>
-          ) : null}
-        </div>
-      </div>
+      <section className="app-main" id="main-content">
+        <header className="topbar">
+          <div className="brand">
+            <div>
+              <h1>小说分析台</h1>
+              <p>本地库 · 索引 · 分析</p>
+            </div>
+          </div>
+          <div className="topbar-right">
+            <RuntimeGrid config={config} />
+            <div className="background-task-stack">{taskChips}</div>
+          </div>
+        </header>
 
-      {error ? (
-        <section className="alert">
-          <AlertTriangle size={18} />
-          <span>{error}</span>
-        </section>
-      ) : null}
+        {error ? (
+          <section className="alert">
+            <AlertTriangle size={18} />
+            <span>{error}</span>
+          </section>
+        ) : null}
 
-      {route === "library" ? (
-        <LibraryPage
-          books={books}
-          config={config}
-          importTask={importTask}
-          importBusy={importBusy}
-          l1Task={l1Task}
-          l1Busy={l1Busy}
-          l2Task={l2Task}
-          l2Busy={l2Busy}
-          onStartImport={startImport}
-          onStartL1Index={startL1Index}
-          onStartL2Index={startL2Index}
-          onImportCancel={() => controlImport("cancel")}
-          onImportPause={() => controlImport("pause")}
-          onImportResume={() => controlImport("resume")}
-          onL1Cancel={() => controlL1("cancel")}
-          onL1Pause={() => controlL1("pause")}
-          onL1Resume={() => controlL1("resume")}
-          onL2Cancel={() => controlL2("cancel")}
-          onL2Pause={() => controlL2("pause")}
-          onL2Resume={() => controlL2("resume")}
-          onBooksChanged={reloadBooks}
-          setError={setError}
-        />
-      ) : route === "prompts" ? (
-        <PromptLibraryPage
-          books={books}
-          config={config}
-          onCreateBook={createBook}
-          onBooksChanged={reloadBooks}
-          onLoadBookIndexPrompts={loadBookIndexPrompts}
-          onSaveBookIndexPrompts={saveBookIndexPrompts}
-          onStartL1Index={startL1Index}
-          onStartL2Index={startL2Index}
-          onLoadPromptGroups={loadPromptGroupsForBook}
-          onPromptGroupsChanged={reloadPromptGroups}
-          setError={setError}
-        />
-      ) : route === "diagnostics" ? (
-        <DiagnosticsPage
-          config={config}
-          setError={setError}
-        />
-      ) : (
-        <AnalysisPage
-          books={books}
-          config={config}
-          prompts={prompts}
-          onLoadPromptGroups={loadPromptGroupsForBook}
-          analysisTask={analysisTask}
-          analysisBusy={analysisBusy}
-          onStartAnalysis={startAnalysis}
-          onResumeAnalysisRun={resumeAnalysisRun}
-          onAnalysisCancel={() => controlAnalysis("cancel")}
-          onAnalysisPause={() => controlAnalysis("pause")}
-          onAnalysisResume={() => controlAnalysis("resume")}
-          setError={setError}
-        />
-      )}
+        {route === "library" ? (
+          <LibraryPage
+            books={books}
+            config={config}
+            importTask={importTask}
+            importBusy={importBusy}
+            l1Task={l1Task}
+            l1Busy={l1Busy}
+            l2Task={l2Task}
+            l2Busy={l2Busy}
+            onStartImport={startImport}
+            onStartL1Index={startL1Index}
+            onStartL2Index={startL2Index}
+            onImportCancel={() => controlImport("cancel")}
+            onImportPause={() => controlImport("pause")}
+            onImportResume={() => controlImport("resume")}
+            onL1Cancel={() => controlL1("cancel")}
+            onL1Pause={() => controlL1("pause")}
+            onL1Resume={() => controlL1("resume")}
+            onL2Cancel={() => controlL2("cancel")}
+            onL2Pause={() => controlL2("pause")}
+            onL2Resume={() => controlL2("resume")}
+            onBooksChanged={reloadBooks}
+            setError={setError}
+          />
+        ) : route === "prompts" ? (
+          <PromptLibraryPage
+            books={books}
+            config={config}
+            onCreateBook={createBook}
+            onBooksChanged={reloadBooks}
+            onLoadBookIndexPrompts={loadBookIndexPrompts}
+            onSaveBookIndexPrompts={saveBookIndexPrompts}
+            onStartL1Index={startL1Index}
+            onStartL2Index={startL2Index}
+            onLoadPromptGroups={loadPromptGroupsForBook}
+            onPromptGroupsChanged={reloadPromptGroups}
+            setError={setError}
+          />
+        ) : route === "diagnostics" ? (
+          <DiagnosticsPage
+            config={config}
+            setError={setError}
+          />
+        ) : (
+          <AnalysisPage
+            books={books}
+            config={config}
+            prompts={prompts}
+            onLoadPromptGroups={loadPromptGroupsForBook}
+            analysisTask={analysisTask}
+            analysisBusy={analysisBusy}
+            onStartAnalysis={startAnalysis}
+            onResumeAnalysisRun={resumeAnalysisRun}
+            onAnalysisCancel={() => controlAnalysis("cancel")}
+            onAnalysisPause={() => controlAnalysis("pause")}
+            onAnalysisResume={() => controlAnalysis("resume")}
+            setError={setError}
+          />
+        )}
+      </section>
     </main>
   );
 }

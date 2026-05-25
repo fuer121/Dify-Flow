@@ -68,7 +68,16 @@ export function LibraryPage({
     auto_l1_index: false
   });
   const [l1Form, setL1Form] = useState({ start_chapter: "1", end_chapter: "100", force: false });
-  const [l2Form, setL2Form] = useState({ start_chapter: "1", end_chapter: "100", force: false, mode: "all", category: "" });
+  const [l2Form, setL2Form] = useState({ start_chapter: "1", end_chapter: "100", force: false });
+  const selectedBook = useMemo(
+    () => books.find((book) => book.book_id === selectedBookId) || null,
+    [books, selectedBookId]
+  );
+  const boundBook = useMemo(
+    () => books.find((book) => book.book_id === importForm.book_id.trim()) || null,
+    [books, importForm.book_id]
+  );
+  const coverageRange = useMemo(() => coverageRangeForBook(selectedBook), [selectedBook]);
 
   const loadL1Data = useCallback(async (bookId, startChapter, endChapter) => {
     if (!validChapterNumber(startChapter) || !validChapterNumber(endChapter)) return;
@@ -85,10 +94,10 @@ export function LibraryPage({
     }
   }, [setError]);
 
-  const loadL2Data = useCallback(async (bookId, startChapter, endChapter, category = "") => {
+  const loadL2Data = useCallback(async (bookId, startChapter, endChapter) => {
     if (!validChapterNumber(startChapter) || !validChapterNumber(endChapter)) return;
     try {
-      const query = `start_chapter=${encodeURIComponent(startChapter)}&end_chapter=${encodeURIComponent(endChapter)}&category=${encodeURIComponent(category)}&limit=80`;
+      const query = `start_chapter=${encodeURIComponent(startChapter)}&end_chapter=${encodeURIComponent(endChapter)}&limit=80`;
       const [coverageData, factsData] = await Promise.all([
         apiGet(`/api/books/${encodeURIComponent(bookId)}/l2-indexes/coverage?${query}`),
         apiGet(`/api/books/${encodeURIComponent(bookId)}/l2-facts?${query}`)
@@ -133,23 +142,14 @@ export function LibraryPage({
   useEffect(() => {
     if (!selectedBookId) return;
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    void loadL1Data(selectedBookId, l1Form.start_chapter, l1Form.end_chapter);
-  }, [selectedBookId, l1Form.start_chapter, l1Form.end_chapter, l1Task?.id, l1Task?.status, loadL1Data]);
+    void loadL1Data(selectedBookId, coverageRange.startChapter, coverageRange.endChapter);
+  }, [selectedBookId, coverageRange.startChapter, coverageRange.endChapter, l1Task?.id, l1Task?.status, loadL1Data]);
 
   useEffect(() => {
     if (!selectedBookId) return;
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    void loadL2Data(selectedBookId, l2Form.start_chapter, l2Form.end_chapter, l2Form.category);
-  }, [selectedBookId, l2Form.start_chapter, l2Form.end_chapter, l2Form.category, l2Task?.id, l2Task?.status, loadL2Data]);
-
-  const selectedBook = useMemo(
-    () => books.find((book) => book.book_id === selectedBookId) || null,
-    [books, selectedBookId]
-  );
-  const boundBook = useMemo(
-    () => books.find((book) => book.book_id === importForm.book_id.trim()) || null,
-    [books, importForm.book_id]
-  );
+    void loadL2Data(selectedBookId, coverageRange.startChapter, coverageRange.endChapter);
+  }, [selectedBookId, coverageRange.startChapter, coverageRange.endChapter, l2Task?.id, l2Task?.status, loadL2Data]);
 
   async function startImport() {
     if (!validChapterNumber(importForm.start_chapter) || !validChapterNumber(importForm.end_chapter)) {
@@ -183,7 +183,7 @@ export function LibraryPage({
     });
   }
 
-  async function startL2Index(modeOverride) {
+  async function startL2Index() {
     if (!selectedBookId) {
       setError("请先选择一本书。");
       return;
@@ -192,13 +192,12 @@ export function LibraryPage({
       setError("L2 起始章节和结束章节必须填写为大于 0 的整数。");
       return;
     }
-    const mode = modeOverride || l2Form.mode;
     await onStartL2Index({
       bookId: selectedBookId,
       startChapter: Number(l2Form.start_chapter),
       endChapter: Number(l2Form.end_chapter),
-      force: mode === "all" ? l2Form.force : false,
-      mode
+      force: l2Form.force,
+      mode: "all"
     });
   }
 
@@ -239,58 +238,143 @@ export function LibraryPage({
   }
 
   return (
-    <section className="library-layout library-layout-single">
-      <div className="library-management-grid">
-        <Panel
-          className="library-directory-panel"
-          icon={Database}
-          title="本地书库"
-          action={<IconButton icon={RefreshCcw} label="刷新" onClick={onBooksChanged} />}
-        >
-          <LibraryDirectory
-            books={books}
-            selectedBookId={selectedBookId}
-            onSelect={selectBook}
-            onDeleteSelected={deleteSelectedBook}
-          />
-        </Panel>
-        <Panel
-          className="library-import-panel"
-          icon={BookOpen}
-          title="导入"
-        >
-          {!showImportForm ? (
-            <button className="secondary compact-action" type="button" onClick={() => setShowImportForm(true)}>
-              <BookOpen size={16} />
-              导入新章节
-            </button>
-          ) : (
-            <>
-              <div className="form-grid import-form-grid">
-                <label>
-                  <span>书籍名称</span>
-                  <input
-                    value={boundBook?.book_name || importForm.book_name}
-                    disabled={Boolean(boundBook?.book_name)}
-                    placeholder="例如：凡人修仙传"
-                    onChange={(event) => setImportForm({ ...importForm, book_name: event.target.value })}
-                  />
-                </label>
-                <label>
-                  <span>小说 ID</span>
-                  <input
-                    value={importForm.book_id}
-                    onChange={(event) => updateBookId(event.target.value)}
-                  />
-                </label>
+    <section className="library-layout library-workspace">
+      <header className="page-hero">
+        <div>
+          <span>书库工作台</span>
+          <h2>书库与索引</h2>
+          <p>书籍导入在左侧完成，当前书籍的 L1 路标和 L2 事实索引在右侧管理。</p>
+        </div>
+        <div className="page-hero-actions">
+          <button className="secondary inline" type="button" onClick={() => openPromptManager("index")} disabled={!selectedBookId}>
+            管理索引 Prompt
+          </button>
+        </div>
+      </header>
+
+      <div className="library-shell-grid">
+        <aside className="library-left-column">
+          <Panel
+            className="library-directory-panel"
+            icon={Database}
+            title="本地书库"
+            action={<IconButton icon={RefreshCcw} label="刷新" onClick={onBooksChanged} />}
+          >
+            <LibraryDirectory
+              books={books}
+              selectedBookId={selectedBookId}
+              onSelect={selectBook}
+              onDeleteSelected={deleteSelectedBook}
+            />
+          </Panel>
+          <Panel
+            className="library-import-panel"
+            icon={BookOpen}
+            title="导入"
+          >
+            {!showImportForm ? (
+              <button className="secondary compact-action" type="button" onClick={() => setShowImportForm(true)}>
+                <BookOpen size={16} />
+                导入新章节
+              </button>
+            ) : (
+              <>
+                <div className="form-grid import-form-grid">
+                  <label>
+                    <span>书籍名称</span>
+                    <input
+                      value={boundBook?.book_name || importForm.book_name}
+                      disabled={Boolean(boundBook?.book_name)}
+                      placeholder="例如：凡人修仙传"
+                      onChange={(event) => setImportForm({ ...importForm, book_name: event.target.value })}
+                    />
+                  </label>
+                  <label>
+                    <span>小说 ID</span>
+                    <input
+                      value={importForm.book_id}
+                      onChange={(event) => updateBookId(event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    <span>起始章节</span>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      pattern="[0-9]*"
+                      value={importForm.start_chapter}
+                      onChange={(event) => setImportForm({ ...importForm, start_chapter: sanitizeChapterInput(event.target.value) })}
+                    />
+                  </label>
+                  <label>
+                    <span>结束章节</span>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      pattern="[0-9]*"
+                      value={importForm.end_chapter}
+                      onChange={(event) => setImportForm({ ...importForm, end_chapter: sanitizeChapterInput(event.target.value) })}
+                    />
+                  </label>
+                  <label className="check-row">
+                    <input
+                      type="checkbox"
+                      checked={importForm.force}
+                      onChange={(event) => setImportForm({ ...importForm, force: event.target.checked })}
+                    />
+                    <span>覆盖已有章节</span>
+                  </label>
+                  <label className="check-row">
+                    <input
+                      type="checkbox"
+                      checked={importForm.auto_l1_index}
+                      onChange={(event) => setImportForm({ ...importForm, auto_l1_index: event.target.checked })}
+                    />
+                    <span>完成后构建 L1</span>
+                  </label>
+                </div>
+                <div className="action-row wrap">
+                  <button className="primary inline" type="button" onClick={startImport} disabled={importBusy || !config.difyConfigured}>
+                    {importBusy ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
+                    {importBusy ? "导入中" : "开始导入"}
+                  </button>
+                  <button className="secondary inline" type="button" onClick={() => setShowImportForm(false)} disabled={importBusy}>
+                    收起
+                  </button>
+                </div>
+              </>
+            )}
+            <TaskBox
+              task={importTask}
+              onCancel={onImportCancel}
+              onPause={onImportPause}
+              onResume={onImportResume}
+            />
+          </Panel>
+        </aside>
+
+        <section className="library-detail-column">
+          <SelectedBookSummary book={selectedBook} />
+          <div className="index-workgrid">
+            <Panel
+              icon={Layers}
+              title="L1 基础索引"
+              className="index-work-panel"
+              action={(
+                <button className="secondary inline" type="button" onClick={() => openPromptManager("index")} disabled={!selectedBookId}>
+                  Prompt
+                </button>
+              )}
+            >
+              <div className="form-grid compact">
                 <label>
                   <span>起始章节</span>
                   <input
                     type="text"
                     inputMode="numeric"
                     pattern="[0-9]*"
-                    value={importForm.start_chapter}
-                    onChange={(event) => setImportForm({ ...importForm, start_chapter: sanitizeChapterInput(event.target.value) })}
+                    value={l1Form.start_chapter}
+                    onChange={(event) => setL1Form({ ...l1Form, start_chapter: sanitizeChapterInput(event.target.value) })}
                   />
                 </label>
                 <label>
@@ -299,178 +383,115 @@ export function LibraryPage({
                     type="text"
                     inputMode="numeric"
                     pattern="[0-9]*"
-                    value={importForm.end_chapter}
-                    onChange={(event) => setImportForm({ ...importForm, end_chapter: sanitizeChapterInput(event.target.value) })}
+                    value={l1Form.end_chapter}
+                    onChange={(event) => setL1Form({ ...l1Form, end_chapter: sanitizeChapterInput(event.target.value) })}
                   />
                 </label>
                 <label className="check-row">
                   <input
                     type="checkbox"
-                    checked={importForm.force}
-                    onChange={(event) => setImportForm({ ...importForm, force: event.target.checked })}
+                    checked={l1Form.force}
+                    onChange={(event) => setL1Form({ ...l1Form, force: event.target.checked })}
                   />
-                  <span>覆盖已有章节</span>
+                  <span>强制重建</span>
+                </label>
+              </div>
+              <CoverageSummary coverage={l1Coverage} chapters={l1Chapters} />
+              <div className="index-action-bar">
+                <button className="primary inline" type="button" onClick={startL1Index} disabled={l1Busy || !selectedBookId || !config.openaiConfigured}>
+                  {l1Busy ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
+                  {l1Busy ? "索引中" : "构建 L1"}
+                </button>
+              </div>
+              {l1Task ? (
+                <TaskBox
+                  task={l1Task}
+                  onCancel={onL1Cancel}
+                  onPause={onL1Pause}
+                  onResume={onL1Resume}
+                />
+              ) : null}
+              <L1Preview chapters={l1Chapters} />
+            </Panel>
+
+            <Panel
+              icon={Database}
+              title="L2 类型化事实"
+              className="index-work-panel"
+              action={(
+                <button className="secondary inline" type="button" onClick={() => openPromptManager("index")} disabled={!selectedBookId}>
+                  Prompt
+                </button>
+              )}
+            >
+              <div className="form-grid compact">
+                <label>
+                  <span>起始章节</span>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    value={l2Form.start_chapter}
+                    onChange={(event) => setL2Form({ ...l2Form, start_chapter: sanitizeChapterInput(event.target.value) })}
+                  />
+                </label>
+                <label>
+                  <span>结束章节</span>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    value={l2Form.end_chapter}
+                    onChange={(event) => setL2Form({ ...l2Form, end_chapter: sanitizeChapterInput(event.target.value) })}
+                  />
                 </label>
                 <label className="check-row">
                   <input
                     type="checkbox"
-                    checked={importForm.auto_l1_index}
-                    onChange={(event) => setImportForm({ ...importForm, auto_l1_index: event.target.checked })}
+                    checked={l2Form.force}
+                    onChange={(event) => setL2Form({ ...l2Form, force: event.target.checked })}
                   />
-                  <span>完成后构建 L1</span>
+                  <span>强制重建</span>
                 </label>
               </div>
-              <div className="action-row wrap">
-                <button className="primary inline" type="button" onClick={startImport} disabled={importBusy || !config.difyConfigured}>
-                  {importBusy ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
-                  {importBusy ? "导入中" : "开始导入"}
-                </button>
-                <button className="secondary inline" type="button" onClick={() => setShowImportForm(false)} disabled={importBusy}>
-                  收起
+              <L2CoverageSummary coverage={l2Coverage} />
+              <div className="index-action-bar">
+                <button className="primary inline" type="button" onClick={() => startL2Index()} disabled={l2Busy || !selectedBookId || !config.openaiConfigured}>
+                  {l2Busy ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
+                  {l2Busy ? "索引中" : "构建 L2"}
                 </button>
               </div>
-            </>
-          )}
-          <TaskBox
-            task={importTask}
-            onCancel={onImportCancel}
-            onPause={onImportPause}
-            onResume={onImportResume}
-          />
-        </Panel>
+              {l2Task ? (
+                <TaskBox
+                  task={l2Task}
+                  onCancel={onL2Cancel}
+                  onPause={onL2Pause}
+                  onResume={onL2Resume}
+                />
+              ) : null}
+              <L2FactPreview facts={l2Facts} />
+            </Panel>
+          </div>
+        </section>
       </div>
+    </section>
+  );
+}
 
-      <aside className="side">
-        <Panel icon={Layers} title="基础索引">
-          <div className="form-grid compact">
-            <label>
-              <span>起始章节</span>
-              <input
-                type="text"
-                inputMode="numeric"
-                pattern="[0-9]*"
-                value={l1Form.start_chapter}
-                onChange={(event) => setL1Form({ ...l1Form, start_chapter: sanitizeChapterInput(event.target.value) })}
-              />
-            </label>
-            <label>
-              <span>结束章节</span>
-              <input
-                type="text"
-                inputMode="numeric"
-                pattern="[0-9]*"
-                value={l1Form.end_chapter}
-                onChange={(event) => setL1Form({ ...l1Form, end_chapter: sanitizeChapterInput(event.target.value) })}
-              />
-            </label>
-            <label className="check-row">
-              <input
-                type="checkbox"
-                checked={l1Form.force}
-                onChange={(event) => setL1Form({ ...l1Form, force: event.target.checked })}
-              />
-              <span>强制重建</span>
-            </label>
-          </div>
-          <CoverageSummary
-            coverage={l1Coverage}
-            chapters={l1Chapters}
-          />
-          <IndexPromptStatus
-            title="L1 Prompt"
-            coverage={l1Coverage}
-            manageLabel="管理 L1 Prompt"
-            onManage={() => openPromptManager("index")}
-          />
-          <button className="primary" type="button" onClick={startL1Index} disabled={l1Busy || !selectedBookId || !config.openaiConfigured}>
-            {l1Busy ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
-            {l1Busy ? "索引中" : "构建 L1"}
-          </button>
-          <TaskBox
-            task={l1Task}
-            onCancel={onL1Cancel}
-            onPause={onL1Pause}
-            onResume={onL1Resume}
-          />
-          <L1Preview chapters={l1Chapters} />
-        </Panel>
-
-        <Panel icon={Database} title="L2 类型化事实">
-          <div className="form-grid compact">
-            <label>
-              <span>起始章节</span>
-              <input
-                type="text"
-                inputMode="numeric"
-                pattern="[0-9]*"
-                value={l2Form.start_chapter}
-                onChange={(event) => setL2Form({ ...l2Form, start_chapter: sanitizeChapterInput(event.target.value) })}
-              />
-            </label>
-            <label>
-              <span>结束章节</span>
-              <input
-                type="text"
-                inputMode="numeric"
-                pattern="[0-9]*"
-                value={l2Form.end_chapter}
-                onChange={(event) => setL2Form({ ...l2Form, end_chapter: sanitizeChapterInput(event.target.value) })}
-              />
-            </label>
-            <label>
-              <span>分类筛选</span>
-              <select value={l2Form.category} onChange={(event) => setL2Form({ ...l2Form, category: event.target.value })}>
-                <option value="">全部分类</option>
-                {L2_CATEGORIES.map((category) => (
-                  <option key={category.value} value={category.value}>{category.label}</option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>构建模式</span>
-              <select value={l2Form.mode} onChange={(event) => setL2Form({ ...l2Form, mode: event.target.value })}>
-                <option value="all">构建全部缺失/过期</option>
-                <option value="missing">只补缺失</option>
-                <option value="retry_failed">只重试失败</option>
-              </select>
-            </label>
-            <label className="check-row">
-              <input
-                type="checkbox"
-                checked={l2Form.force}
-                onChange={(event) => setL2Form({ ...l2Form, force: event.target.checked })}
-              />
-              <span>强制重建</span>
-            </label>
-          </div>
-          <L2CoverageSummary coverage={l2Coverage} />
-          <IndexPromptStatus
-            title="L2 Prompt"
-            coverage={l2Coverage}
-            manageLabel="管理 L2 Prompt"
-            onManage={() => openPromptManager("index")}
-          />
-          <div className="action-row wrap">
-            <button className="primary" type="button" onClick={() => startL2Index()} disabled={l2Busy || !selectedBookId || !config.openaiConfigured}>
-              {l2Busy ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
-              {l2Busy ? "索引中" : "构建 L2"}
-            </button>
-            <button className="secondary" type="button" onClick={() => startL2Index("missing")} disabled={l2Busy || !selectedBookId || !config.openaiConfigured}>
-              补缺失
-            </button>
-            <button className="secondary" type="button" onClick={() => startL2Index("retry_failed")} disabled={l2Busy || !selectedBookId || !config.openaiConfigured}>
-              重试失败
-            </button>
-          </div>
-          <TaskBox
-            task={l2Task}
-            onCancel={onL2Cancel}
-            onPause={onL2Pause}
-            onResume={onL2Resume}
-          />
-          <L2FactPreview facts={l2Facts} />
-        </Panel>
-      </aside>
+function SelectedBookSummary({ book }) {
+  if (!book) return <div className="selected-book-summary empty-state">选择一本书查看索引状态</div>;
+  return (
+    <section className="selected-book-summary">
+      <div>
+        <span>当前书籍</span>
+        <h3>{book.book_name || book.book_id}</h3>
+        <p>{book.book_id}</p>
+      </div>
+      <div className="summary-metrics">
+        <span>{book.chapter_count || 0} 章</span>
+        <span>{chapterRange(book)}</span>
+        <span>{book.last_import_status || "idle"}</span>
+      </div>
     </section>
   );
 }
@@ -509,7 +530,7 @@ function LibraryDirectory({ books, selectedBookId, onSelect, onDeleteSelected })
               </button>
               <StatusPill status={entry.last_import_status || "idle"} />
               {active ? (
-                <button className="danger inline" type="button" onClick={onDeleteSelected}>
+                <button className="library-book-delete" type="button" onClick={onDeleteSelected} aria-label={`删除 ${entry.book_name || entry.book_id}`}>
                   <Trash2 size={15} />
                   删除
                 </button>
@@ -538,12 +559,18 @@ function chapterRange(book) {
   return `${first}-${last}`;
 }
 
+function coverageRangeForBook(book) {
+  return {
+    startChapter: book?.first_chapter || 1,
+    endChapter: book?.last_chapter || book?.first_chapter || 1
+  };
+}
+
 function CoverageSummary({ coverage, chapters }) {
   if (!coverage) return <div className="index-summary">L1 读取中</div>;
   const total = Math.max(coverage.chapters.total || 0, 1);
   const completed = coverage.chapters.completed || 0;
   const failedChapters = chapters.filter((chapter) => chapter.status === "failed").map((chapter) => chapter.chapter_index);
-  const unfinished = (coverage.chapters.missing || 0) + (coverage.chapters.failed || 0) + (coverage.chapters.outdated || 0);
   const finishedRatio = Math.round((completed / total) * 100);
   return (
     <div className="coverage-card">
@@ -553,11 +580,6 @@ function CoverageSummary({ coverage, chapters }) {
       </div>
       <div className="coverage-bar" aria-label={`L1 覆盖 ${finishedRatio}%`}>
         <span style={{ width: `${finishedRatio}%` }} />
-      </div>
-      <div className="index-summary">
-        <span>缺失 {coverage.chapters.missing}</span>
-        <span>失败 {coverage.chapters.failed}</span>
-        <span>未完成 {unfinished}</span>
       </div>
       <p className="coverage-note">
         {failedChapters.length
@@ -583,11 +605,6 @@ function L2CoverageSummary({ coverage }) {
       </div>
       <div className="coverage-bar" aria-label={`L2 覆盖 ${finishedRatio}%`}>
         <span style={{ width: `${finishedRatio}%` }} />
-      </div>
-      <div className="index-summary">
-        <span>缺失 {coverage.chapters.missing}</span>
-        <span>失败 {coverage.chapters.failed}</span>
-        <span>过期 {coverage.chapters.outdated}</span>
       </div>
       <p className="coverage-note">
         {coverage.failed_chapters?.length
@@ -635,28 +652,6 @@ function L2FactPreview({ facts }) {
         </article>
       )}
     </details>
-  );
-}
-
-function IndexPromptStatus({ title, coverage, manageLabel, onManage }) {
-  const chapters = coverage?.chapters;
-  const ratio = chapters?.total ? Math.round((Number(chapters.completed || 0) / Number(chapters.total || 1)) * 100) : 0;
-  const stale = Number(chapters?.outdated || 0);
-  return (
-    <div className="index-prompt-card index-prompt-status-card">
-      <div className="index-prompt-head">
-        <div>
-          <h3>{title}</h3>
-          <small>{stale ? `过期 ${stale} 章` : "未过期"}</small>
-        </div>
-        <button className="secondary inline" type="button" onClick={onManage}>
-          {manageLabel || "管理 Prompt"}
-        </button>
-      </div>
-      <div className={stale ? "inline-warning" : "muted-line"}>
-        {chapters ? `${chapters.completed}/${chapters.total} · ${ratio}%` : "读取中"}
-      </div>
-    </div>
   );
 }
 

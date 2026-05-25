@@ -289,60 +289,69 @@ export function PromptLibraryPage({
 
   return (
     <section className="prompt-workbench">
-      <Panel
-        icon={Folder}
-        title="Prompt 管理"
-        action={<IconButton icon={RefreshCcw} label="刷新" onClick={refreshAll} />}
-      >
-        <div className="book-tabs-row">
-          {books.map((book) => (
-            <button
-              key={book.book_id}
-              type="button"
-              className={book.book_id === selectedBookId ? "book-tab active" : "book-tab"}
-              onClick={() => setSelectedBookId(book.book_id)}
-            >
-              <strong>{book.book_name || book.book_id}</strong>
-              <span>{book.chapter_count || 0} 章</span>
-            </button>
-          ))}
+      <header className="page-hero">
+        <div>
+          <span>Prompt 工作台</span>
+          <h2>Prompt 管理</h2>
+          <p>L1/L2 是书籍级索引 Prompt，分析 Prompt 面向具体分析任务，同一本书内独立管理。</p>
         </div>
-        {showBookForm ? (
-          <div className="form-grid new-book-grid">
-            <label>
-              <span>小说 ID</span>
-              <input value={bookForm.book_id} onChange={(event) => setBookForm({ ...bookForm, book_id: event.target.value })} />
-            </label>
-            <label>
-              <span>书籍名称</span>
-              <input value={bookForm.book_name} onChange={(event) => setBookForm({ ...bookForm, book_name: event.target.value })} />
-            </label>
-            <div className="new-book-actions">
-              <button className="secondary" type="button" onClick={createBook} disabled={creatingBook}>
-                {creatingBook ? <Loader2 className="spin" size={16} /> : <BookPlus size={16} />}
-                保存
-              </button>
-              <button
-                className="ghost"
-                type="button"
-                onClick={() => {
-                  setBookForm(emptyBookForm);
-                  setShowBookForm(false);
-                }}
-              >
-                取消
-              </button>
-            </div>
-          </div>
-        ) : (
-          <button className="secondary new-book-trigger" type="button" onClick={() => setShowBookForm(true)}>
-            <BookPlus size={16} />
-            新建书籍
-          </button>
-        )}
-      </Panel>
+        <div className="page-hero-actions">
+          <IconButton icon={RefreshCcw} label="刷新" onClick={refreshAll} />
+        </div>
+      </header>
 
       <div className="prompt-workbench-grid">
+        <aside className="prompt-book-column">
+          <Panel icon={Folder} title="书籍">
+            <div className="book-tabs-row">
+              {books.map((book) => (
+                <button
+                  key={book.book_id}
+                  type="button"
+                  className={book.book_id === selectedBookId ? "book-tab active" : "book-tab"}
+                  onClick={() => setSelectedBookId(book.book_id)}
+                >
+                  <strong>{book.book_name || book.book_id}</strong>
+                  <span>{book.chapter_count || 0} 章 · {book.book_id}</span>
+                </button>
+              ))}
+            </div>
+            {showBookForm ? (
+              <div className="form-grid new-book-grid">
+                <label>
+                  <span>小说 ID</span>
+                  <input value={bookForm.book_id} onChange={(event) => setBookForm({ ...bookForm, book_id: event.target.value })} />
+                </label>
+                <label>
+                  <span>书籍名称</span>
+                  <input value={bookForm.book_name} onChange={(event) => setBookForm({ ...bookForm, book_name: event.target.value })} />
+                </label>
+                <div className="new-book-actions">
+                  <button className="secondary inline" type="button" onClick={createBook} disabled={creatingBook}>
+                    {creatingBook ? <Loader2 className="spin" size={16} /> : <BookPlus size={16} />}
+                    保存
+                  </button>
+                  <button
+                    className="ghost"
+                    type="button"
+                    onClick={() => {
+                      setBookForm(emptyBookForm);
+                      setShowBookForm(false);
+                    }}
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button className="secondary new-book-trigger" type="button" onClick={() => setShowBookForm(true)}>
+                <BookPlus size={16} />
+                新建书籍
+              </button>
+            )}
+          </Panel>
+        </aside>
+
         <section className="prompt-index-column">
           <Panel icon={Database} title="索引 Prompt" action={<PromptBookMeta book={selectedBook} />}>
             {!selectedBookId || !indexPrompts ? (
@@ -518,7 +527,7 @@ function IndexPromptEditor({ type, title, description, value, hash, updatedAt, c
           <small>Hash {shortHash || "-"} · 更新 {formatTime(updatedAt)}</small>
         </div>
         <button
-          className="secondary inline"
+          className="secondary inline index-lock-button"
           type="button"
           onClick={() => {
             if (!locked) setDraftState({ source: value, draft: value });
